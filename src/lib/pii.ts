@@ -53,6 +53,131 @@ interface CheckPiiOptions {
   confidenceThreshold?: number;
 }
 
+interface FallbackPattern {
+  category: BankingPiiCategory;
+  regex: RegExp;
+  validate?: (value: string) => boolean;
+}
+
+const FALLBACK_PII_PATTERNS: FallbackPattern[] = [
+  {
+    category: "Email",
+    regex: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+  },
+  {
+    category: "PhoneNumber",
+    regex: /\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}\b/g,
+  },
+  {
+    category: "USSocialSecurityNumber",
+    regex: /\b\d{3}-\d{2}-\d{4}\b/g,
+  },
+  {
+    category: "CreditCardNumber",
+    regex: /\b(?:\d[ -]*?){13,19}\b/g,
+    validate: (value: string) => isLikelyCreditCard(value),
+  },
+  {
+    category: "InternationalBankingAccountNumber",
+    regex: /\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/gi,
+  },
+  {
+    category: "IPAddress",
+    regex: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g,
+    validate: (value: string) => isValidIpv4(value),
+  },
+];
+
+function isLikelyCreditCard(value: string): boolean {
+  const digits = value.replace(/\D/g, "");
+  if (digits.length < 13 || digits.length > 19) {
+    return false;
+  }
+
+  let sum = 0;
+  let shouldDouble = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let digit = Number(digits[i]);
+    if (shouldDouble) {
+      digit *= 2;
+      if (digit > 9) {
+        digit -= 9;
+      }
+    }
+    sum += digit;
+    shouldDouble = !shouldDouble;
+  }
+
+  return sum % 10 === 0;
+}
+
+function isValidIpv4(value: string): boolean {
+  return value.split(".").every((part) => {
+    const num = Number(part);
+    return Number.isInteger(num) && num >= 0 && num <= 255;
+  });
+}
+
+function applyFallbackRedaction(text: string, entities: PiiEntity[]): string {
+  if (entities.length === 0) {
+    return text;
+  }
+
+  let redacted = text;
+  const sorted = [...entities].sort((a, b) => b.offset - a.offset);
+  for (const entity of sorted) {
+    const before = redacted.slice(0, entity.offset);
+    const after = redacted.slice(entity.offset + entity.length);
+    redacted = `${before}[REDACTED]${after}`;
+  }
+
+  return redacted;
+}
+
+function runFallbackPiiDetection(text: string, categories: BankingPiiCategory[]): PiiCheckResult {
+  const detected: PiiEntity[] = [];
+  const seen = new Set<string>();
+
+  for (const pattern of FALLBACK_PII_PATTERNS) {
+    if (!categories.includes(pattern.category)) {
+      continue;
+    }
+
+    pattern.regex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.regex.exec(text)) !== null) {
+      const value = match[0];
+      if (!value) {
+        continue;
+      }
+
+      if (pattern.validate && !pattern.validate(value)) {
+        continue;
+      }
+
+      const key = `${pattern.category}:${match.index}:${value.length}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      detected.push({
+        text: value,
+        category: pattern.category,
+        offset: match.index,
+        length: value.length,
+        confidenceScore: 0.99,
+      });
+    }
+  }
+
+  return {
+    hasPii: detected.length > 0,
+    entities: detected,
+    redactedText: applyFallbackRedaction(text, detected),
+  };
+}
+
 /**
  * Get Azure AD access token for Cognitive Services
  */
@@ -107,7 +232,7 @@ export async function checkPii({
         headers["Authorization"] = `Bearer ${token}`;
       } else {
         console.warn("No PII API key or Azure AD token available");
-        return { hasPii: false, entities: [] };
+        return runFallbackPiiDetection(text, categories);
       }
     }
   }
@@ -145,11 +270,7 @@ export async function checkPii({
     if (!response.ok) {
       const errorText = await response.text();
       console.error("PII check failed:", response.status, response.statusText, errorText);
-      // On API error, allow the message through but log for monitoring
-      return {
-        hasPii: false,
-        entities: [],
-      };
+      return runFallbackPiiDetection(text, categories);
     }
 
     const data = await response.json();
@@ -157,10 +278,7 @@ export async function checkPii({
 
     if (!parsed.success) {
       console.error("Failed to parse PII response:", parsed.error);
-      return {
-        hasPii: false,
-        entities: [],
-      };
+      return runFallbackPiiDetection(text, categories);
     }
 
     const document = parsed.data.results.documents[0];
@@ -193,11 +311,7 @@ export async function checkPii({
     };
   } catch (error) {
     console.error("PII check error:", error);
-    // On network error, allow the message through but log for monitoring
-    return {
-      hasPii: false,
-      entities: [],
-    };
+    return runFallbackPiiDetection(text, categories);
   }
 }
 

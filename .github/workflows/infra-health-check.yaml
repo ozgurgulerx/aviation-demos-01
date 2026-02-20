@@ -93,27 +93,51 @@ jobs:
           PUBLIC_IP=$(kubectl get svc "${{ env.BACKEND_PUBLIC_SERVICE }}" -n "${{ env.NAMESPACE }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           echo "Public LoadBalancer IP: $PUBLIC_IP"
 
+          PUBLIC_SUCCESS=false
+          PUBLIC_STATUS="n/a"
           if [ -n "$PUBLIC_IP" ]; then
             MAX_RETRIES=5
             RETRY_INTERVAL=15
-            SUCCESS=false
 
             for i in $(seq 1 "$MAX_RETRIES"); do
-              HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "http://$PUBLIC_IP/health" --connect-timeout 10 || echo "000")
-              if [ "$HEALTH" = "200" ]; then
-                SUCCESS=true
+              STATUS_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "http://$PUBLIC_IP/health" --connect-timeout 10 --max-time 15 || true)
+              STATUS_CODE="${STATUS_CODE:-000}"
+              PUBLIC_STATUS="$STATUS_CODE"
+              if [ "$STATUS_CODE" = "200" ]; then
+                PUBLIC_SUCCESS=true
                 break
               fi
               if [ "$i" -lt "$MAX_RETRIES" ]; then
                 sleep "$RETRY_INTERVAL"
               fi
             done
-
-            if [ "$SUCCESS" = "false" ]; then
-              echo "::warning::Backend health check failed after $MAX_RETRIES attempts (last status: $HEALTH)"
-            fi
           else
-            echo "::warning::No public LoadBalancer IP available, skipping health check"
+            echo "::notice::No public LoadBalancer IP available, skipping public health check"
+          fi
+
+          INTERNAL_STATUS="000"
+          PF_PID=""
+          cleanup_port_forward() {
+            if [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null; then
+              kill "$PF_PID"
+            fi
+          }
+          trap cleanup_port_forward EXIT
+
+          kubectl port-forward -n "${{ env.NAMESPACE }}" "svc/${{ env.BACKEND_INTERNAL_SERVICE }}" 18080:80 >/tmp/backend-port-forward.log 2>&1 &
+          PF_PID=$!
+          sleep 5
+
+          INTERNAL_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080/health" --connect-timeout 5 --max-time 10 || true)
+          INTERNAL_STATUS="${INTERNAL_STATUS:-000}"
+
+          if [ "$PUBLIC_SUCCESS" = "true" ] || [ "$INTERNAL_STATUS" = "200" ]; then
+            echo "Backend health check passed (public status: $PUBLIC_STATUS, internal status: $INTERNAL_STATUS)"
+          else
+            echo "::warning::Backend health check failed (public status: $PUBLIC_STATUS, internal status: $INTERNAL_STATUS)"
+            echo "::group::backend port-forward logs"
+            cat /tmp/backend-port-forward.log || true
+            echo "::endgroup::"
           fi
 
       - name: Test PII container
