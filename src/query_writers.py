@@ -16,6 +16,8 @@ from openai import AzureOpenAI
 
 load_dotenv()
 
+OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+
 
 def _client_tuning_kwargs() -> dict:
     try:
@@ -36,7 +38,7 @@ def _init_client() -> AzureOpenAI:
         return AzureOpenAI(
             azure_endpoint=endpoint,
             api_key=api_key,
-            api_version="2024-06-01",
+            api_version=OPENAI_API_VERSION,
             **_client_tuning_kwargs(),
         )
     credential = DefaultAzureCredential()
@@ -44,7 +46,7 @@ def _init_client() -> AzureOpenAI:
     return AzureOpenAI(
         azure_endpoint=endpoint,
         azure_ad_token_provider=token_provider,
-        api_version="2024-06-01",
+        api_version=OPENAI_API_VERSION,
         **_client_tuning_kwargs(),
     )
 
@@ -58,12 +60,15 @@ def _strip_fences(text: str) -> str:
 def _supports_explicit_temperature(model_name: str) -> bool:
     """GPT-5/o-series deployments reject explicit temperature overrides."""
     model = (model_name or "").strip().lower()
+    normalized = model.replace("-", "").replace("_", "")
     return not (
         model.startswith("gpt-5")
+        or normalized.startswith("gpt5")
+        or "gpt5" in normalized
         or model.startswith("o1")
         or model.startswith("o3")
         or model.startswith("o4")
-        or model == "model-router"
+        or normalized == "modelrouter"
     )
 
 
