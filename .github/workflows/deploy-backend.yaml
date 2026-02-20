@@ -237,6 +237,18 @@ jobs:
           kubectl apply -f /tmp/k8s-rendered/backend-configmap.yaml
           kubectl apply -f /tmp/k8s-rendered/backend-deployment.yaml
 
+      - name: Enforce AKS-managed ACR auth
+        run: |
+          if kubectl get deployment aviation-rag-backend -n "${{ env.K8S_NAMESPACE }}" -o jsonpath='{.spec.template.spec.imagePullSecrets[*].name}' | grep -q .; then
+            echo "::warning::Removing deployment imagePullSecrets to rely on AKS kubelet identity for ACR pulls."
+            kubectl patch deployment aviation-rag-backend \
+              --namespace="${{ env.K8S_NAMESPACE }}" \
+              --type='json' \
+              -p='[{"op":"remove","path":"/spec/template/spec/imagePullSecrets"}]'
+          fi
+
+          kubectl delete secret acr-secret --namespace="${{ env.K8S_NAMESPACE }}" --ignore-not-found
+
       - name: Stamp deployment with config and secret hashes
         run: |
           CONFIG_HASH=$(kubectl get configmap backend-config -n "${{ env.K8S_NAMESPACE }}" -o json | jq -cS '.data' | sha256sum | awk '{print $1}')
@@ -265,6 +277,7 @@ jobs:
             available="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)"
             unavailable="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.status.unavailableReplicas}' 2>/dev/null || echo 0)"
             template_image="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.spec.template.spec.containers[?(@.name=="backend")].image}' 2>/dev/null || echo '')"
+            template_pull_secrets="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.spec.template.spec.imagePullSecrets[*].name}' 2>/dev/null || echo '')"
 
             desired="${desired:-0}"
             current_generation="${current_generation:-0}"
@@ -286,6 +299,28 @@ jobs:
 
               if [ "$drift_reapply_attempts" -ge "$max_drift_reapply_attempts" ]; then
                 echo "::error::Deployment image drift persisted after ${max_drift_reapply_attempts} re-apply attempts."
+                exit 1
+              fi
+
+              sleep "$poll_interval"
+              continue
+            fi
+
+            if [ -n "$template_pull_secrets" ]; then
+              drift_reapply_attempts=$((drift_reapply_attempts + 1))
+              echo "::warning::Deployment auth drift detected during rollout."
+              echo "::warning::Unexpected imagePullSecrets '$template_pull_secrets'. Removing to keep AKS-managed ACR auth (attempt ${drift_reapply_attempts}/${max_drift_reapply_attempts})."
+
+              kubectl patch deployment aviation-rag-backend \
+                --namespace="${{ env.K8S_NAMESPACE }}" \
+                --type='json' \
+                -p='[{"op":"remove","path":"/spec/template/spec/imagePullSecrets"}]'
+              kubectl delete secret acr-secret --namespace="${{ env.K8S_NAMESPACE }}" --ignore-not-found
+
+              tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "$tracked_generation")"
+
+              if [ "$drift_reapply_attempts" -ge "$max_drift_reapply_attempts" ]; then
+                echo "::error::Deployment auth drift persisted after ${max_drift_reapply_attempts} re-apply attempts."
                 exit 1
               fi
 
