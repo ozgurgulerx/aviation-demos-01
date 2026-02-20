@@ -100,6 +100,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_csv(name: str, default: str) -> List[str]:
+    raw = (os.getenv(name, default) or default).strip()
+    if not raw:
+        return []
+    seen = set()
+    out: List[str] = []
+    for token in raw.split(","):
+        value = token.strip()
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(lowered)
+    return out
+
+
 @dataclass
 class Citation:
     """Citation for a source used in the answer."""
@@ -205,23 +223,33 @@ class UnifiedRetriever:
         self.sql_backend = "unavailable"
         self.sql_available = False
         self.sql_unavailable_reason = ""
+        self.sql_visible_schemas = _env_csv("SQL_VISIBLE_SCHEMAS", "public,demo" if self.use_postgres else "")
         if self.use_postgres:
             try:
                 import psycopg2
+                connect_kwargs: Dict[str, Any] = {
+                    "host": os.getenv("PGHOST"),
+                    "port": int(os.getenv("PGPORT", 5432)),
+                    "database": os.getenv("PGDATABASE", "aviationdb"),
+                    "user": os.getenv("PGUSER"),
+                    "password": os.getenv("PGPASSWORD"),
+                    "sslmode": "require",
+                    "connect_timeout": 5,
+                }
+                if self.sql_visible_schemas:
+                    connect_kwargs["options"] = f"-c search_path={','.join(self.sql_visible_schemas)}"
 
-                self.db = psycopg2.connect(
-                    host=os.getenv("PGHOST"),
-                    port=int(os.getenv("PGPORT", 5432)),
-                    database=os.getenv("PGDATABASE", "aviationdb"),
-                    user=os.getenv("PGUSER"),
-                    password=os.getenv("PGPASSWORD"),
-                    sslmode="require",
-                    connect_timeout=5,
-                )
+                self.db = psycopg2.connect(**connect_kwargs)
                 self.db.autocommit = True
+                if self.sql_visible_schemas:
+                    with self.db.cursor() as cur:
+                        cur.execute(f"SET search_path TO {','.join(self.sql_visible_schemas)}")
                 self.sql_backend = "postgres"
                 self.sql_available = True
-                print(f"Connected to PostgreSQL: {os.getenv('PGHOST')}/{os.getenv('PGDATABASE', 'aviationdb')}")
+                print(
+                    f"Connected to PostgreSQL: {os.getenv('PGHOST')}/{os.getenv('PGDATABASE', 'aviationdb')} "
+                    f"(search_path={','.join(self.sql_visible_schemas) or 'default'})"
+                )
             except Exception as exc:
                 self.sql_unavailable_reason = str(exc)
                 if self.allow_sqlite_fallback:
@@ -800,27 +828,30 @@ class UnifiedRetriever:
         try:
             cur = self.db.cursor()
             if self.use_postgres:
+                visible_schemas = self.sql_visible_schemas or ["public"]
                 cur.execute(
                     """
-                    SELECT table_name
+                    SELECT table_schema, table_name
                     FROM information_schema.tables
-                    WHERE table_schema='public'
-                    ORDER BY table_name
-                    """
+                    WHERE table_type='BASE TABLE'
+                      AND table_schema = ANY(%s)
+                    ORDER BY table_schema, table_name
+                    """,
+                    (visible_schemas,),
                 )
-                table_names = [str(row[0]) for row in cur.fetchall()]
-                for table in table_names:
+                table_rows = [(str(row[0]), str(row[1])) for row in cur.fetchall()]
+                for schema_name, table in table_rows:
                     cur.execute(
                         """
                         SELECT column_name, data_type
                         FROM information_schema.columns
-                        WHERE table_schema='public' AND table_name=%s
+                        WHERE table_schema=%s AND table_name=%s
                         ORDER BY ordinal_position
                         """,
-                        (table,),
+                        (schema_name, table),
                     )
                     cols = [{"name": str(r[0]), "type": str(r[1])} for r in cur.fetchall()]
-                    tables.append({"table": table, "columns": cols})
+                    tables.append({"schema": schema_name, "table": table, "columns": cols})
             else:
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 table_names = [str(row[0]) for row in cur.fetchall()]
@@ -848,9 +879,17 @@ class UnifiedRetriever:
         cleaned: List[str] = []
         for token in table_tokens:
             table = token.strip().strip('"').strip("`")
-            table = table.split(".")[-1]
-            if table and table not in cleaned:
-                cleaned.append(table)
+            if not table:
+                continue
+            parts = [p for p in table.split(".") if p]
+            if not parts:
+                continue
+            if len(parts) >= 2:
+                table_ref = f"{parts[-2].lower()}.{parts[-1].lower()}"
+            else:
+                table_ref = parts[-1].lower()
+            if table_ref not in cleaned:
+                cleaned.append(table_ref)
         return cleaned
 
     def _validate_sql_query(self, sql_query: str) -> Optional[Dict[str, Any]]:
@@ -868,7 +907,16 @@ class UnifiedRetriever:
                 return {"code": "sql_dialect_mismatch", "detail": "PostgreSQL-style :: casts are not supported by sqlite"}
 
         schema = self.current_sql_schema()
-        available_tables = {str(t.get("table", "")).lower() for t in schema.get("tables", []) if isinstance(t, dict)}
+        available_tables = set()
+        for table_entry in schema.get("tables", []):
+            if not isinstance(table_entry, dict):
+                continue
+            table_name = str(table_entry.get("table", "")).lower().strip()
+            schema_name = str(table_entry.get("schema", "")).lower().strip()
+            if table_name:
+                available_tables.add(table_name)
+            if schema_name and table_name:
+                available_tables.add(f"{schema_name}.{table_name}")
         referenced_tables = self._detect_sql_tables(sql)
         missing_tables = [t for t in referenced_tables if t.lower() not in available_tables]
         if missing_tables:
