@@ -132,8 +132,8 @@ jobs:
               break
             fi
 
-            if echo "$DEPLOY_OUTPUT" | grep -q "Another deployment is in progress" && [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
-              echo "Deployment lock detected on App Service. Retrying in 30s (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ] && echo "$DEPLOY_OUTPUT" | grep -Eq "Another deployment is in progress|Status Code: 504|GatewayTimeout"; then
+              echo "Transient App Service deploy error detected. Retrying in 30s (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
               ATTEMPT=$((ATTEMPT + 1))
               sleep 30
               continue
