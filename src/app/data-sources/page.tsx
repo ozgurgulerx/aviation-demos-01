@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import {
   ArrowLeft,
@@ -25,6 +26,12 @@ import {
   GLOSSARY_ITEMS,
   RETRIEVAL_FLOW_STEPS,
 } from "@/data/data-sources-content";
+
+export const metadata: Metadata = {
+  title: "Data Sources | SunExpress Pilot Brief Bot",
+  description:
+    "Detailed inventory of aviation data sources, datastore mapping, and retrieval roles used in the demo.",
+};
 
 export default function DataSourcesPage() {
   const dataAsOf = getDataAsOfTimestamp();
