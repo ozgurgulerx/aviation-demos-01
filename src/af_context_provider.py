@@ -383,6 +383,7 @@ class AviationRagContextProvider:
                 try:
                     source, rows, row_citations, out_sql = future.result()
                     step_outputs[idx] = (source, rows, row_citations, out_sql)
+                    columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
                     source_traces.append(
                         {
                             "type": "source_call_done",
@@ -391,10 +392,16 @@ class AviationRagContextProvider:
                             "citation_count": len(row_citations),
                             "source_meta": self.retriever.source_event_meta(source),
                             "timestamp": _utc_now(),
+                            "columns": columns,
+                            "rows_preview": rows_preview,
+                            "rows_truncated": rows_truncated,
                         }
                     )
                 except Exception as exc:
                     step_outputs[idx] = (step.source, [{"error": str(exc)}], [], None)
+                    columns, rows_preview, rows_truncated = self._build_rows_preview(
+                        [{"error": str(exc)}]
+                    )
                     source_traces.append(
                         {
                             "type": "source_call_done",
@@ -404,6 +411,9 @@ class AviationRagContextProvider:
                             "error": str(exc),
                             "source_meta": self.retriever.source_event_meta(step.source),
                             "timestamp": _utc_now(),
+                            "columns": columns,
+                            "rows_preview": rows_preview,
+                            "rows_truncated": rows_truncated,
                         }
                     )
 
@@ -426,6 +436,67 @@ class AviationRagContextProvider:
                 sql_query = out_sql
 
         return source_results, source_traces, citations, sql_query
+
+    def _build_rows_preview(
+        self,
+        rows: List[Dict[str, Any]],
+        max_rows: int = 5,
+        max_columns: int = 8,
+        max_chars: int = 180,
+    ) -> tuple[List[str], List[Dict[str, Any]], bool]:
+        if not rows:
+            return [], [], False
+
+        hidden_keys = {"content_vector"}
+        columns: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in row.keys():
+                if not isinstance(key, str) or key.startswith("__") or key in hidden_keys:
+                    continue
+                if key not in columns:
+                    columns.append(key)
+                    if len(columns) >= max_columns:
+                        break
+            if len(columns) >= max_columns:
+                break
+
+        preview: List[Dict[str, Any]] = []
+        for row in rows[:max_rows]:
+            if not isinstance(row, dict):
+                continue
+            item: Dict[str, Any] = {}
+            for column in columns:
+                if column in row:
+                    item[column] = self._safe_preview_value(row[column], max_chars=max_chars)
+            if item:
+                preview.append(item)
+
+        return columns, preview, len(rows) > len(preview)
+
+    def _safe_preview_value(self, value: Any, max_chars: int = 180) -> Any:
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+
+        if isinstance(value, str):
+            return value if len(value) <= max_chars else value[: max_chars - 3] + "..."
+
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                pass
+
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                serialized = json.dumps(value, ensure_ascii=True)
+            except Exception:
+                serialized = str(value)
+            return serialized if len(serialized) <= max_chars else serialized[: max_chars - 3] + "..."
+
+        rendered = str(value)
+        return rendered if len(rendered) <= max_chars else rendered[: max_chars - 3] + "..."
 
     def _load_fusion_weights(self) -> Dict[str, float]:
         raw = os.getenv("CONTEXT_FUSION_WEIGHTS", "").strip()

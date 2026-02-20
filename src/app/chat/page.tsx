@@ -5,7 +5,7 @@ import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { AlertTriangle, X } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SourcesPanel } from "@/components/layout/sources-panel";
-import { ChatThread } from "@/components/chat/chat-thread";
+import { ChatThread, TimelinePanel } from "@/components/chat/chat-thread";
 import { MessageComposer } from "@/components/chat/message-composer";
 import { FollowUpChips } from "@/components/chat/follow-up-chips";
 import { ToggleGroup } from "@/components/ui/switch";
@@ -39,6 +39,7 @@ import type {
   ReasoningEventPayload,
   ReasoningSseEvent,
   ReasoningStage,
+  SourceResultSnapshot,
 } from "@/types";
 import type { StreamEvent } from "@/lib/chat";
 
@@ -220,6 +221,67 @@ function extractSourceCountsFromToolResult(result?: Record<string, unknown>): Re
   return counts;
 }
 
+function extractPreviewColumns(columns: unknown): string[] {
+  if (!Array.isArray(columns)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of columns) {
+    if (typeof candidate !== "string" || !candidate.trim()) {
+      continue;
+    }
+    const column = candidate.trim();
+    if (seen.has(column)) {
+      continue;
+    }
+    seen.add(column);
+    out.push(column);
+    if (out.length >= 8) {
+      break;
+    }
+  }
+  return out;
+}
+
+function extractPreviewRows(rows: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+  const out: Array<Record<string, unknown>> = [];
+  for (const row of rows.slice(0, 5)) {
+    if (!isRecord(row)) {
+      continue;
+    }
+    out.push({ ...row });
+  }
+  return out;
+}
+
+function buildSourceSnapshot(event: StreamEvent, source: string): SourceResultSnapshot {
+  const rowsPreview = extractPreviewRows(event.rows_preview);
+  const fallbackColumns =
+    rowsPreview.length > 0
+      ? Object.keys(rowsPreview[0] || {}).filter((column) => column && !column.startsWith("__"))
+      : [];
+  const columns = extractPreviewColumns(event.columns);
+  return {
+    source,
+    eventId: event.event_id,
+    rowCount: Number(event.row_count || 0),
+    columns: columns.length > 0 ? columns : fallbackColumns,
+    rowsPreview,
+    rowsTruncated: event.rows_truncated,
+    timestamp: resolveStreamEventTimestamp(event),
+    mode:
+      (event.mode as SourceResultSnapshot["mode"]) ||
+      (event.source_meta?.endpoint_label === "live" || event.source_meta?.endpoint_label === "fallback"
+        ? (event.source_meta.endpoint_label as SourceResultSnapshot["mode"])
+        : undefined),
+    freshness: event.source_meta?.freshness,
+  };
+}
+
 function mergeReasoningPayload(
   previous?: ReasoningEventPayload,
   incoming?: ReasoningEventPayload
@@ -306,6 +368,7 @@ export default function ChatPage() {
   const [streamingContent, setStreamingContent] = useState("");
   const [timelineEvents, setTimelineEvents] = useState<TelemetryEvent[]>([]);
   const [reasoningEvents, setReasoningEvents] = useState<ReasoningSseEvent[]>([]);
+  const [sourceSnapshots, setSourceSnapshots] = useState<Record<string, SourceResultSnapshot>>({});
   const [sourceHealth, setSourceHealth] = useState<SourceHealthStatus[]>(
     createInitialSourceHealth()
   );
@@ -377,6 +440,7 @@ export default function ChatPage() {
     setStreamingContent("");
     setTimelineEvents([]);
     setReasoningEvents([]);
+    setSourceSnapshots({});
     setSourceHealth(createInitialSourceHealth());
     setRouteLabel("Pending");
     setConfidenceLabel("Awaiting run");
@@ -398,6 +462,7 @@ export default function ChatPage() {
     setActiveCitationId(null);
     setShowFollowUps(true);
     setReasoningEvents([]);
+    setSourceSnapshots({});
     retrievalProgressRef.current = { sources: new Set<string>(), callCount: 0 };
   }, []);
 
@@ -582,6 +647,7 @@ export default function ChatPage() {
       setTimelineEvents([]);
       setReasoningEvents([]);
       setShowFollowUps(false);
+      setSourceSnapshots({});
       setSourceHealth(createInitialSourceHealth());
       setRouteLabel("Running");
       setConfidenceLabel("Calculating");
@@ -651,6 +717,13 @@ export default function ChatPage() {
           if (event.type === "source_call_done") {
             const source = typeof event.source === "string" ? normalizeSourceId(event.source) : undefined;
             markEvidenceRetrieval(source ? [source] : [], 0, eventTs);
+            if (source) {
+              const snapshot = buildSourceSnapshot(event, source);
+              setSourceSnapshots((previous) => ({
+                ...previous,
+                [source]: snapshot,
+              }));
+            }
           }
 
           if (event.type === "tool_result") {
@@ -1022,8 +1095,6 @@ export default function ChatPage() {
           messages={messages}
           isLoading={isLoading}
           streamingContent={streamingContent}
-          timelineEvents={timelineEvents}
-          sourceHealth={sourceHealth}
           onCitationClick={handleCitationClick}
           activeCitationId={activeCitationId}
           onSpeakMessage={(messageId, content) => {
@@ -1031,7 +1102,6 @@ export default function ChatPage() {
           }}
           speakingMessageId={speakingMessageId}
           voiceEnabled={voiceMode !== "off"}
-          onRetryLast={handleRetryLast}
           onSendMessage={(message) => {
             void handleSendMessage(message);
           }}
@@ -1050,6 +1120,17 @@ export default function ChatPage() {
           isLoading={isLoading}
           reasoningEvents={reasoningEvents}
         />
+
+        {(isLoading || timelineEvents.length > 0) && (
+          <TimelinePanel
+            events={timelineEvents}
+            sourceHealth={sourceHealth}
+            sourceSnapshots={sourceSnapshots}
+            isLoading={isLoading}
+            onRetryLast={handleRetryLast}
+            docked
+          />
+        )}
       </div>
 
       <SourcesPanel

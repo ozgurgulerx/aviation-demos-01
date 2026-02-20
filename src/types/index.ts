@@ -168,6 +168,18 @@ export interface SourceHealthStatus {
   freshness?: string;
 }
 
+export interface SourceResultSnapshot {
+  source: string;
+  eventId?: string;
+  rowCount: number;
+  columns: string[];
+  rowsPreview: Array<Record<string, unknown>>;
+  rowsTruncated?: boolean;
+  timestamp: string;
+  mode?: "live" | "fallback" | "unknown";
+  freshness?: string;
+}
+
 export interface FabricPreflightCheck {
   name: string;
   status: "pass" | "warn" | "fail";

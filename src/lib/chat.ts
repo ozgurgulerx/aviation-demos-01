@@ -74,6 +74,9 @@ export interface StreamEvent {
   priority?: number;
   row_count?: number;
   citation_count?: number;
+  columns?: string[];
+  rows_preview?: Array<Record<string, unknown>>;
+  rows_truncated?: boolean;
   error?: string;
   citations?: Array<{
     id: number;
@@ -448,7 +451,9 @@ export function updateSourceHealth(
                 : item.status,
           rowCount:
             event.type === "source_call_done"
-              ? event.row_count || item.rowCount
+              ? typeof event.row_count === "number"
+                ? event.row_count
+                : item.rowCount
               : item.rowCount,
           updatedAt: eventTimestamp,
           mode: (mode as SourceHealthStatus["mode"]) || item.mode,

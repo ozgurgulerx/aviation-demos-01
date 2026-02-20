@@ -8,6 +8,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,6 +106,7 @@ class PlanExecutor:
                     try:
                         rows, citations, sql_query = future.result()
                         rows = self._annotate_rows(rows, source, call.id, call.operation, call.params, completed_at)
+                        columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
                         result.source_results_by_call[call.id] = CallResult(
                             call_id=call.id,
                             source=source,
@@ -128,6 +130,9 @@ class PlanExecutor:
                                 "source_meta": self.retriever.source_event_meta(source),
                                 "event_id": call.id,
                                 "timestamp": completed_at,
+                                "columns": columns,
+                                "rows_preview": rows_preview,
+                                "rows_truncated": rows_truncated,
                             }
                         )
                     except Exception as exc:
@@ -151,6 +156,7 @@ class PlanExecutor:
                             completed_at=completed_at,
                             params=dict(call.params or {}),
                         )
+                        columns, rows_preview, rows_truncated = self._build_rows_preview(error_rows)
                         result.source_traces.append(
                             {
                                 "type": "source_call_done",
@@ -161,6 +167,9 @@ class PlanExecutor:
                                 "source_meta": self.retriever.source_event_meta(source),
                                 "event_id": call.id,
                                 "timestamp": completed_at,
+                                "columns": columns,
+                                "rows_preview": rows_preview,
+                                "rows_truncated": rows_truncated,
                             }
                         )
                     done_ids.add(call.id)
@@ -334,3 +343,64 @@ class PlanExecutor:
                 continue
             out.extend(call_result.citations)
         return out
+
+    def _build_rows_preview(
+        self,
+        rows: List[Dict[str, Any]],
+        max_rows: int = 5,
+        max_columns: int = 8,
+        max_chars: int = 180,
+    ) -> Tuple[List[str], List[Dict[str, Any]], bool]:
+        if not rows:
+            return [], [], False
+
+        hidden_keys = {"content_vector"}
+        columns: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in row.keys():
+                if not isinstance(key, str) or key.startswith("__") or key in hidden_keys:
+                    continue
+                if key not in columns:
+                    columns.append(key)
+                    if len(columns) >= max_columns:
+                        break
+            if len(columns) >= max_columns:
+                break
+
+        preview: List[Dict[str, Any]] = []
+        for row in rows[:max_rows]:
+            if not isinstance(row, dict):
+                continue
+            item: Dict[str, Any] = {}
+            for column in columns:
+                if column in row:
+                    item[column] = self._safe_preview_value(row[column], max_chars=max_chars)
+            if item:
+                preview.append(item)
+
+        return columns, preview, len(rows) > len(preview)
+
+    def _safe_preview_value(self, value: Any, max_chars: int = 180) -> Any:
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+
+        if isinstance(value, str):
+            return value if len(value) <= max_chars else value[: max_chars - 3] + "..."
+
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                pass
+
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                serialized = json.dumps(value, ensure_ascii=True)
+            except Exception:
+                serialized = str(value)
+            return serialized if len(serialized) <= max_chars else serialized[: max_chars - 3] + "..."
+
+        rendered = str(value)
+        return rendered if len(rendered) <= max_chars else rendered[: max_chars - 3] + "..."
