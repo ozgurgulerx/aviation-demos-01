@@ -58,7 +58,7 @@ def _strip_fences(text: str) -> str:
 class SQLWriter:
     def __init__(self, model: Optional[str] = None):
         self.client = _init_client()
-        self.model = model or os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME", "gpt-5-nano")
+        self.model = model or os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 
     def generate(
         self,
@@ -100,7 +100,7 @@ Rules:
 class KQLWriter:
     def __init__(self, model: Optional[str] = None):
         self.client = _init_client()
-        self.model = model or os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME", "gpt-5-nano")
+        self.model = model or os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 
     def generate(
         self,

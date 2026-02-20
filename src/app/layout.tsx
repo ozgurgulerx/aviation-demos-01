@@ -4,7 +4,7 @@ import { ThemeProvider } from "@/components/providers/theme-provider";
 import { Toaster } from "@/components/ui/toaster";
 
 export const metadata: Metadata = {
-  title: "SunExpress Pilot Brief Bot",
+  title: "AeroLynx Pilot Brief Bot",
   description:
     "Agentic retrieval cockpit for operational pilot briefing across Azure and Fabric data stores.",
 };

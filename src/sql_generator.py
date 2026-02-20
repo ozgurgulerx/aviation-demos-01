@@ -93,7 +93,7 @@ class SQLGenerator:
                 api_version="2024-06-01",
                 **_client_tuning_kwargs(),
             )
-        self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-nano")
+        self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 
     def generate(self, query: str) -> str:
         """Generate SQL from natural language query."""

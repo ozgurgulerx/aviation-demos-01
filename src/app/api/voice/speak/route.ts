@@ -8,6 +8,7 @@ const RequestSchema = z.object({
 
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT?.replace(/\/$/, "");
 const DEPLOYMENT = process.env.AZURE_OPENAI_VOICE_DEPLOYMENT_NAME || "aviation-voice-tts";
+const VOICE_MODEL = process.env.AZURE_OPENAI_VOICE_MODEL || "gpt-4o-mini-tts";
 const API_VERSION = process.env.AZURE_OPENAI_VOICE_API_VERSION || "2025-03-01-preview";
 const API_KEY = process.env.AZURE_OPENAI_API_KEY;
 const BEARER_TOKEN = process.env.AZURE_OPENAI_BEARER_TOKEN;
@@ -218,7 +219,7 @@ export async function POST(request: NextRequest) {
           ...authHeaders,
         },
         body: JSON.stringify({
-          model: "gpt-4o-mini-tts",
+          model: VOICE_MODEL,
           voice: defaultVoice(language),
           input: text,
         }),

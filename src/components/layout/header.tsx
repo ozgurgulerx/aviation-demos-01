@@ -27,7 +27,7 @@ export function Header() {
           </div>
           <div>
             <p className="font-display text-sm font-semibold tracking-wide">
-              SunExpress Pilot Brief Bot
+              AeroLynx Pilot Brief Bot
             </p>
             <p className="text-[11px] text-primary-foreground/80">
               Agentic Retrieval Control Surface

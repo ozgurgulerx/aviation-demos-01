@@ -152,7 +152,7 @@ class AgentFrameworkRuntime:
             self._af_enabled = False
 
     def _build_af_client(self) -> Optional[Any]:
-        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-nano")
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         project_endpoint = os.getenv("AZURE_FOUNDRY_PROJECT_ENDPOINT")
 

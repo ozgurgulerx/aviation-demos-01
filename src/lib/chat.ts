@@ -475,8 +475,8 @@ export function toOperationalAlert(event: StreamEvent): OperationalAlert | null 
     return {
       id: event.id || event.event_id || generateId(),
       severity: event.severity || "warning",
-      title: event.title || "Operational Advisory",
-      message: event.message || "A new advisory was received from runtime telemetry.",
+      title: event.title || "Flight Risk Advisory",
+      message: event.message || "Elevated operational risk detected. Review constraints before dispatch.",
       source: normalizeSourceName(event.source),
       timestamp,
     };
@@ -486,8 +486,9 @@ export function toOperationalAlert(event: StreamEvent): OperationalAlert | null 
     return {
       id: event.id || event.event_id || generateId(),
       severity: "critical",
-      title: "Runtime Alert",
-      message: event.message || event.error || "An unexpected runtime error occurred.",
+      title: "Briefing Service Interrupted",
+      message:
+        "Brief generation was interrupted. Re-check weather hazards, NOTAM status, and crew legality before release.",
       source: normalizeSourceName(event.source),
       timestamp,
     };
@@ -497,8 +498,8 @@ export function toOperationalAlert(event: StreamEvent): OperationalAlert | null 
     return {
       id: event.id || event.event_id || generateId(),
       severity: "warning",
-      title: "Source Fallback Active",
-      message: `${normalizeSourceName(event.source)} switched to fallback mode. Validate freshness before dispatch decisions.`,
+      title: "Data Freshness Advisory",
+      message: `Primary ${normalizeSourceName(event.source)} feed is degraded. Validate latest weather, NOTAM, and slot data before dispatch.`,
       source: normalizeSourceName(event.source),
       timestamp,
     };

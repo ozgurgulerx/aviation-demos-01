@@ -31,6 +31,7 @@ The project includes an end-to-end ASRS ingestion flow:
 - `AZURE_SEARCH_ENDPOINT`
 - `AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME` (optional, defaults to `text-embedding-3-small`)
 - `AZURE_OPENAI_VOICE_DEPLOYMENT_NAME` (optional, defaults to `aviation-voice-tts`)
+- `AZURE_OPENAI_VOICE_MODEL` (optional, defaults to `gpt-4o-mini-tts`)
 - `AZURE_OPENAI_VOICE_API_VERSION` (optional, defaults to `2025-03-01-preview`)
 - `AZURE_OPENAI_AUTH_MODE` (optional: `token`/`auto`/`api-key`, defaults to `token`)
 - Token-mode options: `AZURE_OPENAI_TENANT_ID`, `AZURE_OPENAI_CLIENT_ID`, `AZURE_OPENAI_CLIENT_SECRET`, or managed identity (`AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID`)
@@ -117,6 +118,15 @@ PG_SERVER_RG="<postgres-resource-group>" \
 - `PGUSER`
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_DEPLOYMENT_NAME` (optional, default `aviation-chat-gpt5-mini`)
+- `AZURE_OPENAI_VOICE_DEPLOYMENT_NAME` (optional, default `aviation-voice-tts`)
+- `AZURE_OPENAI_VOICE_MODEL` (optional, default `gpt-4o-mini-tts`)
+- `AZURE_OPENAI_VOICE_API_VERSION` (optional, default `2025-03-01-preview`)
+- `AZURE_OPENAI_VOICE_TURKISH` (optional, default `alloy`)
+- `AZURE_OPENAI_VOICE_ENGLISH` (optional, default `alloy`)
+- `AZURE_OPENAI_AUTH_MODE` (optional, default `token`)
+- `AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID` (optional; for user-assigned MI)
+- `AZURE_OPENAI_TENANT_ID` (optional; when using service principal token auth)
+- `AZURE_OPENAI_CLIENT_ID` (optional; when using service principal token auth)
 - `AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME` (optional, default `text-embedding-3-small`)
 - `AZURE_SEARCH_ENDPOINT`
 
@@ -126,6 +136,8 @@ PG_SERVER_RG="<postgres-resource-group>" \
 - `AZURE_TENANT_ID`
 - `AZURE_SUBSCRIPTION_ID`
 - `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_CLIENT_SECRET` (optional; service principal token auth)
+- `AZURE_OPENAI_BEARER_TOKEN` (optional; pre-minted token path)
 - `AZURE_SEARCH_ADMIN_KEY`
 - `PGPASSWORD`
 - `APPLICATIONINSIGHTS_CONNECTION_STRING` (optional)

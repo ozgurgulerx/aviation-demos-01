@@ -42,7 +42,7 @@ DB_PATH = Path(os.getenv("SQLITE_PATH", "aviation.db"))
 # Azure OpenAI configuration
 OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-LLM_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-nano")
+LLM_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
 
 # Azure AI Search configuration

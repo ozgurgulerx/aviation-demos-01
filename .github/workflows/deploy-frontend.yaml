@@ -33,6 +33,7 @@ env:
   PII_CONTAINER_ENDPOINT: ${{ vars.PII_CONTAINER_ENDPOINT }}
   AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
   AZURE_OPENAI_VOICE_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_VOICE_DEPLOYMENT_NAME || 'aviation-voice-tts' }}
+  AZURE_OPENAI_VOICE_MODEL: ${{ vars.AZURE_OPENAI_VOICE_MODEL || 'gpt-4o-mini-tts' }}
   AZURE_OPENAI_VOICE_API_VERSION: ${{ vars.AZURE_OPENAI_VOICE_API_VERSION || '2025-03-01-preview' }}
   AZURE_OPENAI_VOICE_TURKISH: ${{ vars.AZURE_OPENAI_VOICE_TURKISH || 'alloy' }}
   AZURE_OPENAI_VOICE_ENGLISH: ${{ vars.AZURE_OPENAI_VOICE_ENGLISH || 'alloy' }}
@@ -107,27 +108,42 @@ jobs:
             --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}"
 
+          SETTINGS=(
+            "BACKEND_URL=${{ env.BACKEND_URL }}"
+            "PII_ENDPOINT=${{ env.PII_ENDPOINT }}"
+            "PII_CONTAINER_ENDPOINT=${{ env.PII_CONTAINER_ENDPOINT }}"
+            "AZURE_OPENAI_ENDPOINT=${{ env.AZURE_OPENAI_ENDPOINT }}"
+            "AZURE_OPENAI_VOICE_DEPLOYMENT_NAME=${{ env.AZURE_OPENAI_VOICE_DEPLOYMENT_NAME }}"
+            "AZURE_OPENAI_VOICE_MODEL=${{ env.AZURE_OPENAI_VOICE_MODEL }}"
+            "AZURE_OPENAI_VOICE_API_VERSION=${{ env.AZURE_OPENAI_VOICE_API_VERSION }}"
+            "AZURE_OPENAI_VOICE_TURKISH=${{ env.AZURE_OPENAI_VOICE_TURKISH }}"
+            "AZURE_OPENAI_VOICE_ENGLISH=${{ env.AZURE_OPENAI_VOICE_ENGLISH }}"
+            "AZURE_OPENAI_AUTH_MODE=${{ env.AZURE_OPENAI_AUTH_MODE }}"
+            "WEBSITE_VNET_ROUTE_ALL=1"
+            "PORT=3000"
+            "WEBSITES_PORT=3000"
+          )
+
+          if [ -n "${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}" ]; then
+            SETTINGS+=("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}")
+          fi
+          if [ -n "${{ env.AZURE_OPENAI_TENANT_ID }}" ]; then
+            SETTINGS+=("AZURE_OPENAI_TENANT_ID=${{ env.AZURE_OPENAI_TENANT_ID }}")
+          fi
+          if [ -n "${{ env.AZURE_OPENAI_CLIENT_ID }}" ]; then
+            SETTINGS+=("AZURE_OPENAI_CLIENT_ID=${{ env.AZURE_OPENAI_CLIENT_ID }}")
+          fi
+          if [ -n "${{ env.AZURE_OPENAI_CLIENT_SECRET }}" ]; then
+            SETTINGS+=("AZURE_OPENAI_CLIENT_SECRET=${{ env.AZURE_OPENAI_CLIENT_SECRET }}")
+          fi
+          if [ -n "${{ env.AZURE_OPENAI_BEARER_TOKEN }}" ]; then
+            SETTINGS+=("AZURE_OPENAI_BEARER_TOKEN=${{ env.AZURE_OPENAI_BEARER_TOKEN }}")
+          fi
+
           az webapp config appsettings set \
             --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --settings \
-              BACKEND_URL="${{ env.BACKEND_URL }}" \
-              PII_ENDPOINT="${{ env.PII_ENDPOINT }}" \
-              PII_CONTAINER_ENDPOINT="${{ env.PII_CONTAINER_ENDPOINT }}" \
-              AZURE_OPENAI_ENDPOINT="${{ env.AZURE_OPENAI_ENDPOINT }}" \
-              AZURE_OPENAI_VOICE_DEPLOYMENT_NAME="${{ env.AZURE_OPENAI_VOICE_DEPLOYMENT_NAME }}" \
-              AZURE_OPENAI_VOICE_API_VERSION="${{ env.AZURE_OPENAI_VOICE_API_VERSION }}" \
-              AZURE_OPENAI_VOICE_TURKISH="${{ env.AZURE_OPENAI_VOICE_TURKISH }}" \
-              AZURE_OPENAI_VOICE_ENGLISH="${{ env.AZURE_OPENAI_VOICE_ENGLISH }}" \
-              AZURE_OPENAI_AUTH_MODE="${{ env.AZURE_OPENAI_AUTH_MODE }}" \
-              AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID="${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}" \
-              AZURE_OPENAI_TENANT_ID="${{ env.AZURE_OPENAI_TENANT_ID }}" \
-              AZURE_OPENAI_CLIENT_ID="${{ env.AZURE_OPENAI_CLIENT_ID }}" \
-              AZURE_OPENAI_CLIENT_SECRET="${{ env.AZURE_OPENAI_CLIENT_SECRET }}" \
-              AZURE_OPENAI_BEARER_TOKEN="${{ env.AZURE_OPENAI_BEARER_TOKEN }}" \
-              WEBSITE_VNET_ROUTE_ALL=1 \
-              PORT=3000 \
-              WEBSITES_PORT=3000
+            --settings "${SETTINGS[@]}"
 
       - name: Prepare deployment package
         working-directory: ./src
