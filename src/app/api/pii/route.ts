@@ -68,7 +68,7 @@ export async function POST(request: NextRequest) {
 
     // Log allowed result
     console.log("✅ RESULT: ALLOWED");
-    console.log("📝 No banking-relevant PII detected in message");
+    console.log("No configured PII categories detected in message");
     console.log("➡️  Message will be forwarded to AI agent");
     console.log("═".repeat(70) + "\n");
 

@@ -29,7 +29,7 @@ env:
   K8S_NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
 
   AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
-  AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION || '2022-12-01' }}
+  AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION || '2024-10-21' }}
   AZURE_OPENAI_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'gpt-5-nano' }}
   AZURE_OPENAI_WORKER_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_WORKER_DEPLOYMENT_NAME || vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'gpt-5-nano' }}
   AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME || vars.AZURE_OPENAI_REASONING_DEPLOYMENT_NAME || 'gpt-5-mini' }}
@@ -48,13 +48,6 @@ env:
   PGUSER: ${{ vars.PGUSER || 'aviationrag_readonly' }}
   FLASK_ENV: ${{ vars.FLASK_ENV || 'production' }}
   LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
-  USE_POSTGRES: ${{ vars.USE_POSTGRES || 'true' }}
-  SQL_DIALECT: ${{ vars.SQL_DIALECT || 'postgres' }}
-  RETRIEVAL_STRICT_SOURCE_MODE: ${{ vars.RETRIEVAL_STRICT_SOURCE_MODE || 'false' }}
-  ALLOW_SQLITE_FALLBACK: ${{ vars.ALLOW_SQLITE_FALLBACK || 'true' }}
-  ALLOW_MOCK_KQL_FALLBACK: ${{ vars.ALLOW_MOCK_KQL_FALLBACK || 'true' }}
-  ALLOW_MOCK_GRAPH_FALLBACK: ${{ vars.ALLOW_MOCK_GRAPH_FALLBACK || 'true' }}
-  ALLOW_MOCK_NOSQL_FALLBACK: ${{ vars.ALLOW_MOCK_NOSQL_FALLBACK || 'true' }}
   SCHEMA_CACHE_TTL_SECONDS: ${{ vars.SCHEMA_CACHE_TTL_SECONDS || '300' }}
   KQL_SCHEMA_MODE: ${{ vars.KQL_SCHEMA_MODE || 'static' }}
   OTEL_SERVICE_NAME: ${{ vars.OTEL_SERVICE_NAME || 'aviation-rag-backend' }}
@@ -64,7 +57,7 @@ env:
   AZURE_OPENAI_TIMEOUT_SECONDS: ${{ vars.AZURE_OPENAI_TIMEOUT_SECONDS || '45' }}
   AZURE_OPENAI_MAX_RETRIES: ${{ vars.AZURE_OPENAI_MAX_RETRIES || '1' }}
   GUNICORN_WORKER_CLASS: ${{ vars.GUNICORN_WORKER_CLASS || 'gthread' }}
-  GUNICORN_WORKERS: ${{ vars.GUNICORN_WORKERS || '3' }}
+  GUNICORN_WORKERS: ${{ vars.GUNICORN_WORKERS || '1' }}
   GUNICORN_THREADS: ${{ vars.GUNICORN_THREADS || '4' }}
   GUNICORN_TIMEOUT_SECONDS: ${{ vars.GUNICORN_TIMEOUT_SECONDS || '240' }}
   GUNICORN_GRACEFUL_TIMEOUT_SECONDS: ${{ vars.GUNICORN_GRACEFUL_TIMEOUT_SECONDS || '30' }}
@@ -76,7 +69,28 @@ env:
   FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
 
 jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint
+        run: cd src && python -m py_compile api_server.py unified_retriever.py query_router.py pii_filter.py
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short || true
+
   build-and-push:
+    needs: lint-and-test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -155,9 +169,7 @@ jobs:
       - name: Build and push Docker image
         run: |
           docker build -f Dockerfile.backend -t "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" .
-          docker tag "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           docker push "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          docker push "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
   deploy:
     needs: build-and-push

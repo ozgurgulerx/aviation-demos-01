@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator, Iterable, List, Optional
 
+from concurrent.futures import ThreadPoolExecutor
+
 from af_context_provider import AviationRagContextProvider
 from af_tools import AviationRagTools, build_agent_framework_tools
 from unified_retriever import Citation, UnifiedRetriever
@@ -297,6 +299,7 @@ class AgentFrameworkRuntime:
         ask_recommendation: bool = False,
         demo_scenario: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
+        _t0_total = time.perf_counter()
         sid = session_id or str(uuid.uuid4())
 
         yield {
@@ -330,7 +333,31 @@ class AgentFrameworkRuntime:
                 "sessionId": sid,
             }
 
-        pii_result = self.retriever.check_pii(query)
+        # Run PII check and query routing in parallel — they are independent.
+        _t0_parallel = time.perf_counter()
+        precomputed_route = None
+
+        def _pii_task():
+            return self.retriever.check_pii(query)
+
+        def _routing_task():
+            return self.retriever.router.route(query)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pii_future = pool.submit(_pii_task)
+            route_future = pool.submit(_routing_task)
+            pii_result = pii_future.result()
+            try:
+                precomputed_route = route_future.result()
+            except Exception:
+                precomputed_route = None
+
+        logger.info(
+            "perf stage=%s ms=%.1f",
+            "parallel_pii_routing",
+            (time.perf_counter() - _t0_parallel) * 1000,
+        )
+
         if pii_result.has_pii:
             warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
             for event in self._emit_text_chunks(warning):
@@ -358,6 +385,7 @@ class AgentFrameworkRuntime:
                     risk_mode=risk_mode,
                     ask_recommendation=ask_recommendation,
                     demo_scenario=demo_scenario,
+                    precomputed_route=precomputed_route,
                 )
                 return
             except Exception as exc:
@@ -380,7 +408,9 @@ class AgentFrameworkRuntime:
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
             demo_scenario=demo_scenario,
+            precomputed_route=precomputed_route,
         )
+        logger.info("perf stage=%s ms=%.1f", "run_stream_total", (time.perf_counter() - _t0_total) * 1000)
 
     def _run_with_agent_framework(
         self,
@@ -394,6 +424,7 @@ class AgentFrameworkRuntime:
         risk_mode: str,
         ask_recommendation: bool,
         demo_scenario: Optional[str],
+        precomputed_route: Optional[Dict[str, Any]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         session = self._get_or_create_session(session_id)
         call_id = str(uuid.uuid4())
@@ -415,6 +446,7 @@ class AgentFrameworkRuntime:
             },
         }
 
+        _t0_ctx = time.perf_counter()
         ctx = self.context_provider.build_context(
             query,
             retrieval_mode=retrieval_mode,
@@ -424,7 +456,9 @@ class AgentFrameworkRuntime:
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
+            precomputed_route=precomputed_route,
         )
+        logger.info("perf stage=%s ms=%.1f", "build_context_af", (time.perf_counter() - _t0_ctx) * 1000)
         if ctx.retrieval_plan:
             yield {"type": "retrieval_plan", "plan": ctx.retrieval_plan}
         for trace in ctx.source_traces:
@@ -446,31 +480,30 @@ class AgentFrameworkRuntime:
 
         answer = self._invoke_agent(prompt=prompt, session=session, session_id=session_id)
         if not answer.strip():
+            # AF agent returned nothing — use true streaming synthesis.
             vector_rows = (
                 list(ctx.source_results.get("VECTOR_REG", []))
                 + list(ctx.source_results.get("VECTOR_OPS", []))
                 + list(ctx.source_results.get("VECTOR_AIRPORT", []))
             )
-            answer = self.retriever._synthesize_answer(
-                query,
-                {
-                    "sql_results": ctx.sql_results[:12],
-                    "kql_results": ctx.source_results.get("KQL", [])[:8],
-                    "graph_results": ctx.source_results.get("GRAPH", [])[:8],
-                    "nosql_results": ctx.source_results.get("NOSQL", [])[:8],
-                    "vector_results": [
-                        {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
-                        for row in vector_rows[:12]
-                    ],
-                    "reconciled_items": ctx.reconciled_items[:40],
-                    "coverage_summary": ctx.coverage_summary,
-                    "conflict_summary": ctx.conflict_summary,
-                },
-                ctx.route,
-            )
-
-        for event in self._emit_text_chunks(answer):
-            yield event
+            synthesis_context = {
+                "sql_results": ctx.sql_results[:12],
+                "kql_results": ctx.source_results.get("KQL", [])[:8],
+                "graph_results": ctx.source_results.get("GRAPH", [])[:8],
+                "nosql_results": ctx.source_results.get("NOSQL", [])[:8],
+                "vector_results": [
+                    {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
+                    for row in vector_rows[:12]
+                ],
+                "reconciled_items": ctx.reconciled_items[:40],
+                "coverage_summary": ctx.coverage_summary,
+                "conflict_summary": ctx.conflict_summary,
+            }
+            for event in self.retriever._synthesize_answer_stream(query, synthesis_context, ctx.route):
+                yield event
+        else:
+            for event in self._emit_text_chunks(answer):
+                yield event
 
         if ctx.citations:
             yield {"type": "citations", "citations": self._format_citations(ctx.citations)}
@@ -504,6 +537,7 @@ class AgentFrameworkRuntime:
         risk_mode: str,
         ask_recommendation: bool,
         demo_scenario: Optional[str],
+        precomputed_route: Optional[Dict[str, Any]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         call_id = str(uuid.uuid4())
         yield {
@@ -523,6 +557,7 @@ class AgentFrameworkRuntime:
             },
         }
 
+        _t0_rag = time.perf_counter()
         tool_result = self.toolset.run_rag_lookup(
             query,
             retrieval_mode=retrieval_mode,
@@ -532,7 +567,9 @@ class AgentFrameworkRuntime:
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
+            precomputed_route=precomputed_route,
         )
+        logger.info("perf stage=%s ms=%.1f", "rag_lookup", (time.perf_counter() - _t0_rag) * 1000)
         route = tool_result.get("route", "HYBRID")
         reasoning = tool_result.get("reasoning", "Fallback retrieval path")
         sql_results = tool_result.get("sql_results", [])
@@ -573,25 +610,22 @@ class AgentFrameworkRuntime:
             + list(source_results.get("VECTOR_OPS", []))
             + list(source_results.get("VECTOR_AIRPORT", []))
         )
-        answer = self.retriever._synthesize_answer(
-            query,
-            {
-                "sql_results": sql_results[:12],
-                "kql_results": source_results.get("KQL", [])[:8],
-                "graph_results": source_results.get("GRAPH", [])[:8],
-                "nosql_results": source_results.get("NOSQL", [])[:8],
-                "vector_results": [
-                    {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
-                    for row in vector_rows[:12]
-                ],
-                "reconciled_items": reconciled_items[:40],
-                "coverage_summary": coverage_summary,
-                "conflict_summary": conflict_summary,
-            },
-            route,
-        )
+        synthesis_context = {
+            "sql_results": sql_results[:12],
+            "kql_results": source_results.get("KQL", [])[:8],
+            "graph_results": source_results.get("GRAPH", [])[:8],
+            "nosql_results": source_results.get("NOSQL", [])[:8],
+            "vector_results": [
+                {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
+                for row in vector_rows[:12]
+            ],
+            "reconciled_items": reconciled_items[:40],
+            "coverage_summary": coverage_summary,
+            "conflict_summary": conflict_summary,
+        }
 
-        for event in self._emit_text_chunks(answer):
+        # True streaming: yield tokens as they arrive from the LLM.
+        for event in self.retriever._synthesize_answer_stream(query, synthesis_context, route):
             yield event
 
         if citations_payload:

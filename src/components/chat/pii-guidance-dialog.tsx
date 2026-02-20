@@ -15,13 +15,11 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 const BLOCKED_EXAMPLES = [
   { pattern: "123-45-6789", description: "Social Security Number" },
   { pattern: "4111-1111-1111-1111", description: "Credit Card Number" },
-  { pattern: "5500 0000 0000 0004", description: "Credit Card (Mastercard)" },
-  { pattern: "GB82 WEST 1234 5698 7654 32", description: "IBAN" },
-  { pattern: "DEUTDEFF", description: "SWIFT/BIC Code" },
   { pattern: "john.doe@gmail.com", description: "Email Address" },
   { pattern: "+1-555-123-4567", description: "Phone Number" },
   { pattern: "123 Main St, Boston, MA 02101", description: "Physical Address" },
-  { pattern: "021000021", description: "ABA Routing Number" },
+  { pattern: "C04106789", description: "Passport Number" },
+  { pattern: "ATP-2847561", description: "Pilot License Number" },
 ];
 
 const ALLOWED_EXAMPLES = [

@@ -3,8 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-DB_MODE="${DB_MODE:-sqlite}"
-SQLITE_DB="${SQLITE_DB:-${ROOT_DIR}/aviation.db}"
+DB_MODE="${DB_MODE:-postgres}"
 RAW_DIR="${RAW_DIR:-${ROOT_DIR}/data/asrs/raw}"
 MANIFEST_DIR="${MANIFEST_DIR:-${ROOT_DIR}/data/asrs/manifests}"
 PROCESSED_DIR="${PROCESSED_DIR:-${ROOT_DIR}/data/processed}"
@@ -55,21 +54,12 @@ echo "[2/4] Extract + normalize"
   --output "$PROCESSED_DIR"
 
 echo
-echo "[3/4] Load SQL store"
-if [[ "$DB_MODE" == "sqlite" ]]; then
-  "$PYTHON_BIN" "$ROOT_DIR/scripts/02_load_database.py" \
-    --mode sqlite \
-    --db "$SQLITE_DB" \
-    --data "$PROCESSED_DIR" \
-    --run-id "$RUN_ID" \
-    --source-manifest "$LATEST_MANIFEST"
-else
-  "$PYTHON_BIN" "$ROOT_DIR/scripts/02_load_database.py" \
-    --mode postgres \
-    --data "$PROCESSED_DIR" \
-    --run-id "$RUN_ID" \
-    --source-manifest "$LATEST_MANIFEST"
-fi
+echo "[3/4] Load SQL store (PostgreSQL)"
+"$PYTHON_BIN" "$ROOT_DIR/scripts/02_load_database.py" \
+  --mode postgres \
+  --data "$PROCESSED_DIR" \
+  --run-id "$RUN_ID" \
+  --source-manifest "$LATEST_MANIFEST"
 
 echo
 echo "[4/5] Create/update semantic index"

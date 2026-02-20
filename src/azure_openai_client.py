@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from typing import Dict, Optional, Tuple
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AzureOpenAI
+
+logger = logging.getLogger(__name__)
 
 AZURE_OPENAI_SCOPE = "https://cognitiveservices.azure.com/.default"
 
@@ -94,3 +98,39 @@ def init_azure_openai_client(
         if api_key:
             return _api_key_client(resolved_endpoint, resolved_api_version, api_key), "api-key"
         return _token_client(resolved_endpoint, resolved_api_version, credential), "token"
+
+
+# ---------------------------------------------------------------------------
+# Shared singleton client — reuses TCP/TLS connections across all callers
+# ---------------------------------------------------------------------------
+
+_shared_client: Optional[AzureOpenAI] = None
+_shared_auth_mode: str = ""
+_shared_lock = threading.Lock()
+
+
+def get_shared_client(
+    *,
+    api_version: Optional[str] = None,
+) -> Tuple[AzureOpenAI, str]:
+    """Return a process-wide shared AzureOpenAI client (thread-safe lazy init).
+
+    The shared client uses the default endpoint and auth mode from env vars,
+    identical to what ``init_azure_openai_client()`` produces.  All callers
+    still provide their own ``model`` / deployment name per-request.
+    """
+    global _shared_client, _shared_auth_mode
+
+    if _shared_client is not None:
+        return _shared_client, _shared_auth_mode
+
+    with _shared_lock:
+        # Double-checked locking.
+        if _shared_client is not None:
+            return _shared_client, _shared_auth_mode
+
+        client, auth_mode = init_azure_openai_client(api_version=api_version)
+        _shared_client = client
+        _shared_auth_mode = auth_mode
+        logger.info("Shared AzureOpenAI client initialized (auth=%s)", auth_mode)
+        return _shared_client, _shared_auth_mode

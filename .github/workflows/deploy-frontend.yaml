@@ -45,7 +45,29 @@ env:
   AZURE_OPENAI_BEARER_TOKEN: ${{ secrets.AZURE_OPENAI_BEARER_TOKEN }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./src
+        run: npm ci
+
+      - name: Lint
+        working-directory: ./src
+        run: npx next lint
+
   build-and-deploy:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

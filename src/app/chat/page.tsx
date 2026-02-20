@@ -2,10 +2,13 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { AlertTriangle, X } from "lucide-react";
+import { AlertTriangle, X, Settings2 } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SourcesPanel } from "@/components/layout/sources-panel";
-import { ChatThread, TimelinePanel } from "@/components/chat/chat-thread";
+import { Header } from "@/components/layout/header";
+import { Footer } from "@/components/layout/footer";
+import { ChatThread } from "@/components/chat/chat-thread";
+import { TimelinePanel } from "@/components/chat/timeline-panel";
 import { MessageComposer } from "@/components/chat/message-composer";
 import { FollowUpChips } from "@/components/chat/follow-up-chips";
 import { ToggleGroup } from "@/components/ui/switch";
@@ -43,7 +46,6 @@ import type {
 } from "@/types";
 import type { StreamEvent } from "@/lib/chat";
 
-type RetrievalMode = "code-rag" | "foundry-iq";
 type QueryProfile = "pilot-brief" | "ops-live" | "compliance";
 type DemoScenario = "none" | "weather-spike" | "runway-notam" | "ground-bottleneck";
 type VoiceMode = "off" | "tr-TR" | "en-US";
@@ -343,13 +345,11 @@ export default function ChatPage() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sourcesPanelCollapsed, setSourcesPanelCollapsed] = useState(false);
 
-  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>("code-rag");
   const [queryProfile, setQueryProfile] = useState<QueryProfile>("pilot-brief");
   const [explainRetrieval, setExplainRetrieval] = useState(true);
   const [freshnessSlaMinutes, setFreshnessSlaMinutes] = useState<number>(60);
   const [demoScenario, setDemoScenario] = useState<DemoScenario>("none");
 
-  const [requiredSources, setRequiredSources] = useState<string[]>([]);
 
   const [activeConversationId, setActiveConversationId] = useState<string | null>(
     SAMPLE_CONVERSATIONS[0]?.id || null
@@ -380,7 +380,8 @@ export default function ChatPage() {
   const [fabricPreflight, setFabricPreflight] = useState<FabricPreflightStatus | null>(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
   const [operationalAlert, setOperationalAlert] = useState<OperationalAlert | null>(null);
-  const [voiceMode, setVoiceMode] = useState<VoiceMode>("tr-TR");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>("off");
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [voiceStatuses, setVoiceStatuses] = useState<Record<string, VoiceClipStatus>>({});
 
@@ -480,13 +481,6 @@ export default function ChatPage() {
     setActiveCitationId((previous) => (previous === id ? null : id));
   }, []);
 
-  const toggleRequiredSource = useCallback((sourceId: string) => {
-    setRequiredSources((previous) =>
-      previous.includes(sourceId)
-        ? previous.filter((item) => item !== sourceId)
-        : [...previous, sourceId]
-    );
-  }, []);
 
   const fetchFabricPreflight = useCallback(async () => {
     setPreflightLoading(true);
@@ -756,10 +750,9 @@ export default function ChatPage() {
               role: message.role,
               content: message.content,
             })),
-            retrievalMode,
+            retrievalMode: "code-rag",
             conversationId,
             queryProfile,
-            requiredSources,
             freshnessSlaMinutes,
             explainRetrieval,
             demoScenario: demoScenario === "none" ? undefined : demoScenario,
@@ -978,9 +971,7 @@ export default function ChatPage() {
     [
       activeConversationId,
       messages,
-      retrievalMode,
       queryProfile,
-      requiredSources,
       freshnessSlaMinutes,
       explainRetrieval,
       demoScenario,
@@ -1024,7 +1015,10 @@ export default function ChatPage() {
     : `Data path health: ${preflightStatus.toUpperCase()}`;
 
   return (
-    <div className="flex h-full bg-transparent">
+    <div className="flex h-full flex-col bg-transparent">
+      <Header />
+
+      <div className="flex min-h-0 flex-1">
       <Sidebar
         isCollapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((previous) => !previous)}
@@ -1045,31 +1039,9 @@ export default function ChatPage() {
               <Badge variant={isLoading ? "warning" : "success"}>
                 {isLoading ? "Briefing in progress" : "Ready"}
               </Badge>
-              <Badge variant={preflightVariant}>{preflightText}</Badge>
-              <Badge variant={fabricPreflight?.live_path_available ? "success" : "outline"}>
-                {fabricPreflight?.live_path_available ? "Primary data path ready" : "Protected fallback ready"}
-              </Badge>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => void fetchFabricPreflight()}
-                disabled={preflightLoading}
-                className="h-7 px-2 text-[11px]"
-              >
-                {preflightLoading ? "Checking..." : "Refresh data path"}
-              </Button>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              <ToggleGroup
-                value={retrievalMode}
-                onValueChange={(value) => setRetrievalMode(value as RetrievalMode)}
-                options={[
-                  { value: "code-rag", label: "Code RAG" },
-                  { value: "foundry-iq", label: "Foundry IQ" },
-                ]}
-              />
-
               <ToggleGroup
                 value={queryProfile}
                 onValueChange={(value) => setQueryProfile(value as QueryProfile)}
@@ -1096,77 +1068,90 @@ export default function ChatPage() {
                 ]}
               />
 
-              <ToggleGroup
-                value={String(freshnessSlaMinutes)}
-                onValueChange={(value) => setFreshnessSlaMinutes(Number(value))}
-                options={[
-                  { value: "15", label: "SLA 15m" },
-                  { value: "60", label: "SLA 60m" },
-                  { value: "180", label: "SLA 180m" },
-                ]}
-              />
-
-              <ToggleGroup
-                value={demoScenario}
-                onValueChange={(value) => setDemoScenario(value as DemoScenario)}
-                options={[
-                  { value: "none", label: "Scenario Off" },
-                  { value: "weather-spike", label: "Weather Spike" },
-                  { value: "runway-notam", label: "Runway NOTAM" },
-                  { value: "ground-bottleneck", label: "Ground Bottleneck" },
-                ]}
-              />
-
               <Button
                 size="sm"
-                variant={explainRetrieval ? "secondary" : "outline"}
-                onClick={() => setExplainRetrieval((previous) => !previous)}
+                variant="ghost"
+                onClick={() => setShowAdvanced((previous) => !previous)}
+                className="h-7 gap-1.5 px-2 text-[11px]"
               >
-                Explainability {explainRetrieval ? "On" : "Off"}
+                <Settings2 className="h-3.5 w-3.5" />
+                {showAdvanced ? "Less" : "More"}
               </Button>
-
-              <Dialog>
-                <DialogTrigger asChild>
-                  <Button size="sm" variant="outline">
-                    Architecture View
-                  </Button>
-                </DialogTrigger>
-                <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
-                  <DialogHeader>
-                    <DialogTitle>Context-to-Evidence Architecture</DialogTitle>
-                    <DialogDescription>
-                      Live source status and retrieval rationale for each datastore used by the flight brief assistant.
-                    </DialogDescription>
-                  </DialogHeader>
-                  <ArchitectureMap sourceHealth={sourceHealth} />
-                </DialogContent>
-              </Dialog>
             </div>
           </div>
 
-          <div className="mx-auto mt-3 flex max-w-5xl flex-wrap gap-2">
-            {DATA_SOURCE_BLUEPRINT.map((source) => {
-              const selected = requiredSources.includes(source.id);
-              return (
-                <Button
-                  key={source.id}
-                  size="sm"
-                  variant={selected ? "secondary" : "outline"}
-                  onClick={() => toggleRequiredSource(source.id)}
-                  className="h-7 rounded-full px-3 text-[11px]"
-                >
-                  {source.id}
-                </Button>
-              );
-            })}
-          </div>
-          {fabricPreflight && (
-            <div className="mx-auto mt-2 max-w-5xl text-xs text-muted-foreground">
-              Data path checked at {fabricPreflight.timestamp || "n/a"} · checks:{" "}
-              {fabricPreflight.checks?.length || 0}
-              {fabricPreflight.error ? " · status degraded" : ""}
-            </div>
-          )}
+          <AnimatePresence initial={false}>
+            {showAdvanced && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.2 }}
+                className="overflow-hidden"
+              >
+                <div className="mx-auto mt-3 max-w-5xl border-t border-border/50 pt-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <ToggleGroup
+                      value={String(freshnessSlaMinutes)}
+                      onValueChange={(value) => setFreshnessSlaMinutes(Number(value))}
+                      options={[
+                        { value: "15", label: "SLA 15m" },
+                        { value: "60", label: "SLA 60m" },
+                        { value: "180", label: "SLA 180m" },
+                      ]}
+                    />
+
+                    <ToggleGroup
+                      value={demoScenario}
+                      onValueChange={(value) => setDemoScenario(value as DemoScenario)}
+                      options={[
+                        { value: "none", label: "Scenario Off" },
+                        { value: "weather-spike", label: "Weather Spike" },
+                        { value: "runway-notam", label: "Runway NOTAM" },
+                        { value: "ground-bottleneck", label: "Ground Bottleneck" },
+                      ]}
+                    />
+
+                    <Button
+                      size="sm"
+                      variant={explainRetrieval ? "secondary" : "outline"}
+                      onClick={() => setExplainRetrieval((previous) => !previous)}
+                    >
+                      Explainability {explainRetrieval ? "On" : "Off"}
+                    </Button>
+
+                    <Dialog>
+                      <DialogTrigger asChild>
+                        <Button size="sm" variant="outline">
+                          Architecture View
+                        </Button>
+                      </DialogTrigger>
+                      <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
+                        <DialogHeader>
+                          <DialogTitle>Context-to-Evidence Architecture</DialogTitle>
+                          <DialogDescription>
+                            Live source status and retrieval rationale for each datastore used by the flight brief assistant.
+                          </DialogDescription>
+                        </DialogHeader>
+                        <ArchitectureMap sourceHealth={sourceHealth} />
+                      </DialogContent>
+                    </Dialog>
+
+                    <Badge variant={preflightVariant}>{preflightText}</Badge>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void fetchFabricPreflight()}
+                      disabled={preflightLoading}
+                      className="h-7 px-2 text-[11px]"
+                    >
+                      {preflightLoading ? "Checking..." : "Refresh data path"}
+                    </Button>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
 
         <OperationalAlertBanner
@@ -1228,6 +1213,9 @@ export default function ChatPage() {
         isLoading={isLoading}
         confidenceLabel={confidenceLabel}
       />
+      </div>
+
+      <Footer />
     </div>
   );
 }

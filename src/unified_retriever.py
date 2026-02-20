@@ -4,21 +4,17 @@ Unified Retriever - Multi-source retrieval combining SQL and Semantic search.
 Routes queries to appropriate sources and returns answers with citations.
 """
 
-import csv
-import gzip
-import io
 import json
 import logging
 import os
 import re
-import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, Generator, List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -26,7 +22,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 
-from azure_openai_client import init_azure_openai_client
+from azure_openai_client import get_shared_client
 from query_router import QueryRouter
 from query_writers import SQLWriter
 from sql_generator import SQLGenerator
@@ -37,13 +33,8 @@ logger = logging.getLogger(__name__)
 # Load .env file
 load_dotenv()
 
-# Database configuration - support both SQLite (local) and PostgreSQL (production)
-_USE_POSTGRES_RAW = os.getenv("USE_POSTGRES", "").strip().lower()
-if _USE_POSTGRES_RAW:
-    USE_POSTGRES = _USE_POSTGRES_RAW in ("true", "1", "yes")
-else:
-    USE_POSTGRES = bool(os.getenv("PGHOST"))
-DB_PATH = Path(os.getenv("SQLITE_PATH", "aviation.db"))
+# Database configuration — PostgreSQL only.
+# When PG is unavailable, SQL is simply marked as unavailable (no SQLite fallback).
 
 # Azure OpenAI configuration
 OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
@@ -64,26 +55,6 @@ def _get_fabric_bearer_token() -> str:
     """Re-read bearer token from env on each call so rotated tokens take effect."""
     return os.getenv("FABRIC_BEARER_TOKEN", "")
 
-
-def _resolve_project_root() -> Path:
-    module_dir = Path(__file__).resolve().parent
-    candidates = [module_dir, module_dir.parent]
-    marker_paths = [
-        Path("data/b-runways.csv"),
-        Path("data/a-metars.cache.csv.gz"),
-        Path("data/a-tafs.cache.xml.gz"),
-        Path("data/h-notam_recent"),
-    ]
-    for candidate in candidates:
-        if any((candidate / marker).exists() for marker in marker_paths):
-            return candidate
-    for candidate in candidates:
-        if (candidate / "contracts").exists():
-            return candidate
-    return module_dir
-
-
-ROOT = _resolve_project_root()
 
 CITY_AIRPORT_MAP: Dict[str, List[str]] = {
     "new york": ["KJFK", "KLGA", "KEWR"],
@@ -203,7 +174,7 @@ class UnifiedRetriever:
 
     def __init__(self, enable_pii_filter: bool = True):
         # LLM client
-        self.llm, self.llm_auth_mode = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+        self.llm, self.llm_auth_mode = get_shared_client(api_version=OPENAI_API_VERSION)
         self.llm_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
         self.embedding_deployment = os.getenv(
             "AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small"
@@ -230,95 +201,69 @@ class UnifiedRetriever:
                     credential=search_credential,
                 )
         else:
-            print("Warning: Azure AI Search is not configured; semantic retrieval will be unavailable.")
+            logger.warning("Azure AI Search is not configured; semantic retrieval will be unavailable.")
 
-        # Source execution policy and dialect controls.
-        self.strict_source_mode = _env_bool("RETRIEVAL_STRICT_SOURCE_MODE", False)
-        self.allow_sqlite_fallback = _env_bool("ALLOW_SQLITE_FALLBACK", not self.strict_source_mode)
-        self.allow_mock_kql_fallback = _env_bool("ALLOW_MOCK_KQL_FALLBACK", not self.strict_source_mode)
-        self.allow_mock_graph_fallback = _env_bool("ALLOW_MOCK_GRAPH_FALLBACK", not self.strict_source_mode)
-        self.allow_mock_nosql_fallback = _env_bool("ALLOW_MOCK_NOSQL_FALLBACK", not self.strict_source_mode)
-        self.allow_legacy_sql_fallback = _env_bool("ALLOW_LEGACY_SQL_FALLBACK", not self.strict_source_mode)
-
-        # Database connection - SQLite or PostgreSQL.
-        self.use_postgres = USE_POSTGRES
-        self.db = None  # SQLite connection (only used for SQLite mode)
+        # Database connection — PostgreSQL only.
         self._pg_pool = None  # PostgreSQL connection pool (thread-safe)
         self._pg_pool_lock = threading.Lock()
         self.sql_backend = "unavailable"
         self.sql_available = False
         self.sql_unavailable_reason = ""
-        self.sql_visible_schemas = _env_csv("SQL_VISIBLE_SCHEMAS", "public,demo" if self.use_postgres else "")
-        if self.use_postgres:
+        self.sql_visible_schemas = _env_csv("SQL_VISIBLE_SCHEMAS", "public,demo")
+        try:
+            import psycopg2
+            import psycopg2.pool
+            connect_kwargs: Dict[str, Any] = {
+                "host": os.getenv("PGHOST"),
+                "port": int(os.getenv("PGPORT", 5432)),
+                "database": os.getenv("PGDATABASE", "aviationrag"),
+                "user": os.getenv("PGUSER"),
+                "password": os.getenv("PGPASSWORD"),
+                "sslmode": "require",
+                "connect_timeout": 5,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
+            }
+            if self.sql_visible_schemas:
+                schemas_param = ",".join(self.sql_visible_schemas)
+                connect_kwargs["options"] = f"-c search_path={schemas_param}"
+
+            self._pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=5,
+                **connect_kwargs,
+            )
+            # Verify pool is usable with a test connection.
+            test_conn = self._pg_pool.getconn()
             try:
-                import psycopg2
-                import psycopg2.pool
-                connect_kwargs: Dict[str, Any] = {
-                    "host": os.getenv("PGHOST"),
-                    "port": int(os.getenv("PGPORT", 5432)),
-                    "database": os.getenv("PGDATABASE", "aviationdb"),
-                    "user": os.getenv("PGUSER"),
-                    "password": os.getenv("PGPASSWORD"),
-                    "sslmode": "require",
-                    "connect_timeout": 5,
-                    "keepalives": 1,
-                    "keepalives_idle": 30,
-                    "keepalives_interval": 10,
-                    "keepalives_count": 5,
-                }
+                test_conn.autocommit = True
                 if self.sql_visible_schemas:
-                    schemas_param = ",".join(self.sql_visible_schemas)
-                    connect_kwargs["options"] = f"-c search_path={schemas_param}"
-
-                self._pg_pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=1,
-                    maxconn=5,
-                    **connect_kwargs,
-                )
-                # Verify pool is usable with a test connection.
-                test_conn = self._pg_pool.getconn()
-                try:
-                    test_conn.autocommit = True
-                    if self.sql_visible_schemas:
-                        with test_conn.cursor() as cur:
-                            cur.execute(
-                                "SET search_path TO " + ", ".join(
-                                    "%s" for _ in self.sql_visible_schemas
-                                ),
-                                self.sql_visible_schemas,
-                            )
-                finally:
-                    self._pg_pool.putconn(test_conn)
-                self.sql_backend = "postgres"
-                self.sql_available = True
-                print(
-                    f"Connected to PostgreSQL pool: {os.getenv('PGHOST')}/{os.getenv('PGDATABASE', 'aviationdb')} "
-                    f"(search_path={','.join(self.sql_visible_schemas) or 'default'})"
-                )
-            except Exception as exc:
-                self.sql_unavailable_reason = str(exc)
-                self._pg_pool = None
-                if self.allow_sqlite_fallback:
-                    self.use_postgres = False
-                    self.db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-                    self.db.row_factory = sqlite3.Row
-                    self.sql_backend = "sqlite-fallback"
-                    self.sql_available = True
-                    print(f"Warning: PostgreSQL unavailable ({exc}); falling back to SQLite: {DB_PATH}")
-                else:
-                    self.db = None
-                    self.sql_backend = "unavailable"
-                    self.sql_available = False
-                    print(f"Warning: PostgreSQL unavailable and fallback disabled ({exc})")
-        else:
-            self.db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-            self.db.row_factory = sqlite3.Row
-            self.sql_backend = "sqlite"
+                    with test_conn.cursor() as cur:
+                        cur.execute(
+                            "SET search_path TO " + ", ".join(
+                                "%s" for _ in self.sql_visible_schemas
+                            ),
+                            self.sql_visible_schemas,
+                        )
+            finally:
+                self._pg_pool.putconn(test_conn)
+            self.sql_backend = "postgres"
             self.sql_available = True
-            print(f"Connected to SQLite: {DB_PATH}")
+            logger.info(
+                "Connected to PostgreSQL pool: %s/%s (search_path=%s)",
+                os.getenv("PGHOST"), os.getenv("PGDATABASE", "aviationrag"),
+                ",".join(self.sql_visible_schemas) or "default",
+            )
+        except Exception as exc:
+            self.sql_unavailable_reason = str(exc)
+            self._pg_pool = None
+            self.sql_backend = "unavailable"
+            self.sql_available = False
+            logger.warning("PostgreSQL unavailable (%s)", exc)
 
-        dialect_default = "postgres" if self.use_postgres else "sqlite"
-        self.sql_dialect = (os.getenv("SQL_DIALECT", dialect_default) or dialect_default).strip().lower()
+        self.sql_dialect = "postgres"
 
         # Specialized components
         self.router = QueryRouter()
@@ -329,17 +274,22 @@ class UnifiedRetriever:
         self.use_legacy_sql_generator = _env_bool("USE_LEGACY_SQL_GENERATOR", False)
         self._vector_k_param = self._detect_vector_k_param()
 
+        # Schema cache (avoids repeated DB introspection within TTL)
+        self._schema_cache: Optional[Dict[str, Any]] = None
+        self._schema_cache_expires_at: float = 0.0
+        self._schema_cache_ttl: float = float(os.getenv("SQL_SCHEMA_CACHE_TTL_SECONDS", "300"))
+
         # PII filter
         self.enable_pii_filter = enable_pii_filter
         if enable_pii_filter:
             self.pii_filter = PiiFilter()
             if self.pii_filter.is_available():
-                print("PII filter enabled and available")
+                logger.info("PII filter enabled and available")
             else:
-                print("Warning: PII filter enabled but service unavailable")
+                logger.warning("PII filter enabled but service unavailable")
         else:
             self.pii_filter = None
-            print("Warning: PII filter disabled")
+            logger.warning("PII filter disabled")
 
     def _detect_vector_k_param(self) -> str:
         """Handle azure-search-documents SDK drift (k vs k_nearest_neighbors)."""
@@ -357,18 +307,16 @@ class UnifiedRetriever:
 
     def get_embedding(self, text: str) -> List[float]:
         """Get embedding from Azure OpenAI."""
+        _t0 = time.perf_counter()
         response = self.llm.embeddings.create(
             model=self.embedding_deployment,
             input=text[:8000]
         )
+        logger.info("perf stage=%s ms=%.1f", "get_embedding", (time.perf_counter() - _t0) * 1000)
         return response.data[0].embedding
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
-
-    def _latest_matching(self, pattern: str) -> Optional[Path]:
-        matches = sorted(ROOT.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-        return matches[0] if matches else None
 
     def _post_json(self, endpoint: str, payload: Any) -> Any:
         body = json.dumps(payload).encode("utf-8")
@@ -433,202 +381,6 @@ class UnifiedRetriever:
             return []
         return self._extract_airports_from_query(sql_query)
 
-    def _latest_runways_file(self) -> Optional[Path]:
-        return (
-            self._latest_matching("data/g-ourairports_recent/runways_*.csv")
-            or self._latest_matching("data/b-runways.csv")
-        )
-
-    def _query_runway_constraints_fallback(self, query: str, airports: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], List[Citation]]:
-        runways_file = self._latest_runways_file()
-        if not runways_file:
-            return (
-                [self._source_unavailable_row("SQL", "runway_constraints_fallback_dataset_missing")],
-                [],
-            )
-
-        airport_list = [a.upper() for a in (airports or self._extract_airports_from_query(query)) if a]
-        if not airport_list:
-            airport_list = ["KJFK", "KLGA", "KEWR"]
-        airport_set = set(airport_list)
-
-        rows: List[Dict[str, Any]] = []
-        with runways_file.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                airport = str(row.get("airport_ident") or "").upper().strip()
-                if airport not in airport_set:
-                    continue
-                le_ident = str(row.get("le_ident") or "").strip()
-                he_ident = str(row.get("he_ident") or "").strip()
-                runway_id = "/".join([x for x in [le_ident, he_ident] if x]) or str(row.get("id") or "unknown")
-                rows.append(
-                    {
-                        "airport": airport,
-                        "runway_id": runway_id,
-                        "constraint_type": "runway_profile",
-                        "effective_from": None,
-                        "effective_to": None,
-                        "length_ft": int(float(row.get("length_ft") or 0)) if row.get("length_ft") else None,
-                        "width_ft": int(float(row.get("width_ft") or 0)) if row.get("width_ft") else None,
-                        "surface": row.get("surface"),
-                        "lighted": row.get("lighted"),
-                        "source_file": str(runways_file),
-                    }
-                )
-                if len(rows) >= 60:
-                    break
-
-        if not rows:
-            return (
-                [self._source_error_row("SQL", "runway_constraints_unavailable", f"no runway rows matched {airport_list}")],
-                [],
-            )
-
-        citations = [
-            Citation(
-                source_type="SQL",
-                identifier=f"runway_{idx}",
-                title=f"{row.get('airport')} {row.get('runway_id')}",
-                content_preview=str(row)[:120],
-                score=0.85,
-                dataset="ourairports-runways-fallback",
-            )
-            for idx, row in enumerate(rows[:10], start=1)
-        ]
-        return rows, citations
-
-    def _load_gzip_text(self, local_file: Optional[Path], remote_url: str) -> Optional[str]:
-        try:
-            if local_file and local_file.exists():
-                with gzip.open(local_file, "rt", encoding="utf-8", errors="ignore") as f:
-                    return f.read()
-            with urllib.request.urlopen(remote_url, timeout=20) as resp:
-                payload = resp.read()
-            return gzip.decompress(payload).decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-
-    def _metar_rows_for_airports(self, airports: List[str], max_rows: int = 12) -> List[Dict[str, Any]]:
-        metars_file = self._latest_matching("data/a-metars.cache.csv.gz")
-        text = self._load_gzip_text(
-            metars_file,
-            "https://aviationweather.gov/data/cache/metars.cache.csv.gz",
-        )
-        if not text:
-            return []
-
-        latest_by_station: Dict[str, Dict[str, Any]] = {}
-        reader = csv.DictReader(io.StringIO(text))
-        airport_set = {a.upper() for a in airports}
-        for row in reader:
-            station = str(row.get("station_id") or "").upper().strip()
-            if station not in airport_set:
-                continue
-            existing = latest_by_station.get(station)
-            current_ts = str(row.get("observation_time") or "")
-            existing_ts = str(existing.get("observation_time") or "") if existing else ""
-            if not existing or current_ts > existing_ts:
-                latest_by_station[station] = row
-
-        out: List[Dict[str, Any]] = []
-        for station in airports:
-            row = latest_by_station.get(station.upper())
-            if not row:
-                continue
-            out.append(
-                {
-                    "station_id": row.get("station_id"),
-                    "observation_time": row.get("observation_time"),
-                    "raw_text": row.get("raw_text"),
-                    "flight_category": row.get("flight_category"),
-                    "wind_speed_kt": row.get("wind_speed_kt"),
-                    "wind_gust_kt": row.get("wind_gust_kt"),
-                    "visibility_statute_mi": row.get("visibility_statute_mi"),
-                    "source_file": str(metars_file) if metars_file else "aviationweather_cache_feed",
-                }
-            )
-            if len(out) >= max_rows:
-                break
-        return out
-
-    def _taf_rows_for_airports(self, airports: List[str], max_rows: int = 12) -> List[Dict[str, Any]]:
-        tafs_file = self._latest_matching("data/a-tafs.cache.xml.gz")
-        text = self._load_gzip_text(
-            tafs_file,
-            "https://aviationweather.gov/data/cache/tafs.cache.xml.gz",
-        )
-        if not text:
-            return []
-
-        try:
-            root = ET.fromstring(text)
-        except Exception:
-            return []
-
-        airport_set = {a.upper() for a in airports}
-        out: List[Dict[str, Any]] = []
-        for taf in root.findall(".//TAF"):
-            station = (taf.findtext("station_id") or "").upper().strip()
-            if station not in airport_set:
-                continue
-            out.append(
-                {
-                    "station_id": station,
-                    "issue_time": taf.findtext("issue_time"),
-                    "valid_time_from": taf.findtext("valid_time_from"),
-                    "valid_time_to": taf.findtext("valid_time_to"),
-                    "raw_text": (taf.findtext("raw_text") or "").strip(),
-                    "source_file": str(tafs_file) if tafs_file else "aviationweather_cache_feed",
-                }
-            )
-            if len(out) >= max_rows:
-                break
-        return out
-
-    def _notam_docs_for_airports(self, query: str, max_rows: int = 30) -> List[Dict[str, Any]]:
-        airports = self._extract_airports_from_query(query)
-        facility_targets = {a[1:] if a.startswith("K") and len(a) == 4 else a for a in airports}
-        local_candidates = [
-            self._latest_matching("data/h-notam_recent/*/search_location_us_hubs_all.jsonl"),
-            self._latest_matching("data/h-notam_recent/*/search_location_us_hubs.jsonl"),
-            self._latest_matching("data/h-notam_recent/*/search_location_istanbul_all.jsonl"),
-            self._latest_matching("data/h-notam_recent/*/search_location_istanbul.jsonl"),
-        ]
-
-        docs: List[Dict[str, Any]] = []
-        for file in [f for f in local_candidates if f]:
-            try:
-                with file.open("r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        try:
-                            obj = json.loads(line)
-                        except Exception:
-                            continue
-                        facility = str(obj.get("facilityDesignator") or "").upper().strip()
-                        if facility_targets and facility not in facility_targets:
-                            icao_msg = str(obj.get("icaoMessage") or "").upper()
-                            if not any(airport in icao_msg for airport in airports):
-                                continue
-                        docs.append(
-                            {
-                                "facilityDesignator": obj.get("facilityDesignator"),
-                                "notamNumber": obj.get("notamNumber"),
-                                "issueDate": obj.get("issueDate"),
-                                "startDate": obj.get("startDate"),
-                                "endDate": obj.get("endDate"),
-                                "sourceType": obj.get("sourceType"),
-                                "airportName": obj.get("airportName"),
-                                "icaoMessage": str(obj.get("icaoMessage") or "")[:400],
-                                "source_file": str(file),
-                            }
-                        )
-                        if len(docs) >= max_rows:
-                            return docs
-            except Exception:
-                continue
-        return docs
-
     def _kusto_rows(self, endpoint: str, csl: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         db_name = FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "").strip()
         if not db_name:
@@ -664,7 +416,6 @@ class UnifiedRetriever:
             "error": detail,
             "error_code": code,
             "source": source,
-            "strict_mode": self.strict_source_mode,
         }
         if extra:
             payload.update(extra)
@@ -675,29 +426,18 @@ class UnifiedRetriever:
             source=source,
             code="source_unavailable",
             detail=detail,
-            extra={"execution_mode": self.source_mode(source)},
         )
 
     def source_mode(self, source: str) -> str:
         source_norm = (source or "").upper()
         if source_norm == "SQL":
-            if not self.sql_available:
-                return "blocked"
-            if self.sql_backend == "postgres":
-                return "live"
-            return "fallback"
+            return "live" if self.sql_available else "blocked"
         if source_norm == "KQL":
-            if FABRIC_KQL_ENDPOINT:
-                return "live"
-            return "fallback" if self.allow_mock_kql_fallback else "blocked"
+            return "live" if FABRIC_KQL_ENDPOINT else "blocked"
         if source_norm == "GRAPH":
-            if FABRIC_GRAPH_ENDPOINT:
-                return "live"
-            return "fallback" if self.allow_mock_graph_fallback else "blocked"
+            return "live" if FABRIC_GRAPH_ENDPOINT else "blocked"
         if source_norm == "NOSQL":
-            if FABRIC_NOSQL_ENDPOINT:
-                return "live"
-            return "fallback" if self.allow_mock_nosql_fallback else "blocked"
+            return "live" if FABRIC_NOSQL_ENDPOINT else "blocked"
         if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
             return "live" if self.search_clients else "blocked"
         return "unknown"
@@ -726,7 +466,6 @@ class UnifiedRetriever:
             "store_type": store_type_map.get(source_norm, "unknown"),
             "endpoint_label": self.source_mode(source_norm),
             "freshness": freshness_map.get(source_norm, "unknown"),
-            "strict_source_mode": self.strict_source_mode,
             "sql_backend": self.sql_backend if source_norm == "SQL" else "",
         }
 
@@ -763,14 +502,6 @@ class UnifiedRetriever:
                 "status": token_status,
                 "detail": "present" if fabric_token else "missing_optional_or_not_configured",
                 "mode": "n/a",
-            }
-        )
-        checks.append(
-            {
-                "name": "strict_source_mode",
-                "status": "pass",
-                "detail": "enabled" if self.strict_source_mode else "disabled",
-                "mode": "policy",
             }
         )
         checks.append(
@@ -817,36 +548,11 @@ class UnifiedRetriever:
         checks.append(
             {
                 "name": "sql_schema_snapshot",
-                "status": "pass" if sql_schema.get("tables") else ("fail" if self.strict_source_mode else "warn"),
+                "status": "pass" if sql_schema.get("tables") else "fail",
                 "detail": f"tables={len(sql_schema.get('tables', []))}",
                 "mode": sql_mode,
             }
         )
-
-        fallback_ready = bool(
-            self._latest_matching("data/e-opensky_recent/opensky_states_all_*.json")
-            or self._latest_matching("data/a-metars.cache.csv.gz")
-            or self._latest_matching("data/j-synthetic_ops_overlay/*/synthetic/ops_graph_edges.csv")
-        )
-        checks.append(
-            {
-                "name": "local_fallback_datasets",
-                "status": "pass" if fallback_ready else "warn",
-                "detail": "ready" if fallback_ready else "not_found",
-                "mode": "fallback",
-            }
-        )
-
-        strict_blockers = [c["name"] for c in checks if c.get("mode") == "blocked"]
-        if self.strict_source_mode and strict_blockers:
-            checks.append(
-                {
-                    "name": "strict_mode_blockers",
-                    "status": "fail",
-                    "detail": ",".join(strict_blockers),
-                    "mode": "policy",
-                }
-            )
 
         if any(c["status"] == "fail" for c in checks):
             overall = "fail"
@@ -859,7 +565,6 @@ class UnifiedRetriever:
             "timestamp": self._now_iso(),
             "overall_status": overall,
             "live_path_available": live_configured,
-            "strict_source_mode": self.strict_source_mode,
             "checks": checks,
         }
 
@@ -871,7 +576,8 @@ class UnifiedRetriever:
             conn = self._pg_pool.getconn()
             conn.autocommit = True
             return conn
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to acquire PG connection: %s", exc)
             return None
 
     def _put_pg_connection(self, conn: Any) -> None:
@@ -879,10 +585,11 @@ class UnifiedRetriever:
         if self._pg_pool is not None and conn is not None:
             try:
                 self._pg_pool.putconn(conn)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to return PG connection to pool: %s", exc)
 
     def current_sql_schema(self) -> Dict[str, Any]:
+        _t0_schema = time.perf_counter()
         if not self.sql_available:
             return {
                 "source": "unavailable",
@@ -893,89 +600,87 @@ class UnifiedRetriever:
             }
 
         tables: List[Dict[str, Any]] = []
-        if self.use_postgres:
-            conn = self._get_pg_connection()
-            if conn is None:
-                return {
-                    "source": "unavailable",
-                    "collected_at": self._now_iso(),
-                    "schema_version": "none",
-                    "error": "pg_pool_connection_unavailable",
-                    "tables": [],
-                }
-            try:
-                cur = conn.cursor()
-                visible_schemas = self.sql_visible_schemas or ["public"]
+        conn = self._get_pg_connection()
+        if conn is None:
+            return {
+                "source": "unavailable",
+                "collected_at": self._now_iso(),
+                "schema_version": "none",
+                "error": "pg_pool_connection_unavailable",
+                "tables": [],
+            }
+        try:
+            cur = conn.cursor()
+            visible_schemas = self.sql_visible_schemas or ["public"]
+            cur.execute(
+                """
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_type='BASE TABLE'
+                  AND table_schema = ANY(%s)
+                ORDER BY table_schema, table_name
+                """,
+                (visible_schemas,),
+            )
+            table_rows = [(str(row[0]), str(row[1])) for row in cur.fetchall()]
+            for schema_name, table in table_rows:
                 cur.execute(
                     """
-                    SELECT table_schema, table_name
-                    FROM information_schema.tables
-                    WHERE table_type='BASE TABLE'
-                      AND table_schema = ANY(%s)
-                    ORDER BY table_schema, table_name
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema=%s AND table_name=%s
+                    ORDER BY ordinal_position
                     """,
-                    (visible_schemas,),
+                    (schema_name, table),
                 )
-                table_rows = [(str(row[0]), str(row[1])) for row in cur.fetchall()]
-                for schema_name, table in table_rows:
-                    cur.execute(
-                        """
-                        SELECT column_name, data_type
-                        FROM information_schema.columns
-                        WHERE table_schema=%s AND table_name=%s
-                        ORDER BY ordinal_position
-                        """,
-                        (schema_name, table),
-                    )
-                    cols = [{"name": str(r[0]), "type": str(r[1])} for r in cur.fetchall()]
-                    tables.append({"schema": schema_name, "table": table, "columns": cols})
-                cur.close()
-            except Exception as exc:
-                return {
-                    "source": "live",
-                    "collected_at": self._now_iso(),
-                    "schema_version": "error",
-                    "error": str(exc),
-                    "tables": [],
-                }
-            finally:
-                self._put_pg_connection(conn)
-        else:
-            if self.db is None:
-                return {
-                    "source": "unavailable",
-                    "collected_at": self._now_iso(),
-                    "schema_version": "none",
-                    "error": "sqlite_connection_unavailable",
-                    "tables": [],
-                }
-            try:
-                cur = self.db.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                table_names = [str(row[0]) for row in cur.fetchall()]
-                for table in table_names:
-                    # PRAGMA does not support parameterized queries in SQLite.
-                    # Table names come from sqlite_master so are trusted; use double-quoted identifier.
-                    safe_name = table.replace('"', '""')
-                    cur.execute(f'PRAGMA table_info("{safe_name}")')
-                    cols = [{"name": str(r[1]), "type": str(r[2])} for r in cur.fetchall()]
-                    tables.append({"table": table, "columns": cols})
-            except Exception as exc:
-                return {
-                    "source": "fallback",
-                    "collected_at": self._now_iso(),
-                    "schema_version": "error",
-                    "error": str(exc),
-                    "tables": [],
-                }
-        return {
-            "source": "live" if self.sql_backend == "postgres" else "fallback",
+                cols = [{"name": str(r[0]), "type": str(r[1])} for r in cur.fetchall()]
+                tables.append({"schema": schema_name, "table": table, "columns": cols})
+            cur.close()
+        except Exception as exc:
+            return {
+                "source": "live",
+                "collected_at": self._now_iso(),
+                "schema_version": "error",
+                "error": str(exc),
+                "tables": [],
+            }
+        finally:
+            self._put_pg_connection(conn)
+        result = {
+            "source": "live",
             "collected_at": self._now_iso(),
             "schema_version": f"tables:{len(tables)}",
             "tables": tables,
         }
+        logger.info("perf stage=%s ms=%.1f", "current_sql_schema", (time.perf_counter() - _t0_schema) * 1000)
+        return result
+
+    def cached_sql_schema(self) -> Dict[str, Any]:
+        """Return SQL schema from cache if fresh, otherwise refresh from DB."""
+        now = time.perf_counter()
+        if self._schema_cache is not None and now < self._schema_cache_expires_at:
+            return self._schema_cache
+        schema = self.current_sql_schema()
+        self._schema_cache = schema
+        self._schema_cache_expires_at = now + self._schema_cache_ttl
+        return schema
 
     def _detect_sql_tables(self, sql_query: str) -> List[str]:
+        # Collect CTE names defined by WITH ... AS so they can be excluded.
+        cte_names = {
+            m.lower()
+            for m in re.findall(
+                r"\bWITH\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\b", sql_query, flags=re.IGNORECASE
+            )
+        }
+        # Also handle comma-separated CTEs: WITH a AS (...), b AS (...)
+        cte_names.update(
+            m.lower()
+            for m in re.findall(
+                r",\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", sql_query, flags=re.IGNORECASE
+            )
+        )
+
         table_tokens = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.]*)", sql_query, flags=re.IGNORECASE)
         cleaned: List[str] = []
         for token in table_tokens:
@@ -989,6 +694,9 @@ class UnifiedRetriever:
                 table_ref = f"{parts[-2].lower()}.{parts[-1].lower()}"
             else:
                 table_ref = parts[-1].lower()
+            # Skip CTE-defined names — they are not real tables.
+            if table_ref in cte_names:
+                continue
             if table_ref not in cleaned:
                 cleaned.append(table_ref)
         return cleaned
@@ -1000,14 +708,23 @@ class UnifiedRetriever:
         if not re.match(r"^\s*(SELECT|WITH)\b", sql, flags=re.IGNORECASE):
             return {"code": "sql_validation_failed", "detail": "only_select_or_with_queries_are_allowed"}
 
-        dialect = (self.sql_dialect or "").lower()
-        if dialect == "sqlite":
-            if re.search(r"\bILIKE\b", sql, flags=re.IGNORECASE):
-                return {"code": "sql_dialect_mismatch", "detail": "ILIKE is not supported by sqlite"}
-            if re.search(r"::\s*[A-Za-z_][A-Za-z0-9_]*", sql):
-                return {"code": "sql_dialect_mismatch", "detail": "PostgreSQL-style :: casts are not supported by sqlite"}
+        # Block mutating / DDL keywords anywhere in the query.
+        _sql_blocked_patterns = (
+            r"\bDELETE\b", r"\bDROP\b", r"\bALTER\b", r"\bCREATE\b",
+            r"\bINSERT\b", r"\bUPDATE\b", r"\bEXEC\b", r"\bEXECUTE\b",
+            r"\bTRUNCATE\b", r"\bGRANT\b", r"\bREVOKE\b", r"\bMERGE\b",
+        )
+        for pattern in _sql_blocked_patterns:
+            if re.search(pattern, sql, flags=re.IGNORECASE):
+                return {"code": "sql_validation_failed", "detail": f"sql_contains_blocked_operation: {pattern}"}
 
-        schema = self.current_sql_schema()
+        # Check for semicolons outside of string literals to prevent multi-statement injection.
+        stripped = re.sub(r'"[^"]*"', '', sql)
+        stripped = re.sub(r"'[^']*'", '', stripped)
+        if ";" in stripped:
+            return {"code": "sql_validation_failed", "detail": "sql_multiple_statements_not_allowed"}
+
+        schema = self.cached_sql_schema()
         available_tables = set()
         for table_entry in schema.get("tables", []):
             if not isinstance(table_entry, dict):
@@ -1033,13 +750,6 @@ class UnifiedRetriever:
 
         validation_error = self._validate_sql_query(sql_query)
         if validation_error:
-            if (
-                str(validation_error.get("code")) == "sql_schema_missing"
-                and "runway_constraints" in str(validation_error.get("detail", "")).lower()
-                and not self.strict_source_mode
-            ):
-                airports = self._extract_airports_from_sql(sql_query)
-                return self._query_runway_constraints_fallback(sql_query, airports=airports)
             return [
                 self._source_error_row(
                     source="SQL",
@@ -1049,46 +759,27 @@ class UnifiedRetriever:
                 )
             ], []
 
-        if self.use_postgres:
-            conn = self._get_pg_connection()
-            if conn is None:
-                return [self._source_unavailable_row("SQL", "pg_pool_connection_unavailable")], []
-            try:
-                cur = conn.cursor()
-                cur.execute(sql_query)
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-                dict_rows = [dict(zip(columns, row)) for row in rows]
-                cur.close()
-            except Exception as exc:
-                return [
-                    self._source_error_row(
-                        source="SQL",
-                        code="sql_runtime_error",
-                        detail=str(exc),
-                        extra={"sql": sql_query},
-                    )
-                ], []
-            finally:
-                self._put_pg_connection(conn)
-        else:
-            if self.db is None:
-                return [self._source_unavailable_row("SQL", "sqlite_connection_unavailable")], []
-            try:
-                cur = self.db.cursor()
-                cur.execute(sql_query)
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-                dict_rows = [dict(zip(columns, row)) for row in rows]
-            except Exception as exc:
-                return [
-                    self._source_error_row(
-                        source="SQL",
-                        code="sql_runtime_error",
-                        detail=str(exc),
-                        extra={"sql": sql_query},
-                    )
-                ], []
+        conn = self._get_pg_connection()
+        if conn is None:
+            return [self._source_unavailable_row("SQL", "pg_pool_connection_unavailable")], []
+        try:
+            cur = conn.cursor()
+            cur.execute(sql_query)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+            dict_rows = [dict(zip(columns, row)) for row in rows]
+            cur.close()
+        except Exception as exc:
+            return [
+                self._source_error_row(
+                    source="SQL",
+                    code="sql_runtime_error",
+                    detail=str(exc),
+                    extra={"sql": sql_query},
+                )
+            ], []
+        finally:
+            self._put_pg_connection(conn)
 
         citations: List[Citation] = []
         for idx, row in enumerate(dict_rows[:10], start=1):
@@ -1108,7 +799,7 @@ class UnifiedRetriever:
 
     def _heuristic_sql_fallback(self, query: str, need_schema_detail: str) -> Optional[str]:
         """Best-effort SQL fallback when writer returns NEED_SCHEMA."""
-        schema = self.current_sql_schema()
+        schema = self.cached_sql_schema()
         tables = {
             str(t.get("table", "")).lower(): {
                 str(col.get("name", "")).lower()
@@ -1167,6 +858,7 @@ class UnifiedRetriever:
 
     def query_sql(self, query: str, sql_hint: str = None) -> Tuple[List[Dict], str, List[Citation]]:
         """Execute SQL query against the aviation database."""
+        _t0_sql = time.perf_counter()
         if not self.sql_available:
             row = self._source_unavailable_row("SQL", self.sql_unavailable_reason or "sql_backend_not_available")
             return [row], "", []
@@ -1180,7 +872,7 @@ class UnifiedRetriever:
             if self.use_legacy_sql_generator:
                 sql = self.sql_generator.generate(enhanced_query)
             else:
-                schema = self.current_sql_schema()
+                schema = self.cached_sql_schema()
                 sql = self.sql_writer.generate(
                     user_query=enhanced_query,
                     evidence_type="generic",
@@ -1190,9 +882,6 @@ class UnifiedRetriever:
                     constraints={"sql_hint": sql_hint or "", "dialect": self.sql_dialect},
                 )
         except Exception as exc:
-            if not self.allow_legacy_sql_fallback:
-                row = self._source_error_row("SQL", "sql_generation_failed", str(exc))
-                return [row], "", []
             try:
                 sql = self.sql_generator.generate(enhanced_query)
             except Exception as fallback_exc:
@@ -1216,6 +905,7 @@ class UnifiedRetriever:
             return [self._source_error_row("SQL", "sql_schema_missing", sql, {"sql": sql})], sql, []
 
         results, citations = self.execute_sql_query(sql)
+        logger.info("perf stage=%s ms=%.1f", "query_sql", (time.perf_counter() - _t0_sql) * 1000)
         return results, sql, citations
 
     def query_semantic(
@@ -1227,6 +917,7 @@ class UnifiedRetriever:
         filter_expression: Optional[str] = None,
     ) -> Tuple[List[Dict], List[Citation]]:
         """Search a specific semantic index using hybrid/vector retrieval."""
+        _t0_sem = time.perf_counter()
         index_name = self.vector_source_to_index.get(source) or self.vector_source_to_index.get("VECTOR_OPS", "idx_ops_narratives")
         client = self.search_clients.get(index_name)
         if client is None:
@@ -1337,6 +1028,7 @@ class UnifiedRetriever:
 
         results_list.sort(key=lambda row: float(row.get("__vector_score_final", 0.0) or 0.0), reverse=True)
         citations.sort(key=lambda c: c.score, reverse=True)
+        logger.info("perf stage=%s source=%s ms=%.1f", "query_semantic", source, (time.perf_counter() - _t0_sem) * 1000)
         return results_list[:top], citations[:top]
 
     def query_semantic_multi(
@@ -1416,53 +1108,70 @@ class UnifiedRetriever:
         return text
 
     def query_kql(self, query: str, window_minutes: int = 60) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve event-window signals from Eventhouse or local fallback."""
-        if FABRIC_KQL_ENDPOINT:
-            if self._is_kusto_endpoint(FABRIC_KQL_ENDPOINT):
-                if self._looks_like_kql_text(query):
-                    csl = self._ensure_kql_window(query, window_minutes)
-                elif self.strict_source_mode:
-                    return [
-                        self._source_error_row(
-                            source="KQL",
-                            code="kql_validation_failed",
-                            detail="selected KQL source requires executable KQL/CSL query text",
-                        )
-                    ], []
+        """Retrieve event-window signals from Eventhouse (live only)."""
+        if not FABRIC_KQL_ENDPOINT:
+            return [self._source_unavailable_row("KQL", "FABRIC_KQL_ENDPOINT not configured")], []
+
+        if self._is_kusto_endpoint(FABRIC_KQL_ENDPOINT):
+            if self._looks_like_kql_text(query):
+                csl = self._ensure_kql_window(query, window_minutes)
+            else:
+                airports = self._extract_airports_from_query(query)
+                if airports:
+                    values = ",".join(f"'{a}'" for a in airports)
+                    csl = (
+                        "weather_obs "
+                        f"| where toupper(station_id) in ({values}) or toupper(icao) in ({values}) "
+                        f"| where timestamp > ago({max(1, int(window_minutes))}m) "
+                        "| top 40 by timestamp desc"
+                    )
                 else:
-                    airports = self._extract_airports_from_query(query)
-                    if airports:
-                        values = ",".join(f"'{a}'" for a in airports)
+                    tokens = self._query_tokens(query)
+                    if tokens:
+                        values = ",".join(f"'{t}'" for t in tokens)
                         csl = (
-                            "weather_obs "
-                            f"| where toupper(station_id) in ({values}) or toupper(icao) in ({values}) "
-                            f"| where timestamp > ago({max(1, int(window_minutes))}m) "
-                            "| top 40 by timestamp desc"
+                            "opensky_states "
+                            f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                            "| take 50"
                         )
                     else:
-                        tokens = self._query_tokens(query)
-                        if tokens:
-                            values = ",".join(f"'{t}'" for t in tokens)
-                            csl = (
-                                "opensky_states "
-                                f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
-                                "| take 50"
-                            )
-                        else:
-                            csl = "opensky_states | take 50"
+                        csl = "opensky_states | take 50"
 
-                validation_error = self._validate_kql_query(csl)
-                if validation_error:
-                    return [
-                        self._source_error_row(
-                            source="KQL",
-                            code="kql_validation_failed",
-                            detail=validation_error,
-                            extra={"csl": csl},
-                        )
-                    ], []
+            validation_error = self._validate_kql_query(csl)
+            if validation_error:
+                return [
+                    self._source_error_row(
+                        source="KQL",
+                        code="kql_validation_failed",
+                        detail=validation_error,
+                        extra={"csl": csl},
+                    )
+                ], []
 
-                rows, error = self._kusto_rows(FABRIC_KQL_ENDPOINT, csl)
+            rows, error = self._kusto_rows(FABRIC_KQL_ENDPOINT, csl)
+            if rows:
+                citation = Citation(
+                    source_type="KQL",
+                    identifier="eventhouse_live",
+                    title="Fabric Eventhouse query",
+                    content_preview=str(rows)[:120],
+                    score=1.0,
+                    dataset="fabric-eventhouse",
+                )
+                return rows, [citation]
+            return [
+                self._source_error_row(
+                    source="KQL",
+                    code="kql_runtime_error",
+                    detail=error or "kql_query_returned_no_rows",
+                    extra={"csl": csl},
+                )
+            ], []
+        else:
+            payload = {"query": query, "window_minutes": window_minutes}
+            response = self._post_json(FABRIC_KQL_ENDPOINT, payload)
+            if isinstance(response, dict) and "error" not in response:
+                rows = response.get("rows", [])
                 if rows:
                     citation = Citation(
                         source_type="KQL",
@@ -1473,117 +1182,39 @@ class UnifiedRetriever:
                         dataset="fabric-eventhouse",
                     )
                     return rows, [citation]
-                if self.strict_source_mode:
-                    return [
-                        self._source_error_row(
-                            source="KQL",
-                            code="kql_runtime_error",
-                            detail=error or "kql_query_returned_no_rows",
-                            extra={"csl": csl},
-                        )
-                    ], []
-            else:
-                payload = {"query": query, "window_minutes": window_minutes}
-                response = self._post_json(FABRIC_KQL_ENDPOINT, payload)
-                if isinstance(response, dict) and "error" not in response:
-                    rows = response.get("rows", [])
-                    if rows:
-                        citation = Citation(
-                            source_type="KQL",
-                            identifier="eventhouse_live",
-                            title="Fabric Eventhouse query",
-                            content_preview=str(rows)[:120],
-                            score=1.0,
-                            dataset="fabric-eventhouse",
-                        )
-                        return rows, [citation]
-                if self.strict_source_mode:
-                    detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
-                    return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
-
-        if not FABRIC_KQL_ENDPOINT and not self.allow_mock_kql_fallback:
-            return [self._source_unavailable_row("KQL", "FABRIC_KQL_ENDPOINT not configured and fallback disabled")], []
-
-        # Local deterministic fallback for demo readiness.
-        rows: List[Dict[str, Any]] = []
-        airports = self._extract_airports_from_query(query)
-        if airports:
-            metar_rows = self._metar_rows_for_airports(airports, max_rows=12)
-            rows.extend(metar_rows)
-            taf_rows = self._taf_rows_for_airports(airports, max_rows=12)
-            rows.extend(taf_rows)
-
-        if rows:
-            citation = Citation(
-                source_type="KQL",
-                identifier="eventhouse_weather_fallback",
-                title=f"Eventhouse weather fallback ({', '.join(airports[:3])})",
-                content_preview=str(rows[:3])[:120],
-                score=0.9,
-                dataset="eventhouse-weather-fallback",
-            )
-            return rows, [citation]
-
-        states_file = self._latest_matching("data/e-opensky_recent/opensky_states_all_*.json")
-        if states_file:
-            try:
-                payload = json.loads(states_file.read_text(encoding="utf-8"))
-                states_count = len(payload.get("states", []) or [])
-                rows.append(
-                    {
-                        "metric": "opensky_states_count",
-                        "value": states_count,
-                        "window_minutes": window_minutes,
-                        "source_file": str(states_file),
-                    }
-                )
-            except Exception as exc:
-                rows.append({"metric": "opensky_states_count", "error": str(exc)})
-
-        metars_file = self._latest_matching("data/a-metars.cache.csv.gz")
-        if metars_file:
-            obs_count = 0
-            try:
-                with gzip.open(metars_file, "rt", encoding="utf-8", errors="ignore") as f:
-                    # Ignore header, count sample quickly.
-                    for idx, _line in enumerate(f):
-                        if idx == 0:
-                            continue
-                        obs_count += 1
-                        if obs_count >= 5000:
-                            break
-                rows.append(
-                    {
-                        "metric": "metar_observation_count_sample",
-                        "value": obs_count,
-                        "source_file": str(metars_file),
-                    }
-                )
-            except Exception as exc:
-                rows.append({"metric": "metar_observation_count_sample", "error": str(exc)})
-
-        citation = Citation(
-            source_type="KQL",
-            identifier="eventhouse_mock",
-            title="Eventhouse fallback snapshot",
-            content_preview=str(rows)[:120],
-            score=0.8,
-            dataset="eventhouse-mock",
-        )
-        return rows, [citation]
+            detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
+            return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
 
     def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve graph relationships from Fabric graph endpoint or local overlay graph."""
-        if FABRIC_GRAPH_ENDPOINT:
-            if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
-                tokens = self._query_tokens(query)
-                if tokens:
-                    values = ",".join(f"'{t}'" for t in tokens)
-                    csl = f"ops_graph_edges | where src_id in~ ({values}) or dst_id in~ ({values}) | take 50"
-                else:
-                    csl = "ops_graph_edges | take 30"
+        """Retrieve graph relationships from Fabric graph endpoint (live only)."""
+        if not FABRIC_GRAPH_ENDPOINT:
+            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured")], []
 
-                paths, _error = self._kusto_rows(FABRIC_GRAPH_ENDPOINT, csl)
+        if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
+            tokens = self._query_tokens(query)
+            if tokens:
+                values = ",".join(f"'{t}'" for t in tokens)
+                csl = f"ops_graph_edges | where src_id in~ ({values}) or dst_id in~ ({values}) | take 50"
+            else:
+                csl = "ops_graph_edges | take 30"
+
+            paths, _error = self._kusto_rows(FABRIC_GRAPH_ENDPOINT, csl)
+            if paths:
+                citation = Citation(
+                    source_type="GRAPH",
+                    identifier="fabric_graph_live",
+                    title="Fabric graph traversal",
+                    content_preview=str(paths)[:120],
+                    score=1.0,
+                    dataset="fabric-graph",
+                )
+                return paths, [citation]
+            return [self._source_error_row("GRAPH", "graph_runtime_error", _error or "graph_query_returned_no_rows", {"csl": csl})], []
+        else:
+            payload = {"query": query, "hops": hops}
+            response = self._post_json(FABRIC_GRAPH_ENDPOINT, payload)
+            if isinstance(response, dict) and "error" not in response:
+                paths = response.get("paths", [])
                 if paths:
                     citation = Citation(
                         source_type="GRAPH",
@@ -1594,118 +1225,44 @@ class UnifiedRetriever:
                         dataset="fabric-graph",
                     )
                     return paths, [citation]
-                if self.strict_source_mode:
-                    return [self._source_error_row("GRAPH", "graph_runtime_error", _error or "graph_query_returned_no_rows", {"csl": csl})], []
-            else:
-                payload = {"query": query, "hops": hops}
-                response = self._post_json(FABRIC_GRAPH_ENDPOINT, payload)
-                if isinstance(response, dict) and "error" not in response:
-                    paths = response.get("paths", [])
-                    if paths:
-                        citation = Citation(
-                            source_type="GRAPH",
-                            identifier="fabric_graph_live",
-                            title="Fabric graph traversal",
-                            content_preview=str(paths)[:120],
-                            score=1.0,
-                            dataset="fabric-graph",
-                        )
-                        return paths, [citation]
-                if self.strict_source_mode:
-                    detail = str(response.get("error")) if isinstance(response, dict) else "graph_endpoint_query_failed"
-                    return [self._source_error_row("GRAPH", "graph_runtime_error", detail)], []
-
-        if not FABRIC_GRAPH_ENDPOINT and not self.allow_mock_graph_fallback:
-            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and fallback disabled")], []
-
-        graph_file = self._latest_matching("data/j-synthetic_ops_overlay/*/synthetic/ops_graph_edges.csv")
-        if not graph_file:
-            return [self._source_unavailable_row("GRAPH", "graph_edges_unavailable")], []
-
-        paths: List[Dict[str, Any]] = []
-        tokens = {t.upper() for t in re.findall(r"[A-Za-z0-9]{3,6}", query)}
-        with graph_file.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                src_id = str(row.get("src_id", "")).upper()
-                dst_id = str(row.get("dst_id", "")).upper()
-                if tokens and src_id not in tokens and dst_id not in tokens:
-                    continue
-                paths.append(row)
-                if len(paths) >= 30:
-                    break
-
-        if not paths:
-            with graph_file.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    paths.append(row)
-                    if len(paths) >= 10:
-                        break
-
-        citation = Citation(
-            source_type="GRAPH",
-            identifier="overlay_graph",
-            title="Graph dependency paths",
-            content_preview=str(paths[:3])[:120],
-            score=0.85,
-            dataset="fabric-graph-preview-mock",
-        )
-        return paths, [citation]
+            detail = str(response.get("error")) if isinstance(response, dict) else "graph_endpoint_query_failed"
+            return [self._source_error_row("GRAPH", "graph_runtime_error", detail)], []
 
     def query_nosql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve NoSQL-style records from endpoint or local NOTAM snapshots."""
-        if FABRIC_NOSQL_ENDPOINT:
-            if self._is_kusto_endpoint(FABRIC_NOSQL_ENDPOINT):
-                docs, _error = self._kusto_rows(FABRIC_NOSQL_ENDPOINT, "hazards_airsigmets | take 30")
-                if docs:
-                    citation = Citation(
-                        source_type="NOSQL",
-                        identifier="nosql_live",
-                        title="NoSQL lookup",
-                        content_preview=str(docs)[:120],
-                        score=1.0,
-                        dataset="nosql-live",
-                    )
-                    return docs, [citation]
-                if self.strict_source_mode:
-                    return [self._source_error_row("NOSQL", "nosql_runtime_error", _error or "nosql_query_returned_no_rows")], []
-            else:
-                payload = {"query": query}
-                response = self._post_json(FABRIC_NOSQL_ENDPOINT, payload)
-                if isinstance(response, dict) and "error" not in response:
-                    docs = response.get("docs", [])
-                    if docs:
-                        citation = Citation(
-                            source_type="NOSQL",
-                            identifier="nosql_live",
-                            title="NoSQL lookup",
-                            content_preview=str(docs)[:120],
-                            score=1.0,
-                            dataset="nosql-live",
-                        )
-                        return docs, [citation]
-                if self.strict_source_mode:
-                    detail = str(response.get("error")) if isinstance(response, dict) else "nosql_endpoint_query_failed"
-                    return [self._source_error_row("NOSQL", "nosql_runtime_error", detail)], []
+        """Retrieve NoSQL-style records from live endpoint."""
+        if not FABRIC_NOSQL_ENDPOINT:
+            return [self._source_unavailable_row("NOSQL", "FABRIC_NOSQL_ENDPOINT not configured")], []
 
-        if not FABRIC_NOSQL_ENDPOINT and not self.allow_mock_nosql_fallback:
-            return [self._source_unavailable_row("NOSQL", "FABRIC_NOSQL_ENDPOINT not configured and fallback disabled")], []
+        if self._is_kusto_endpoint(FABRIC_NOSQL_ENDPOINT):
+            docs, _error = self._kusto_rows(FABRIC_NOSQL_ENDPOINT, "hazards_airsigmets | take 30")
+            if docs:
+                citation = Citation(
+                    source_type="NOSQL",
+                    identifier="nosql_live",
+                    title="NoSQL lookup",
+                    content_preview=str(docs)[:120],
+                    score=1.0,
+                    dataset="nosql-live",
+                )
+                return docs, [citation]
+            return [self._source_error_row("NOSQL", "nosql_runtime_error", _error or "nosql_query_returned_no_rows")], []
 
-        docs = self._notam_docs_for_airports(query, max_rows=30)
-        citation = Citation(
-            source_type="NOSQL",
-            identifier="notam_snapshot",
-            title="NoSQL fallback documents",
-            content_preview=str(docs[:3])[:120],
-            score=0.75,
-            dataset="nosql-mock",
-        )
-        return docs, [citation]
-
-    def query_runway_constraints_fallback(self, query: str, airports: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], List[Citation]]:
-        """Expose runway constraint fallback rows for planner/executor fallback flows."""
-        return self._query_runway_constraints_fallback(query, airports=airports)
+        payload = {"query": query}
+        response = self._post_json(FABRIC_NOSQL_ENDPOINT, payload)
+        if isinstance(response, dict) and "error" not in response:
+            docs = response.get("docs", [])
+            if docs:
+                citation = Citation(
+                    source_type="NOSQL",
+                    identifier="nosql_live",
+                    title="NoSQL lookup",
+                    content_preview=str(docs)[:120],
+                    score=1.0,
+                    dataset="nosql-live",
+                )
+                return docs, [citation]
+        detail = str(response.get("error")) if isinstance(response, dict) else "nosql_endpoint_query_failed"
+        return [self._source_error_row("NOSQL", "nosql_runtime_error", detail)], []
 
     # =========================================================================
     # Route Execution Methods
@@ -1759,12 +1316,12 @@ class UnifiedRetriever:
             try:
                 sql_results, sql_query, sql_citations = sql_future.result(timeout=30)
             except Exception as e:
-                print(f"SQL query error in parallel execution: {e}")
+                logger.error("SQL query error in parallel execution: %s", e)
 
             try:
                 semantic_results, semantic_citations = semantic_future.result(timeout=30)
             except Exception as e:
-                print(f"Semantic query error in parallel execution: {e}")
+                logger.error("Semantic query error in parallel execution: %s", e)
 
         context = {
             "sql_results": sql_results[:10] if sql_results else [],
@@ -1816,6 +1373,7 @@ class UnifiedRetriever:
             rows, citations = self.query_semantic(
                 query,
                 top=int(cfg.get("top", 5)),
+                embedding=cfg.get("embedding"),
                 source=source,
                 filter_expression=cfg.get("filter"),
             )
@@ -1840,12 +1398,12 @@ class UnifiedRetriever:
         # Step 0: Check for PII before processing
         if self.pii_filter:
             pii_result = self.pii_filter.check(query)
+            if pii_result.error:
+                logger.warning("PII check completed with error (fail-open): %s", pii_result.error)
             if pii_result.has_pii:
                 warning = self.pii_filter.format_warning(pii_result.entities)
-                print(f"\n{'='*60}")
-                print(f"PII DETECTED - Query blocked")
-                print(f"Categories: {[e.category for e in pii_result.entities]}")
-                print(f"{'='*60}")
+                logger.warning("PII DETECTED - Query blocked. Categories: %s",
+                               [e.category for e in pii_result.entities])
                 return RetrievalResult(
                     answer=warning,
                     route="BLOCKED",
@@ -1866,10 +1424,7 @@ class UnifiedRetriever:
         route = route_result.get("route", "HYBRID")
         sql_hint = route_result.get("sql_hint")
 
-        print(f"\n{'='*60}")
-        print(f"Query: {query}")
-        print(f"Route: {route} - {route_result.get('reasoning', '')}")
-        print(f"{'='*60}")
+        logger.info("Query: %s | Route: %s - %s", query, route, route_result.get("reasoning", ""))
 
         # Execute appropriate route
         if route == "SQL":
@@ -1884,6 +1439,7 @@ class UnifiedRetriever:
 
     def _synthesize_answer(self, query: str, context: dict, route: str) -> str:
         """Generate natural language answer from retrieved context."""
+        _t0_synth = time.perf_counter()
 
         route_instructions = {
             "SQL": "Focus on the precise data from SQL results.",
@@ -1918,10 +1474,60 @@ Retrieved Data:
                     {"role": "user", "content": context_str}
                 ]
             )
+            logger.info("perf stage=%s ms=%.1f", "synthesize_answer", (time.perf_counter() - _t0_synth) * 1000)
             return response.choices[0].message.content
         except Exception as exc:
             logger.error("LLM synthesis failed: %s", exc)
             return "I'm unable to generate a response right now due to a temporary service issue. Please try again shortly."
+
+    def _synthesize_answer_stream(
+        self, query: str, context: dict, route: str
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Stream synthesis tokens as agent_update events (true streaming)."""
+        _t0_synth = time.perf_counter()
+
+        route_instructions = {
+            "SQL": "Focus on the precise data from SQL results.",
+            "SEMANTIC": "Focus on document content and similarity matches.",
+            "HYBRID": "Combine structured data with semantic context for a comprehensive answer.",
+            "AGENTIC": "Prioritize evidence reconciliation across multiple source types.",
+        }
+
+        system_prompt = f"""You are a helpful aviation data analyst assistant.
+Answer the user's question based on the provided context.
+{route_instructions.get(route, '')}
+
+Guidelines:
+- Be concise but informative
+- Format numbers nicely
+- If showing multiple items, use a clear list or table format
+- Reference the data sources when relevant
+- If the context is insufficient, say so clearly"""
+
+        context_str = f"""
+Query: {query}
+
+Retrieved Data:
+{context}
+"""
+
+        try:
+            stream = self.llm.chat.completions.create(
+                model=self.llm_deployment,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": context_str},
+                ],
+                stream=True,
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield {"type": "agent_update", "content": chunk.choices[0].delta.content}
+            logger.info("perf stage=%s ms=%.1f", "synthesize_answer_stream", (time.perf_counter() - _t0_synth) * 1000)
+        except Exception as exc:
+            logger.error("LLM streaming synthesis failed: %s — falling back to non-streaming", exc)
+            answer = self._synthesize_answer(query, context, route)
+            yield {"type": "agent_update", "content": answer}
 
 
 # =============================================================================

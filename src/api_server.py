@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Flask API server for Aviation RAG backend."""
 
+import logging
+import os
+
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 from af_runtime import AgentFrameworkRuntime
 from af_streaming import to_sse
 
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
-CORS(app)  # Enable CORS for Next.js frontend
+CORS(app, origins=[
+    os.getenv("ALLOWED_ORIGIN", "https://aviation-rag-frontend-705508.azurewebsites.net"),
+])
 
 runtime = None
 
@@ -16,9 +23,9 @@ def get_runtime() -> AgentFrameworkRuntime:
     """Lazily initialize runtime so health checks are not blocked by cold-start."""
     global runtime
     if runtime is None:
-        print("Initializing Agent Framework runtime...")
+        logger.info("Initializing Agent Framework runtime...")
         runtime = AgentFrameworkRuntime()
-        print(f"Runtime ready (af_enabled={runtime.af_enabled})")
+        logger.info("Runtime ready (af_enabled=%s)", runtime.af_enabled)
     return runtime
 
 
@@ -64,7 +71,8 @@ def chat():
             ):
                 yield to_sse(event)
         except Exception as exc:
-            yield to_sse({"type": "agent_error", "message": str(exc)})
+            logger.exception("SSE stream error")
+            yield to_sse({"type": "agent_error", "message": "An internal error occurred while processing your request."})
 
     return Response(
         stream_with_context(event_stream()),
@@ -118,8 +126,8 @@ def query():
         )
         return jsonify(result)
     except Exception as exc:
-        print(f"Error in query endpoint: {exc}")
-        return jsonify({"error": str(exc)}), 500
+        logger.exception("Error in query endpoint")
+        return jsonify({"error": "An internal error occurred."}), 500
 
 
 @app.route('/api/fabric/preflight', methods=['GET'])
@@ -130,7 +138,8 @@ def fabric_preflight():
         payload = af_runtime.retriever.fabric_preflight()
         return jsonify(payload)
     except Exception as exc:
-        return jsonify({"overall_status": "fail", "error": str(exc)}), 500
+        logger.exception("Fabric preflight error")
+        return jsonify({"overall_status": "fail", "error": "Preflight check failed."}), 500
 
 
 if __name__ == '__main__':

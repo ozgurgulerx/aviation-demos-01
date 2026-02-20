@@ -6,9 +6,12 @@ Routes: SQL, SEMANTIC, HYBRID
 
 import os
 import json
+import logging
 from dotenv import load_dotenv
 
-from azure_openai_client import init_azure_openai_client
+from azure_openai_client import get_shared_client
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -19,14 +22,25 @@ ROUTING_PROMPT = """You are a query router for an aviation safety Q&A system wit
 
 ## Available Data Sources
 
-1. **SQL Database**
+1. **SQL Database (PostgreSQL)**
    - Table asrs_reports(asrs_report_id, event_date, location, aircraft_type, flight_phase, narrative_type, title, report_text, raw_json, ingested_at)
    - Table asrs_ingestion_runs(run_id, started_at, completed_at, status, source_manifest_path, records_seen, records_loaded, records_failed)
-   - Best for: counts, rankings, exact filters, timelines, grouped metrics
+   - Additional tables in demo schema: ourairports_airports, ourairports_runways, ourairports_navaids, ourairports_frequencies, openflights_routes, openflights_airports, openflights_airlines, ops_flight_legs, ops_turnaround_milestones, ops_crew_rosters, ops_mel_techlog_events
+   - Best for: counts, rankings, exact filters, timelines, grouped metrics, runway data, route networks, operational stats
 
-2. **Semantic Index** (aviation-index)
-   - Chunked ASRS narrative documents with metadata
-   - Best for: contextual explanations, similarity, narrative retrieval
+2. **Semantic Indexes** (vector search with reranking)
+   - idx_ops_narratives: ASRS narrative documents — incident reports, near-miss narratives, safety observations
+   - idx_regulatory: Regulatory documents — NOTAMs, Airworthiness Directives, EASA/FAA bulletins
+   - idx_airport_ops_docs: Airport operational documents — runway specs, station info, facility data
+   - Best for: contextual explanations, similarity, narrative retrieval, regulatory lookups
+
+3. **KQL Eventhouse** (when configured)
+   - Near-real-time weather observations (METAR/TAF), OpenSky flight states, hazard alerts
+   - Best for: current weather, live flight tracking, recent hazards
+
+4. **Graph Store** (when configured)
+   - Dependency paths between airports, runways, alternates, routes
+   - Best for: impact analysis, dependency chains, alternate airport selection
 
 ## Route Definitions
 
@@ -34,14 +48,17 @@ ROUTING_PROMPT = """You are a query router for an aviation safety Q&A system wit
 - "how many", "count", "top", "most", "average"
 - explicit group/filter conditions
 - trend analysis by date/phase/location/aircraft type
+- runway dimensions, airport details, route networks
 
 **SEMANTIC** - Use when query needs narrative understanding:
 - "describe", "summarize", "what happened", "examples"
 - contextual or similarity-based retrieval
+- regulatory lookups, compliance questions
 
 **HYBRID** - Use when both are useful:
 - requests mixing metrics with explanation
 - quantitative answer plus narrative context
+- operational questions needing both data and context
 
 ## Output Format
 
@@ -58,28 +75,35 @@ class QueryRouter:
     """Routes queries to appropriate retrieval paths."""
 
     def __init__(self):
-        self.client, _ = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+        self.client, _ = get_shared_client(api_version=OPENAI_API_VERSION)
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 
     def route(self, query: str) -> dict:
         """Classify a query into a retrieval route using LLM."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": ROUTING_PROMPT},
-                {"role": "user", "content": query}
-            ],
-            response_format={"type": "json_object"}
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": ROUTING_PROMPT},
+                    {"role": "user", "content": query}
+                ],
+                response_format={"type": "json_object"}
+            )
 
-        result = json.loads(response.choices[0].message.content)
+            result = json.loads(response.choices[0].message.content)
 
-        if "route" not in result:
-            result["route"] = "HYBRID"
-        if "reasoning" not in result:
-            result["reasoning"] = "Default routing"
+            if "route" not in result:
+                result["route"] = "HYBRID"
+            if "reasoning" not in result:
+                result["reasoning"] = "Default routing"
 
-        return result
+            return result
+        except Exception as exc:
+            logger.warning("LLM routing failed, falling back to HYBRID: %s", exc)
+            return {
+                "route": "HYBRID",
+                "reasoning": "Fallback to HYBRID due to routing error",
+            }
 
     def quick_route(self, query: str) -> str:
         """Quick route classification using keyword heuristics."""

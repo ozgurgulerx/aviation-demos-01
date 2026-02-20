@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { User, Bot, CheckCircle2, AlertCircle, Loader2, Volume2, Square, RotateCcw } from "lucide-react";
+import { User, Bot, CheckCircle2, Loader2, Volume2, Square, RotateCcw } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -126,7 +126,7 @@ export function Message({
               <VoiceIcon
                 className={cn(
                   "h-3.5 w-3.5",
-                  !isSpeaking && (voiceStatus === "idle" || voiceStatus === "preparing") && "animate-spin"
+                  voiceStatus === "preparing" && "animate-spin"
                 )}
               />
               {voiceLabel}
@@ -156,12 +156,6 @@ export function Message({
           </Badge>
         )}
 
-        {!isUser && !message.isVerified && (!message.citations || message.citations.length === 0) && (
-          <Badge variant="warning" className="text-xs gap-1">
-            <AlertCircle className="h-3 w-3" />
-            Unverified
-          </Badge>
-        )}
       </div>
     </Container>
   );

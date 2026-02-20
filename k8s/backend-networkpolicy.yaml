@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aviation-rag-backend-netpol
+  namespace: ${K8S_NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app: aviation-rag-backend
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow from App Service subnet (VNet integration)
+  - from:
+    - ipBlock:
+        cidr: 10.0.4.0/24
+    ports:
+    - protocol: TCP
+      port: 5001
+  # Allow from ingress-nginx namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 5001
+  # Allow from within the same namespace (ClusterIP service)
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 5001

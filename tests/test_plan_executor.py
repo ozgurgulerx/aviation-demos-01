@@ -10,8 +10,6 @@ from plan_executor import PlanExecutor
 
 
 class _DummyRetriever:
-    strict_source_mode = False
-
     def source_event_meta(self, source: str):
         return {"source": source, "endpoint_label": "test", "freshness": "test"}
 

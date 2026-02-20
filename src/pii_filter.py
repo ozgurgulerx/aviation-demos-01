@@ -5,11 +5,16 @@ Filters prompts before they are sent to LLMs.
 Uses the same Azure PII container as the frontend.
 """
 
+import hashlib
+import logging
 import os
+import time
 import requests
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -64,6 +69,10 @@ class PiiFilter:
         self.endpoint = endpoint or PII_ENDPOINT
         self.confidence_threshold = confidence_threshold
         self._is_available = None
+        # Result cache: keyed by SHA-256 of input text, stores (result, expires_at).
+        self._cache: Dict[str, Tuple[PiiCheckResult, float]] = {}
+        self._cache_ttl: float = float(os.getenv("PII_CACHE_TTL_SECONDS", "60"))
+        self._cache_max_entries: int = 200
 
     def is_available(self) -> bool:
         """Check if PII service is available."""
@@ -82,10 +91,35 @@ class PiiFilter:
 
         return self._is_available
 
+    def _cache_key(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _evict_stale(self) -> None:
+        now = time.monotonic()
+        expired = [k for k, (_, exp) in self._cache.items() if now >= exp]
+        for k in expired:
+            self._cache.pop(k, None)
+        # Hard cap to prevent unbounded growth.
+        if len(self._cache) > self._cache_max_entries:
+            oldest_keys = sorted(self._cache, key=lambda k: self._cache[k][1])
+            for k in oldest_keys[: len(self._cache) - self._cache_max_entries]:
+                self._cache.pop(k, None)
+
     def check(self, text: str) -> PiiCheckResult:
-        """Check text for PII."""
+        """Check text for PII (with short-TTL cache)."""
         if not text or not text.strip():
             return PiiCheckResult(has_pii=False, entities=[])
+
+        # Cache lookup.
+        cache_key = self._cache_key(text)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            result, expires_at = cached
+            if time.monotonic() < expires_at:
+                logger.info("perf stage=%s cache=hit", "pii_check")
+                return result
+            else:
+                self._cache.pop(cache_key, None)
 
         try:
             request_body = {
@@ -144,11 +178,15 @@ class PiiFilter:
                 and e["category"] in PII_CATEGORIES
             ]
 
-            return PiiCheckResult(
+            check_result = PiiCheckResult(
                 has_pii=len(entities) > 0,
                 entities=entities,
                 redacted_text=redacted_text
             )
+            # Cache the result.
+            self._evict_stale()
+            self._cache[cache_key] = (check_result, time.monotonic() + self._cache_ttl)
+            return check_result
 
         except requests.exceptions.Timeout:
             return PiiCheckResult(has_pii=False, entities=[], error="PII check timed out")

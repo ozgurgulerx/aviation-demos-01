@@ -55,7 +55,7 @@ export interface Conversation {
 // Watchlist Types
 export interface WatchlistItem {
   id: string;
-  type: "company" | "investor";
+  type: "route" | "airport" | "aircraft";
   name: string;
   addedAt: Date;
 }

@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: aviation-rag-backend-pdb
+  namespace: ${K8S_NAMESPACE}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: aviation-rag-backend

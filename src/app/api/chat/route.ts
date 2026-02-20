@@ -142,13 +142,14 @@ export async function POST(request: NextRequest) {
 
     if (!backendResponse.ok || !backendResponse.body) {
       const errText = await backendResponse.text().catch(() => "");
+      console.error(`Backend error (${backendResponse.status}): ${errText}`);
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(
             encoder.encode(
               createSSEMessage({
                 type: "agent_error",
-                message: errText || `Backend error (${backendResponse.status})`,
+                message: `Backend service error (${backendResponse.status})`,
               })
             )
           );
@@ -251,14 +252,12 @@ export async function POST(request: NextRequest) {
             streamTimeout = null;
           }
           if (timedOut) return;
+          console.error("SSE streaming error:", error);
           controller.enqueue(
             encoder.encode(
               createSSEMessage({
                 type: "agent_error",
-                message:
-                  error instanceof Error
-                    ? error.message
-                    : "Unknown streaming error",
+                message: "A streaming error occurred.",
               })
             )
           );
@@ -284,11 +283,9 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
+    console.error("Chat route error:", error);
     return new Response(
-      JSON.stringify({
-        error: "Internal server error",
-        message: error instanceof Error ? error.message : "Unknown error",
-      }),
+      JSON.stringify({ error: "Internal server error" }),
       { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }

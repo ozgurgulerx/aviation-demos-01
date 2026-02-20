@@ -20,7 +20,6 @@ os.environ.setdefault(
 os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 os.environ.setdefault("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
 os.environ["AZURE_OPENAI_API_KEY"] = ""
-os.environ["USE_POSTGRES"] = "false"
 
 sys.path.insert(0, str(ROOT / "src"))
 from af_runtime import AgentFrameworkRuntime  # noqa: E402

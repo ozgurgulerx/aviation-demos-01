@@ -95,19 +95,19 @@ export const SAMPLE_CONVERSATIONS: Conversation[] = [
 export const SAMPLE_WATCHLIST: WatchlistItem[] = [
   {
     id: "w1",
-    type: "company",
+    type: "airport",
     name: "SAW turnaround wave",
     addedAt: new Date("2026-02-20T07:00:00Z"),
   },
   {
     id: "w2",
-    type: "company",
+    type: "aircraft",
     name: "Crew legality thresholds",
     addedAt: new Date("2026-02-20T06:40:00Z"),
   },
   {
     id: "w3",
-    type: "investor",
+    type: "route",
     name: "NOTAM-driven route impact",
     addedAt: new Date("2026-02-19T22:10:00Z"),
   },

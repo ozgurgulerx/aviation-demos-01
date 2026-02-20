@@ -188,14 +188,17 @@ async function getAzureAccessToken(): Promise<string | null> {
     return cachedToken;
   }
 
-  // Try to get token using Azure CLI (for local dev)
+  // Try to get token using Azure CLI (for local dev) — async to avoid blocking the event loop
   try {
-    const { execSync } = await import("child_process");
-    const token = execSync(
-      'az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv',
-      { encoding: 'utf-8', timeout: 10000 }
-    ).trim();
-    return token || null;
+    const { execFile } = await import("child_process");
+    const { promisify } = await import("util");
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(
+      "az",
+      ["account", "get-access-token", "--resource", "https://cognitiveservices.azure.com", "--query", "accessToken", "-o", "tsv"],
+      { timeout: 10000 }
+    );
+    return stdout.trim() || null;
   } catch {
     return null;
   }
@@ -289,7 +292,7 @@ export async function checkPii({
       };
     }
 
-    // Filter entities by confidence threshold AND banking-relevant categories
+    // Filter entities by confidence threshold AND configured PII categories
     // This prevents false positives like "NVIDIA", "IMF", "Conservative" being flagged
     const filteredEntities: PiiEntity[] = document.entities
       .filter((e) =>

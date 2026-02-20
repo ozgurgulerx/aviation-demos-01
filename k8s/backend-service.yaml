@@ -1,19 +1,3 @@
-apiVersion: v1
-kind: Service
-metadata:
-  name: aviation-rag-backend-lb
-  namespace: ${K8S_NAMESPACE}
-  annotations:
-    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: /health
-spec:
-  type: LoadBalancer
-  selector:
-    app: aviation-rag-backend
-  ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 5001
----
 # Internal LoadBalancer for App Service VNet integration
 apiVersion: v1
 kind: Service

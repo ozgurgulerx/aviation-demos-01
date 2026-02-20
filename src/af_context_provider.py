@@ -8,12 +8,16 @@ KQL/event windows, graph traversal, and optional NoSQL sources.
 
 from __future__ import annotations
 
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from agentic_orchestrator import AgenticOrchestrator
 from context_reconciler import SOURCE_PRIORITY_DEFAULT, reconcile_context
@@ -130,6 +134,7 @@ class AviationRagContextProvider:
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
+        precomputed_route: Optional[Dict[str, Any]] = None,
     ) -> AviationRagContext:
         if retrieval_mode == "code-rag" and self._agentic_enabled and self.orchestrator is not None:
             try:
@@ -156,6 +161,7 @@ class AviationRagContextProvider:
             freshness_sla_minutes=freshness_sla_minutes,
             explain_retrieval=explain_retrieval,
             additional_reasoning=fallback_note,
+            precomputed_route=precomputed_route,
         )
 
     def _build_legacy_context(
@@ -168,8 +174,11 @@ class AviationRagContextProvider:
         freshness_sla_minutes: Optional[int],
         explain_retrieval: bool,
         additional_reasoning: str,
+        precomputed_route: Optional[Dict[str, Any]] = None,
     ) -> AviationRagContext:
-        route, reasoning, sql_hint = self._resolve_route(query, retrieval_mode, forced_route)
+        route, reasoning, sql_hint = self._resolve_route(
+            query, retrieval_mode, forced_route, precomputed_route=precomputed_route
+        )
 
         plan_request = RetrievalRequest(
             query=query,
@@ -353,12 +362,23 @@ class AviationRagContextProvider:
         sql_query: Optional[str] = None
         step_outputs: Dict[int, tuple[str, List[Dict[str, Any]], List[Citation], Optional[str]]] = {}
 
+        # Pre-compute shared embedding once for all VECTOR steps.
+        has_vector_steps = any(s.source.startswith("VECTOR_") for s in steps)
+        shared_embedding = None
+        if has_vector_steps:
+            _t0_emb = time.perf_counter()
+            shared_embedding = self.retriever.get_embedding(query)
+            logger.info("perf stage=%s ms=%.1f", "shared_embedding_legacy", (time.perf_counter() - _t0_emb) * 1000)
+
         def _run(step: SourcePlan) -> tuple[str, List[Dict[str, Any]], List[Citation], Optional[str]]:
             params = dict(step.params)
             if step.source == "SQL" and sql_hint and "sql_hint" not in params:
                 params["sql_hint"] = sql_hint
-            if step.source.startswith("VECTOR_") and "top" not in params:
-                params["top"] = self.semantic_top_k
+            if step.source.startswith("VECTOR_"):
+                if "top" not in params:
+                    params["top"] = self.semantic_top_k
+                if shared_embedding is not None and "embedding" not in params:
+                    params["embedding"] = shared_embedding
             rows, row_citations, out_sql = self.retriever.retrieve_source(step.source, query, params)
             return step.source, rows, row_citations, out_sql
 
@@ -582,7 +602,11 @@ class AviationRagContextProvider:
         )
 
     def _resolve_route(
-        self, query: str, retrieval_mode: str, forced_route: Optional[str]
+        self,
+        query: str,
+        retrieval_mode: str,
+        forced_route: Optional[str],
+        precomputed_route: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Optional[str]]:
         if forced_route in ("SQL", "SEMANTIC", "HYBRID"):
             return forced_route, "Route forced by caller", None
@@ -591,7 +615,16 @@ class AviationRagContextProvider:
         if retrieval_mode == "foundry-iq":
             return "SEMANTIC", "Foundry IQ mode prefers semantic context", None
 
+        # Use precomputed route from parallel PII+routing if available.
+        if precomputed_route is not None:
+            route = precomputed_route.get("route", "HYBRID")
+            reasoning = precomputed_route.get("reasoning", "Route inferred by QueryRouter (parallel)")
+            sql_hint = precomputed_route.get("sql_hint")
+            return route, reasoning, sql_hint
+
+        _t0 = time.perf_counter()
         route_result = self.retriever.router.route(query)
+        logger.info("perf stage=%s ms=%.1f", "routing", (time.perf_counter() - _t0) * 1000)
         route = route_result.get("route", "HYBRID")
         reasoning = route_result.get("reasoning", "Route inferred by QueryRouter")
         sql_hint = route_result.get("sql_hint")

@@ -10,8 +10,6 @@ import {
   ChevronRight,
   MessageCircle,
   Star,
-  Building2,
-  Users,
   Bookmark,
   Radar,
   Database,
@@ -24,11 +22,10 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import {
   SAMPLE_CONVERSATIONS,
-  SAMPLE_WATCHLIST,
   QUERY_CATEGORIES,
   type QueryCategory,
 } from "@/data/seed";
-import type { Conversation, WatchlistItem } from "@/types";
+import type { Conversation } from "@/types";
 
 interface SidebarProps {
   isCollapsed: boolean;
@@ -191,12 +188,6 @@ export function Sidebar({
                 </Link>
               </Section>
 
-              <Separator className="my-1" />
-              <Section title="Watchlist" icon={<Star className="h-3.5 w-3.5 text-gold" />}>
-                {SAMPLE_WATCHLIST.map((item) => (
-                  <WatchlistItemComponent key={item.id} item={item} />
-                ))}
-              </Section>
             </>
           )}
         </div>
@@ -275,17 +266,3 @@ function PresetItem({
   );
 }
 
-function WatchlistItemComponent({ item }: { item: WatchlistItem }) {
-  return (
-    <button className="w-full rounded-lg border border-transparent px-2.5 py-2 text-left text-sm text-muted-foreground transition-colors hover:border-border hover:bg-surface-2 hover:text-foreground">
-      <div className="flex items-center gap-2">
-        {item.type === "company" ? (
-          <Building2 className="h-3.5 w-3.5 shrink-0" />
-        ) : (
-          <Users className="h-3.5 w-3.5 shrink-0" />
-        )}
-        <span className="truncate">{item.name}</span>
-      </div>
-    </button>
-  );
-}

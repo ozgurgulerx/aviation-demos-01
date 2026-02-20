@@ -61,6 +61,7 @@ class AviationRagTools:
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
+        precomputed_route: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         ctx = self.context_provider.build_context(
             query,
@@ -71,6 +72,7 @@ class AviationRagTools:
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
+            precomputed_route=precomputed_route,
         )
         return {
             "route": ctx.route,

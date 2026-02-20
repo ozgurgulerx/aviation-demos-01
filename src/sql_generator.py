@@ -7,7 +7,7 @@ import os
 import re
 from dotenv import load_dotenv
 
-from azure_openai_client import init_azure_openai_client
+from azure_openai_client import get_shared_client
 
 load_dotenv()
 
@@ -62,7 +62,7 @@ class SQLGenerator:
     """Generate SQL queries from natural language using LLM."""
 
     def __init__(self):
-        self.client, _ = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+        self.client, _ = get_shared_client(api_version=OPENAI_API_VERSION)
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 
     def generate(self, query: str) -> str:

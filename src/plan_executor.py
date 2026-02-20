@@ -5,12 +5,16 @@ Executes agentic plans against registered datastores/tools.
 
 from __future__ import annotations
 
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from contracts.agentic_plan import AgenticPlan, ToolCall
 from query_writers import KQLWriter, SQLWriter
@@ -59,6 +63,17 @@ class PlanExecutor:
         schemas: Dict[str, Any],
     ) -> PlanExecutionResult:
         result = PlanExecutionResult()
+
+        # Pre-compute shared embedding for VECTOR tool calls using the same query.
+        has_vector_calls = any(
+            self._canon_tool(call.tool).startswith("VECTOR_") for call in plan.tool_calls
+        )
+        self._shared_embedding = None
+        self._shared_embedding_query = user_query
+        if has_vector_calls:
+            _t0_emb = time.perf_counter()
+            self._shared_embedding = self.retriever.get_embedding(user_query)
+            logger.info("perf stage=%s ms=%.1f", "shared_embedding_agentic", (time.perf_counter() - _t0_emb) * 1000)
 
         # Build evidence -> tool map for post-verification.
         for req in plan.required_evidence:
@@ -129,8 +144,6 @@ class PlanExecutor:
                         execution_mode = self.retriever.source_mode(source)
                         if has_row_errors:
                             contract_status = "failed"
-                        elif execution_mode == "fallback":
-                            contract_status = "degraded"
                         else:
                             contract_status = "met"
                         result.source_traces.append(
@@ -234,18 +247,6 @@ class PlanExecutor:
                         constraints=call.params,
                     )
                 except Exception as exc:
-                    if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
-                        rows, citations = self.retriever.query_runway_constraints_fallback(
-                            user_query,
-                            airports=entities.get("airports") if isinstance(entities, dict) else None,
-                        )
-                        rows.append(
-                            {
-                                "warning": "sql_generation_failed_using_runway_fallback",
-                                "detail": str(exc),
-                            }
-                        )
-                        return rows, citations, None
                     return [{"error": str(exc), "error_code": "sql_generation_failed"}], [], None
             if sql_query.strip().startswith("-- NEED_SCHEMA"):
                 rows, citations, resolved_sql = self._handle_sql_need_schema(
@@ -271,23 +272,19 @@ class PlanExecutor:
                         constraints=call.params,
                     )
                 except Exception as exc:
-                    if not self.retriever.strict_source_mode:
-                        window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
-                        rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
-                        rows.append(
-                            {
-                                "warning": "kql_generation_failed_using_weather_fallback",
-                                "detail": str(exc),
-                            }
-                        )
-                        return rows, citations, None
-                    return [{"error": str(exc), "error_code": "kql_generation_failed"}], [], None
-            if kql_query.strip().startswith("// NEED_SCHEMA"):
-                if not self.retriever.strict_source_mode:
                     window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
                     rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
-                    return rows, citations, kql_query
-                return [{"error": kql_query, "error_code": "kql_schema_missing"}], [], kql_query
+                    rows.append(
+                        {
+                            "warning": "kql_generation_failed_using_direct_query",
+                            "detail": str(exc),
+                        }
+                    )
+                    return rows, citations, None
+            if kql_query.strip().startswith("// NEED_SCHEMA"):
+                window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
+                rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
+                return rows, citations, kql_query
             window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
             rows, citations = self.retriever.query_kql(kql_query, window_minutes=window)
             return rows, citations, kql_query
@@ -302,9 +299,18 @@ class PlanExecutor:
             return rows, citations, None
 
         if source in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
+            # Reuse shared embedding when the query text matches the original user query.
+            effective_query = call.query or user_query
+            shared_emb = None
+            if (
+                self._shared_embedding is not None
+                and effective_query == self._shared_embedding_query
+            ):
+                shared_emb = self._shared_embedding
             rows, citations = self.retriever.query_semantic(
-                call.query or user_query,
+                effective_query,
                 top=int(call.params.get("top", 5)),
+                embedding=shared_emb,
                 source=source,
                 filter_expression=call.params.get("filter"),
             )
@@ -322,23 +328,15 @@ class PlanExecutor:
         evidence_type: str,
         entities: Dict[str, Any],
     ) -> Tuple[List[Dict[str, Any]], List[Citation], str]:
-        if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
-            rows, citations = self.retriever.query_runway_constraints_fallback(
-                user_query,
-                airports=entities.get("airports") if isinstance(entities, dict) else None,
-            )
-            return rows, citations, sql_query
-
-        if not self.retriever.strict_source_mode:
-            fallback_sql = self.retriever._heuristic_sql_fallback(user_query, sql_query)
-            if fallback_sql:
-                rows, citations = self._execute_sql_raw(fallback_sql)
-                if rows and not rows[0].get("error_code"):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            row["partial_schema"] = sql_query
-                            row["fallback_sql"] = fallback_sql
-                return rows, citations, fallback_sql
+        fallback_sql = self.retriever._heuristic_sql_fallback(user_query, sql_query)
+        if fallback_sql:
+            rows, citations = self._execute_sql_raw(fallback_sql)
+            if rows and not rows[0].get("error_code"):
+                for row in rows:
+                    if isinstance(row, dict):
+                        row["partial_schema"] = sql_query
+                        row["fallback_sql"] = fallback_sql
+            return rows, citations, fallback_sql
 
         return [{"error": sql_query, "error_code": "sql_schema_missing"}], [], sql_query
 

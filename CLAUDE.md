@@ -55,7 +55,7 @@ cd src && npx next lint
 # Data pipeline (ASRS)
 python scripts/00_fetch_asrs_exports.py --from-date 2026-01-01 --to-date 2026-01-31
 python scripts/01_extract_data.py --input data/asrs/raw --output data/processed
-python scripts/02_load_database.py --mode sqlite --data data/processed   # or --mode postgres
+python scripts/02_load_database.py --mode postgres --data data/processed
 python scripts/03_create_search_index.py
 python scripts/04_upload_documents.py --data data/processed
 ```
@@ -65,6 +65,8 @@ python scripts/04_upload_documents.py --data data/processed
 - Account: `admin@MngEnvMCAP705508.onmicrosoft.com`
 - Tenant ID: `52095a81-130f-4b06-83f1-9859b2c73de6`
 - Subscription: `ME-MngEnvMCAP705508-ozgurguler-1` (`6a539906-6ce2-4e3b-84ee-89f701de18d8`)
+
+**Always use this tenant.** All Azure operations (provisioning, deployment, CLI commands) must target this tenant and subscription. Do not switch or prompt for alternatives.
 
 Always verify Azure CLI context before provisioning/deploying:
 
@@ -79,7 +81,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
      -> POST /api/chat (Next.js) -> POST /api/chat (Flask)
         -> PiiFilter.check() (backend PII layer)
         -> QueryRouter.route() (LLM) or .quick_route() (heuristic)
-           -> SQL route:      SQLGenerator -> PostgreSQL/SQLite -> citations
+           -> SQL route:      SQLGenerator -> PostgreSQL -> citations
            -> SEMANTIC route: AI Search (vector + semantic) -> citations
            -> HYBRID route:   SQL + Semantic in parallel (ThreadPoolExecutor)
         -> Azure OpenAI (gpt-5-nano) synthesizes answer from context
@@ -103,7 +105,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 ### Backend
 - Flask with flask-cors (all origins allowed)
 - `DefaultAzureCredential` + `get_bearer_token_provider` for Azure OpenAI auth
-- DB dual-mode: SQLite (dev, default) vs PostgreSQL (prod, when `USE_POSTGRES=true` or `PGHOST` set)
+- DB: PostgreSQL only (requires `PGHOST` set)
 - Single gunicorn worker in production (`--workers 1 --timeout 180`)
 - PII filter: 14 categories, confidence >= 0.8, fail-open on timeout (5s)
 
@@ -124,7 +126,6 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - `AZURE_SEARCH_INDEX_NAME` — Search index (default: `aviation-index`)
 - `ASRS_EXPORT_URL` — ASRS export endpoint URL for `scripts/00_fetch_asrs_exports.py`
 - `ASRS_QUERY_TEMPLATE_JSON` — optional JSON object of fixed query params for ASRS export requests
-- `USE_POSTGRES` — Set `"true"` for PostgreSQL mode
 - `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` — PostgreSQL connection
 - `PII_ENDPOINT` / `PII_CONTAINER_ENDPOINT` — PII service URL
 
@@ -143,7 +144,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 
 - **Commit `.env.local` or `.env`** — contains real Azure secrets (keys, passwords, connection strings)
 - **Increase gunicorn workers** beyond 1 without reviewing in-memory state in unified_retriever.py
-- **Remove `check_same_thread=False`** from SQLite connection — Flask serves from multiple threads
+- **Skip PostgreSQL connection pool** changes without reviewing thread safety in unified_retriever.py
 - **Forget CSP `connect-src`** in `next.config.mjs` when changing backend domain
 - **Assume SSE reduces latency** — streaming is cosmetic, backend returns full response synchronously
 - **Use `AZURE_OPENAI_API_KEY` in production** — prefer `DefaultAzureCredential` (managed identity)

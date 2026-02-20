@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
-from azure_openai_client import init_azure_openai_client
+from azure_openai_client import get_shared_client
 from contracts.agentic_plan import AgenticPlan, CoverageItem, EvidenceRequirement, Intent, TimeWindow, ToolCall
 from intent_graph_provider import IntentGraphSnapshot
 
@@ -37,7 +37,7 @@ OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 
 def _init_client():
-    client, _ = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+    client, _ = get_shared_client(api_version=OPENAI_API_VERSION)
     return client
 
 

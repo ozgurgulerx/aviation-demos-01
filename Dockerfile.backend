@@ -37,7 +37,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5001/health || exit 1
 
 ENV GUNICORN_WORKER_CLASS=gthread \
-    GUNICORN_WORKERS=3 \
+    GUNICORN_WORKERS=1 \
     GUNICORN_THREADS=4 \
     GUNICORN_TIMEOUT_SECONDS=240 \
     GUNICORN_GRACEFUL_TIMEOUT_SECONDS=30 \

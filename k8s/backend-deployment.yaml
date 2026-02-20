@@ -12,8 +12,8 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: aviation-rag-backend
@@ -23,6 +23,10 @@ spec:
         app: aviation-rag-backend
     spec:
       terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -35,6 +39,12 @@ spec:
       containers:
       - name: backend
         image: ${AZURE_CONTAINER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         command: ["/bin/sh", "-c"]
         args:
         - >
@@ -63,6 +73,9 @@ spec:
           limits:
             memory: "2Gi"
             cpu: "1"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
         startupProbe:
           httpGet:
             path: /health
@@ -74,18 +87,19 @@ spec:
           httpGet:
             path: /health
             port: 5001
-          initialDelaySeconds: 120
           periodSeconds: 30
           timeoutSeconds: 10
-          failureThreshold: 10
+          failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /health
             port: 5001
-          initialDelaySeconds: 30
           periodSeconds: 15
           timeoutSeconds: 5
-          failureThreshold: 8
+          failureThreshold: 4
+      volumes:
+      - name: tmp
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

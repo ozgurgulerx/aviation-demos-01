@@ -6,7 +6,7 @@ K8S_DIR="${K8S_DIR:-${SCRIPT_DIR}/../k8s}"
 OUT_DIR="${1:-/tmp/k8s-rendered}"
 
 # Defaults for non-secret values.
-: "${AZURE_OPENAI_API_VERSION:=2022-12-01}"
+: "${AZURE_OPENAI_API_VERSION:=2024-10-21}"
 : "${AZURE_OPENAI_DEPLOYMENT_NAME:=gpt-5-nano}"
 : "${AZURE_OPENAI_WORKER_DEPLOYMENT_NAME:=${AZURE_OPENAI_DEPLOYMENT_NAME}}"
 : "${AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME:=gpt-5-mini}"
@@ -22,13 +22,6 @@ OUT_DIR="${1:-/tmp/k8s-rendered}"
 : "${PGUSER:=aviationrag_readonly}"
 : "${FLASK_ENV:=production}"
 : "${LOG_LEVEL:=INFO}"
-: "${USE_POSTGRES:=true}"
-: "${SQL_DIALECT:=postgres}"
-: "${RETRIEVAL_STRICT_SOURCE_MODE:=false}"
-: "${ALLOW_SQLITE_FALLBACK:=true}"
-: "${ALLOW_MOCK_KQL_FALLBACK:=true}"
-: "${ALLOW_MOCK_GRAPH_FALLBACK:=true}"
-: "${ALLOW_MOCK_NOSQL_FALLBACK:=true}"
 : "${SCHEMA_CACHE_TTL_SECONDS:=300}"
 : "${KQL_SCHEMA_MODE:=static}"
 : "${OTEL_SERVICE_NAME:=aviation-rag-backend}"
@@ -38,7 +31,7 @@ OUT_DIR="${1:-/tmp/k8s-rendered}"
 : "${AZURE_OPENAI_TIMEOUT_SECONDS:=45}"
 : "${AZURE_OPENAI_MAX_RETRIES:=1}"
 : "${GUNICORN_WORKER_CLASS:=gthread}"
-: "${GUNICORN_WORKERS:=3}"
+: "${GUNICORN_WORKERS:=1}"
 : "${GUNICORN_THREADS:=4}"
 : "${GUNICORN_TIMEOUT_SECONDS:=240}"
 : "${GUNICORN_GRACEFUL_TIMEOUT_SECONDS:=30}"
@@ -49,6 +42,7 @@ OUT_DIR="${1:-/tmp/k8s-rendered}"
 : "${FABRIC_GRAPH_ENDPOINT:=}"
 : "${FABRIC_NOSQL_ENDPOINT:=}"
 : "${BACKEND_INGRESS_HOST:=aviation-rag-api.westeurope.cloudapp.azure.com}"
+: "${ALLOWED_ORIGIN:=https://aviation-rag-frontend-705508.azurewebsites.net}"
 : "${IMAGE_TAG:=latest}"
 
 export AZURE_CONTAINER_REGISTRY IMAGE_NAME IMAGE_TAG
@@ -62,14 +56,13 @@ export AZURE_SEARCH_ENDPOINT
 export PII_ENDPOINT PII_CONTAINER_ENDPOINT
 export K8S_NAMESPACE
 export PGHOST PGPORT PGDATABASE PGUSER
-export FLASK_ENV LOG_LEVEL USE_POSTGRES SQL_DIALECT RETRIEVAL_STRICT_SOURCE_MODE
-export ALLOW_SQLITE_FALLBACK ALLOW_MOCK_KQL_FALLBACK ALLOW_MOCK_GRAPH_FALLBACK ALLOW_MOCK_NOSQL_FALLBACK
+export FLASK_ENV LOG_LEVEL
 export SCHEMA_CACHE_TTL_SECONDS KQL_SCHEMA_MODE OTEL_SERVICE_NAME ENVIRONMENT AF_SESSION_TTL_SECONDS AF_MAX_SESSIONS
 export GUNICORN_WORKER_CLASS GUNICORN_WORKERS GUNICORN_THREADS
 export GUNICORN_TIMEOUT_SECONDS GUNICORN_GRACEFUL_TIMEOUT_SECONDS
 export GUNICORN_KEEPALIVE_SECONDS GUNICORN_MAX_REQUESTS GUNICORN_MAX_REQUESTS_JITTER
 export FABRIC_KQL_ENDPOINT FABRIC_GRAPH_ENDPOINT FABRIC_NOSQL_ENDPOINT
-export BACKEND_INGRESS_HOST
+export BACKEND_INGRESS_HOST ALLOWED_ORIGIN
 
 required=(
   AZURE_CONTAINER_REGISTRY
@@ -90,7 +83,7 @@ done
 
 mkdir -p "${OUT_DIR}"
 
-for manifest in namespace.yaml backend-service.yaml backend-configmap.yaml backend-deployment.yaml backend-ingress.yaml; do
+for manifest in namespace.yaml backend-service.yaml backend-configmap.yaml backend-deployment.yaml backend-ingress.yaml backend-networkpolicy.yaml backend-pdb.yaml; do
   src="${K8S_DIR}/${manifest}"
   [ -f "${src}" ] || continue
   envsubst < "${src}" > "${OUT_DIR}/${manifest}"
