@@ -24,8 +24,8 @@ permissions:
   contents: read
 
 env:
-  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'aviationragacr' }}
-  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'aviationragacr.azurecr.io' }}
+  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'avrag705508acr' }}
+  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'avrag705508acr.azurecr.io' }}
   IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
   AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || 'rg-aviation-rag' }}
