@@ -900,7 +900,7 @@ export default function ChatPage() {
                 disabled={preflightLoading}
                 className="h-7 px-2 text-[11px]"
               >
-                {preflightLoading ? "Checking..." : "Refresh preflight"}
+                {preflightLoading ? "Checking..." : "Refresh data path"}
               </Button>
             </div>
 
@@ -1006,9 +1006,9 @@ export default function ChatPage() {
           </div>
           {fabricPreflight && (
             <div className="mx-auto mt-2 max-w-5xl text-xs text-muted-foreground">
-              Preflight timestamp: {fabricPreflight.timestamp || "n/a"} · checks:{" "}
+              Data path checked at {fabricPreflight.timestamp || "n/a"} · checks:{" "}
               {fabricPreflight.checks?.length || 0}
-              {fabricPreflight.error ? ` · error: ${fabricPreflight.error}` : ""}
+              {fabricPreflight.error ? " · status degraded" : ""}
             </div>
           )}
         </div>

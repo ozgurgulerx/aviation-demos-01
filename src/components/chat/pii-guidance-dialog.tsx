@@ -25,13 +25,13 @@ const BLOCKED_EXAMPLES = [
 ];
 
 const ALLOWED_EXAMPLES = [
-  { pattern: "I have $100M to invest", description: "Dollar amounts (not PII)" },
-  { pattern: "My salary is $500,000", description: "Income statements" },
-  { pattern: "I'm worth $50 million", description: "Wealth statements" },
-  { pattern: "High risk appetite", description: "Investment preferences" },
-  { pattern: "Which funds hold NVIDIA?", description: "Fund queries" },
-  { pattern: "Compare bond fund duration", description: "Analysis requests" },
-  { pattern: "What does IMF say about rates?", description: "Market questions" },
+  { pattern: "Assess departure risk for SAW to AYT in 90 minutes", description: "Flight risk analysis" },
+  { pattern: "Flag potential crew legality breaches for next wave", description: "Crew legality checks" },
+  { pattern: "Compare disruption impact across SAW, ADB, and AYT", description: "Network impact scan" },
+  { pattern: "Summarize active runway and NOTAM constraints", description: "Regulatory/NOTAM queries" },
+  { pattern: "List hazards affecting approach and alternates", description: "Weather risk review" },
+  { pattern: "Show turnaround bottlenecks by stand and station", description: "Ground ops analysis" },
+  { pattern: "Generate a concise pilot brief with evidence", description: "Brief generation request" },
 ];
 
 export function PiiGuidanceDialog() {
@@ -119,8 +119,8 @@ export function PiiGuidanceDialog() {
               <Info className="h-4 w-4 text-blue-500 shrink-0 mt-0.5" />
               <p className="text-xs text-muted-foreground">
                 <strong className="text-foreground">Note:</strong> The filter detects specific patterns
-                (account numbers, SSNs, etc.), not semantic meaning. General financial discussions
-                like investment amounts or salary ranges are permitted.
+                (account numbers, SSNs, etc.), not semantic meaning. Operational questions about
+                routes, NOTAMs, crew legality, and disruptions are permitted.
               </p>
             </div>
           </div>

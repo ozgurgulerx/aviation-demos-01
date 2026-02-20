@@ -41,10 +41,10 @@ export default function LoginPage() {
 
             <div className="space-y-2">
               <h1 className="text-2xl font-semibold tracking-tight">
-                Fund Intelligence
+                AeroLynx Flight Briefing
               </h1>
               <p className="text-sm text-muted-foreground">
-                Enterprise funding data analytics platform
+                Operational pilot briefing and evidence workspace
               </p>
             </div>
           </CardHeader>

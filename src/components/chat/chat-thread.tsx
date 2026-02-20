@@ -56,11 +56,11 @@ const toneMap: Record<string, string> = {
 };
 
 const orchestrationSteps = [
-  "Plan",
-  "Arbitrate",
+  "Understand",
+  "Map intent",
   "Retrieve",
-  "Assemble",
   "Synthesize",
+  "Evidence",
 ];
 
 export function ChatThread({
@@ -519,11 +519,18 @@ function getOrchestrationStep(events: TelemetryEvent[], isLoading: boolean): num
     step = Math.max(step, 2);
   }
 
-  if (events.some((event) => event.type === "source_call_done" && (event.citationCount || 0) > 0)) {
+  if (
+    events.some(
+      (event) =>
+        event.type === "agent_update" ||
+        event.type === "text" ||
+        event.type === "tool_result"
+    )
+  ) {
     step = Math.max(step, 3);
   }
 
-  if (events.some((event) => event.type === "agent_done")) {
+  if (events.some((event) => event.type === "agent_done" || event.type === "agent_error")) {
     step = Math.max(step, 4);
   }
 

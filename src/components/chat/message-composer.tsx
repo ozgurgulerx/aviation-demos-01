@@ -574,7 +574,7 @@ export function MessageComposer({
             value={input}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
-            placeholder="Ask about fund data..."
+            placeholder="Ask for a flight risk brief, crew legality scan, or disruption impact analysis..."
             disabled={disabled || isLoading || piiStatus === "checking"}
             className={cn(
               "min-h-[52px] max-h-[200px] py-3.5 pr-36 resize-none transition-all duration-300 text-base",

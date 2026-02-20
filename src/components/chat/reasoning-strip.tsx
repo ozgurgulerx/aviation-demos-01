@@ -45,7 +45,11 @@ export function ReasoningStrip({
 
   const currentStageIndex = latest ? getReasoningStageIndex(latest.stage) : isLoading ? 0 : -1;
   const progressPercent = currentStageIndex < 0 ? 0 : ((currentStageIndex + 1) / STAGES.length) * 100;
-  const compactLabel = latest ? STAGES[getReasoningStageIndex(latest.stage)]?.label : "Waiting for analysis";
+  const compactLabel = latest
+    ? STAGES[getReasoningStageIndex(latest.stage)]?.label
+    : isLoading
+      ? "Understanding request"
+      : "Waiting for analysis";
 
   const compactArtifact = useMemo(() => {
     if (!latest?.payload) return "";
@@ -75,7 +79,7 @@ export function ReasoningStrip({
     <section className="mt-3 rounded-lg border border-border/70 bg-background/80 px-3 py-2">
       <div className="mb-2 flex items-center gap-2">
         <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-          Reasoning Strip
+          Agent Pipeline
         </p>
         <div className="relative h-1 flex-1 overflow-hidden rounded-full bg-muted">
           <motion.div
@@ -242,4 +246,3 @@ function toUtcClock(value: string): string {
     timeZone: "UTC",
   });
 }
-
