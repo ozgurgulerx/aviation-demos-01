@@ -317,6 +317,9 @@ class AgentFrameworkRuntime:
                 "status": "completed",
                 "sessionId": sid,
             }
+            scenario_alert = self._scenario_operational_alert(demo_scenario)
+            if scenario_alert:
+                yield scenario_alert
 
         if freshness_sla_minutes:
             yield {
@@ -737,6 +740,42 @@ class AgentFrameworkRuntime:
         if not prefix:
             return query
         return f"{prefix}\n\nUser query: {query}"
+
+    def _scenario_operational_alert(self, demo_scenario: str) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc).isoformat()
+        scenario = (demo_scenario or "").strip().lower()
+        alerts = {
+            "weather-spike": {
+                "severity": "warning",
+                "title": "Weather Advisory",
+                "message": "Convective weather spike detected near departure corridor. Re-check hazard windows at T-30 and prepare alternate flow sequencing.",
+                "source": "KQL",
+            },
+            "runway-notam": {
+                "severity": "critical",
+                "title": "Runway NOTAM Critical",
+                "message": "Runway constraint NOTAM is active and may reduce throughput. Validate dispatch sequence and slot exposure before release.",
+                "source": "VECTOR_REG",
+            },
+            "ground-bottleneck": {
+                "severity": "warning",
+                "title": "Ground Handling Bottleneck",
+                "message": "Ground handling saturation detected at hub stands. Prioritize turnaround recovery and downstream tail protection.",
+                "source": "KQL",
+            },
+        }
+        payload = alerts.get(scenario)
+        if not payload:
+            return None
+        return {
+            "type": "operational_alert",
+            "stage": "ops_alert",
+            "severity": payload["severity"],
+            "title": payload["title"],
+            "message": payload["message"],
+            "source": payload["source"],
+            "timestamp": now,
+        }
 
     def _format_citations(self, citations: List[Citation]) -> List[Dict[str, Any]]:
         now = datetime.now(timezone.utc).isoformat()

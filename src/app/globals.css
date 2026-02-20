@@ -147,6 +147,19 @@
     @apply absolute inset-0 rounded-full bg-emerald-500/40;
     animation: ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
   }
+
+  .alert-marquee-track {
+    display: inline-flex;
+    min-width: 100%;
+    white-space: nowrap;
+    gap: 2.5rem;
+    animation: alert-marquee-scroll 16s linear infinite;
+  }
+
+  .alert-marquee-segment {
+    @apply text-sm font-medium;
+    min-width: max-content;
+  }
 }
 
 @layer utilities {
@@ -267,4 +280,13 @@
 
 .citation-chip.active {
   @apply bg-primary text-primary-foreground;
+}
+
+@keyframes alert-marquee-scroll {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
 }

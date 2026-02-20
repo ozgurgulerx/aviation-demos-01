@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AlertTriangle, X } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SourcesPanel } from "@/components/layout/sources-panel";
 import { ChatThread } from "@/components/chat/chat-thread";
@@ -18,8 +20,8 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { ArchitectureMap } from "@/components/architecture/architecture-map";
-import { generateId } from "@/lib/utils";
-import { parseSSEFrames, toTelemetryEvent, updateSourceHealth } from "@/lib/chat";
+import { cn, generateId } from "@/lib/utils";
+import { parseSSEFrames, toOperationalAlert, toTelemetryEvent, updateSourceHealth } from "@/lib/chat";
 import {
   SAMPLE_CONVERSATIONS,
   ENHANCED_FOLLOW_UP_SUGGESTIONS,
@@ -31,6 +33,7 @@ import type {
   TelemetryEvent,
   SourceHealthStatus,
   FabricPreflightStatus,
+  OperationalAlert,
 } from "@/types";
 
 type RetrievalMode = "code-rag" | "foundry-iq";
@@ -84,6 +87,7 @@ export default function ChatPage() {
   const [confidenceLabel, setConfidenceLabel] = useState<string>("Awaiting run");
   const [fabricPreflight, setFabricPreflight] = useState<FabricPreflightStatus | null>(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
+  const [operationalAlert, setOperationalAlert] = useState<OperationalAlert | null>(null);
 
   const handleNewChat = useCallback(() => {
     setActiveConversationId(null);
@@ -96,6 +100,7 @@ export default function ChatPage() {
     setSourceHealth(createInitialSourceHealth());
     setRouteLabel("Pending");
     setConfidenceLabel("Awaiting run");
+    setOperationalAlert(null);
   }, []);
 
   const handleSelectConversation = useCallback((id: string) => {
@@ -167,6 +172,7 @@ export default function ChatPage() {
       setSourceHealth(createInitialSourceHealth());
       setRouteLabel("Running");
       setConfidenceLabel("Calculating");
+      setOperationalAlert(null);
 
       try {
         const response = await fetch("/api/chat", {
@@ -217,6 +223,11 @@ export default function ChatPage() {
 
           if (event.type === "agent_error" || event.type === "error") {
             throw new Error(event.message || event.error || "Agent runtime error");
+          }
+
+          const alert = toOperationalAlert(event);
+          if (alert) {
+            setOperationalAlert(alert);
           }
 
           setSourceHealth((previous) => updateSourceHealth(previous, event));
@@ -313,6 +324,13 @@ export default function ChatPage() {
         ]);
         setRouteLabel("Error");
         setConfidenceLabel("Unavailable");
+        setOperationalAlert({
+          id: generateId(),
+          severity: "critical",
+          title: "Runtime Alert",
+          message: error instanceof Error ? error.message : "Unknown error",
+          timestamp: new Date().toISOString(),
+        });
       } finally {
         setIsLoading(false);
         setStreamingContent("");
@@ -493,6 +511,11 @@ export default function ChatPage() {
           )}
         </div>
 
+        <OperationalAlertBanner
+          alert={operationalAlert}
+          onDismiss={() => setOperationalAlert(null)}
+        />
+
         <ChatThread
           messages={messages}
           isLoading={isLoading}
@@ -533,5 +556,80 @@ export default function ChatPage() {
         confidenceLabel={confidenceLabel}
       />
     </div>
+  );
+}
+
+function OperationalAlertBanner({
+  alert,
+  onDismiss,
+}: {
+  alert: OperationalAlert | null;
+  onDismiss: () => void;
+}) {
+  const reducedMotion = useReducedMotion();
+  const severity = alert?.severity || "advisory";
+  const marquee = [alert?.message || "", alert?.message || ""];
+
+  return (
+    <AnimatePresence>
+      {alert && (
+        <motion.section
+          initial={reducedMotion ? false : { opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -6 }}
+          transition={{ duration: reducedMotion ? 0 : 0.24 }}
+          role="alert"
+          aria-live={severity === "critical" ? "assertive" : "polite"}
+          className={cn(
+            "relative z-20 border-b px-4 py-2",
+            severity === "critical" && "border-orange-500/55 bg-orange-500/16",
+            severity === "warning" && "border-amber-500/50 bg-amber-500/14",
+            severity === "advisory" && "border-primary/40 bg-primary/10"
+          )}
+        >
+          <div className="mx-auto flex max-w-5xl items-center gap-3">
+            <div className="flex items-center gap-2 whitespace-nowrap text-xs font-semibold uppercase tracking-[0.1em]">
+              <AlertTriangle className="h-4 w-4" />
+              {severity === "critical" ? "Critical Operational Advisory" : "Operational Advisory"}
+            </div>
+
+            <div className="min-w-0 flex-1 overflow-hidden">
+              {reducedMotion ? (
+                <p className="truncate text-sm">{alert.message}</p>
+              ) : (
+                <div className="alert-marquee-track">
+                  {marquee.map((text, index) => (
+                    <span key={`${alert.id}-${index}`} className="alert-marquee-segment">
+                      {text}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="hidden text-[11px] text-muted-foreground md:block">
+              {new Date(alert.timestamp).toLocaleTimeString("en-US", {
+                hour12: false,
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+                timeZone: "UTC",
+              })}{" "}
+              UTC
+            </div>
+
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              onClick={onDismiss}
+              className="h-7 w-7 shrink-0"
+              aria-label="Dismiss advisory"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        </motion.section>
+      )}
+    </AnimatePresence>
   );
 }

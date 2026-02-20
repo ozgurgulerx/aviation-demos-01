@@ -73,6 +73,7 @@ export interface SourceReference {
 }
 
 export type TelemetryEventStatus = "running" | "completed" | "error" | "info";
+export type OperationalAlertSeverity = "advisory" | "warning" | "critical";
 
 export interface TelemetryEvent {
   id: string;
@@ -90,7 +91,8 @@ export interface TelemetryEvent {
     | "scenario_loaded"
     | "freshness_guardrail"
     | "fallback_mode_changed"
-    | "fabric_preflight";
+    | "fabric_preflight"
+    | "operational_alert";
   stage: string;
   message: string;
   status: TelemetryEventStatus;
@@ -110,6 +112,16 @@ export interface TelemetryEvent {
   };
   evidenceRefs?: number[];
   mode?: "live" | "fallback" | "unknown";
+  alertSeverity?: OperationalAlertSeverity;
+}
+
+export interface OperationalAlert {
+  id: string;
+  severity: OperationalAlertSeverity;
+  title: string;
+  message: string;
+  source?: string;
+  timestamp: string;
 }
 
 export interface EvidenceManifestItem {

@@ -144,6 +144,7 @@ export function SourcesPanel({
                   <AnimatePresence initial={false}>
                     {sourceHealth.map((source) => {
                       const visual = getDatastoreVisual(source.source);
+                      const tone = getSourceTone(source.source);
 
                       return (
                         <motion.div
@@ -160,19 +161,45 @@ export function SourcesPanel({
                           }
                           transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
                           className={cn(
-                            "relative rounded-lg border bg-card px-3 py-2 text-xs",
-                            source.status === "querying" && "border-primary/40",
-                            source.status === "ready" && "border-emerald-500/30"
+                            "relative overflow-hidden rounded-lg border bg-card px-3 py-2 text-xs",
+                            source.status === "querying" && tone.queryCard,
+                            source.status === "ready" && tone.readyCard,
+                            source.status === "error" && "border-destructive/45 bg-destructive/[0.05]"
                           )}
                         >
+                          <span
+                            className={cn(
+                              "pointer-events-none absolute inset-y-0 left-0 w-1 rounded-l-lg opacity-0 transition-opacity duration-300",
+                              tone.accentBar,
+                              source.status !== "idle" && "opacity-100"
+                            )}
+                          />
                           {source.status === "querying" && !reducedMotion && (
+                            <>
+                              <motion.span
+                                className={cn("pointer-events-none absolute inset-0 rounded-lg border", tone.queryBorder)}
+                                animate={{ opacity: [0.65, 0.25, 0.65] }}
+                                transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
+                              />
+                              <motion.span className="pointer-events-none absolute inset-0 overflow-hidden rounded-lg">
+                                <motion.span
+                                  className="absolute inset-y-0 -left-1/3 w-1/2 blur-xl"
+                                  style={{ background: tone.querySheen }}
+                                  animate={{ x: ["-140%", "240%"] }}
+                                  transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+                                />
+                              </motion.span>
+                            </>
+                          )}
+                          {source.status === "ready" && !reducedMotion && (
                             <motion.span
-                              className="pointer-events-none absolute inset-0 rounded-lg border border-primary/45"
-                              animate={{ opacity: [0.65, 0.2, 0.65] }}
-                              transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+                              className="pointer-events-none absolute inset-0 rounded-lg"
+                              style={{ boxShadow: `inset 0 0 0 1px ${tone.readyGlow}` }}
+                              animate={{ opacity: [0.2, 0.55, 0.2] }}
+                              transition={{ duration: 2.8, repeat: Infinity, ease: "easeInOut" }}
                             />
                           )}
-                          <div className="mb-1 flex items-center justify-between gap-2">
+                          <div className="relative z-[1] mb-1 flex items-center justify-between gap-2">
                             <div className="flex min-w-0 items-center gap-2">
                               <motion.div
                                 animate={
@@ -214,7 +241,7 @@ export function SourcesPanel({
                               {source.status}
                             </Badge>
                           </div>
-                          <div className="flex items-center justify-between text-muted-foreground">
+                          <div className="relative z-[1] flex items-center justify-between text-muted-foreground">
                             <AnimatePresence mode="popLayout" initial={false}>
                               <motion.span
                                 key={`${source.source}-${source.rowCount}`}
@@ -231,7 +258,7 @@ export function SourcesPanel({
                             </span>
                           </div>
                           {source.mode && (
-                            <div className="mt-1 text-[10px] text-muted-foreground">
+                            <div className="relative z-[1] mt-1 text-[10px] text-muted-foreground">
                               Retrieval mode: <span className="font-semibold text-foreground">{source.mode}</span>
                             </div>
                           )}
@@ -327,6 +354,49 @@ export function SourcesPanel({
       </ScrollArea>
     </motion.aside>
   );
+}
+
+interface SourceTone {
+  accentBar: string;
+  queryCard: string;
+  queryBorder: string;
+  readyCard: string;
+  querySheen: string;
+  readyGlow: string;
+}
+
+function getSourceTone(sourceId: string): SourceTone {
+  const source = sourceId.toUpperCase();
+  if (source.startsWith("VECTOR")) {
+    return {
+      accentBar: "bg-sky-500/80",
+      queryCard: "border-sky-500/45 bg-sky-500/[0.08]",
+      queryBorder: "border-sky-500/55",
+      readyCard: "border-sky-500/35 bg-sky-500/[0.05]",
+      querySheen: "linear-gradient(115deg, transparent 10%, rgba(14, 165, 233, 0.24) 52%, transparent 88%)",
+      readyGlow: "rgba(14, 165, 233, 0.24)",
+    };
+  }
+
+  if (source === "NOSQL" || source === "POSTGRES") {
+    return {
+      accentBar: "bg-teal-500/80",
+      queryCard: "border-teal-500/45 bg-teal-500/[0.08]",
+      queryBorder: "border-teal-500/55",
+      readyCard: "border-teal-500/35 bg-teal-500/[0.05]",
+      querySheen: "linear-gradient(115deg, transparent 10%, rgba(20, 184, 166, 0.24) 52%, transparent 88%)",
+      readyGlow: "rgba(20, 184, 166, 0.24)",
+    };
+  }
+
+  return {
+    accentBar: "bg-primary/80",
+    queryCard: "border-primary/45 bg-primary/[0.07]",
+    queryBorder: "border-primary/55",
+    readyCard: "border-primary/35 bg-primary/[0.05]",
+    querySheen: "linear-gradient(115deg, transparent 10%, rgba(25, 81, 171, 0.24) 52%, transparent 88%)",
+    readyGlow: "rgba(25, 81, 171, 0.22)",
+  };
 }
 
 function CitationCard({

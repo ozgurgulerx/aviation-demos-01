@@ -1,4 +1,11 @@
-import type { Message, Conversation, TelemetryEvent, SourceHealthStatus } from "@/types";
+import type {
+  Message,
+  Conversation,
+  TelemetryEvent,
+  SourceHealthStatus,
+  OperationalAlert,
+  OperationalAlertSeverity,
+} from "@/types";
 import { generateId } from "./utils";
 import { normalizeSourceId } from "./datastore";
 
@@ -49,6 +56,7 @@ export interface StreamEvent {
     | "freshness_guardrail"
     | "fallback_mode_changed"
     | "fabric_preflight"
+    | "operational_alert"
     | "done"
     | "error";
   id?: string;
@@ -94,13 +102,16 @@ export interface StreamEvent {
   evidence_refs?: number[];
   mode?: "live" | "fallback" | "unknown";
   scenario?: string;
+  severity?: OperationalAlertSeverity;
+  title?: string;
 }
 
 export function parseSSELine(line: string): StreamEvent | null {
-  if (!line.startsWith("data: ")) return null;
+  const sanitized = line.replace(/\r$/, "").trimStart();
+  if (!sanitized.startsWith("data:")) return null;
 
   try {
-    return JSON.parse(line.slice(6)) as StreamEvent;
+    return JSON.parse(sanitized.slice(5).trimStart()) as StreamEvent;
   } catch {
     return null;
   }
@@ -110,12 +121,13 @@ export function parseSSEFrames(buffer: string): {
   events: StreamEvent[];
   remainder: string;
 } {
-  const frames = buffer.split("\n\n");
-  const remainder = frames.pop() || "";
+  const frames = buffer.split(/\r?\n\r?\n/);
+  const maybeRemainder = frames.pop();
+  const remainder = maybeRemainder ?? "";
   const events: StreamEvent[] = [];
 
   for (const frame of frames) {
-    const lines = frame.split("\n");
+    const lines = frame.split(/\r?\n/);
     for (const line of lines) {
       const parsed = parseSSELine(line);
       if (parsed) {
@@ -261,6 +273,17 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         status: event.mode === "fallback" ? "running" : "completed",
         timestamp,
       };
+    case "operational_alert":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: event.stage || "ops_alert",
+        message: event.message || event.title || "Operational advisory",
+        status: event.severity === "critical" ? "error" : "info",
+        timestamp,
+        source: normalizeSourceName(event.source),
+        alertSeverity: event.severity,
+      };
     case "agent_done":
       return {
         id: fallbackId,
@@ -298,6 +321,85 @@ export function updateSourceHealth(
   current: SourceHealthStatus[],
   event: StreamEvent
 ): SourceHealthStatus[] {
+  if (event.type === "retrieval_plan") {
+    const plannedSources = extractPlannedSources(event.plan);
+    if (plannedSources.length === 0) {
+      return current;
+    }
+    const now = resolveEventTimestamp(event);
+    const normalizedPlanned = new Set(plannedSources.map((source) => normalizeSourceName(source)));
+    const existingBySource = new Set(current.map((item) => item.source));
+    const updated: SourceHealthStatus[] = current.map((item): SourceHealthStatus => {
+      if (!normalizedPlanned.has(item.source)) {
+        return item;
+      }
+      return {
+        ...item,
+        status: item.status === "ready" ? "ready" : "querying",
+        updatedAt: now,
+      };
+    });
+
+    for (const source of normalizedPlanned) {
+      if (existingBySource.has(source)) {
+        continue;
+      }
+      updated.push({
+        source,
+        status: "querying",
+        rowCount: 0,
+        updatedAt: now,
+        mode: "unknown",
+      });
+    }
+    return updated;
+  }
+
+  if (event.type === "tool_result") {
+    const sourceResultCounts = extractSourceResultCounts(event.result);
+    if (Object.keys(sourceResultCounts).length === 0) {
+      return current;
+    }
+    const now = resolveEventTimestamp(event);
+    const normalizedToCount = Object.entries(sourceResultCounts).reduce(
+      (acc, [source, count]) => {
+        const normalized = normalizeSourceName(source);
+        acc[normalized] = (acc[normalized] || 0) + count;
+        return acc;
+      },
+      {} as Record<string, number>
+    );
+
+    const existingBySource = new Set(current.map((item) => item.source));
+    const updated: SourceHealthStatus[] = current.map((item): SourceHealthStatus => {
+      const count = normalizedToCount[item.source];
+      if (typeof count !== "number") {
+        return item;
+      }
+      return {
+        ...item,
+        status: "ready" as const,
+        rowCount: count,
+        updatedAt: now,
+      };
+    });
+
+    for (const [source, count] of Object.entries(normalizedToCount)) {
+      if (existingBySource.has(source)) {
+        continue;
+      }
+      updated.push({
+        source,
+        status: "ready",
+        rowCount: count,
+        updatedAt: now,
+        mode: "unknown",
+      });
+    }
+
+    return updated;
+  }
+
   if (
     event.type !== "source_call_start" &&
     event.type !== "source_call_done" &&
@@ -365,6 +467,86 @@ function resolveEventTimestamp(event: StreamEvent): string {
     }
   }
   return new Date().toISOString();
+}
+
+export function toOperationalAlert(event: StreamEvent): OperationalAlert | null {
+  const timestamp = resolveEventTimestamp(event);
+  if (event.type === "operational_alert") {
+    return {
+      id: event.id || event.event_id || generateId(),
+      severity: event.severity || "warning",
+      title: event.title || "Operational Advisory",
+      message: event.message || "A new advisory was received from runtime telemetry.",
+      source: normalizeSourceName(event.source),
+      timestamp,
+    };
+  }
+
+  if (event.type === "agent_error" || event.type === "error") {
+    return {
+      id: event.id || event.event_id || generateId(),
+      severity: "critical",
+      title: "Runtime Alert",
+      message: event.message || event.error || "An unexpected runtime error occurred.",
+      source: normalizeSourceName(event.source),
+      timestamp,
+    };
+  }
+
+  if (event.type === "fallback_mode_changed" && event.mode === "fallback" && event.source) {
+    return {
+      id: event.id || event.event_id || generateId(),
+      severity: "warning",
+      title: "Source Fallback Active",
+      message: `${normalizeSourceName(event.source)} switched to fallback mode. Validate freshness before dispatch decisions.`,
+      source: normalizeSourceName(event.source),
+      timestamp,
+    };
+  }
+
+  return null;
+}
+
+function extractSourceResultCounts(result?: Record<string, unknown>): Record<string, number> {
+  if (!result) {
+    return {};
+  }
+  const raw = result["source_result_counts"];
+  if (!raw || typeof raw !== "object") {
+    return {};
+  }
+
+  const out: Record<string, number> = {};
+  for (const [source, value] of Object.entries(raw as Record<string, unknown>)) {
+    const count = Number(value);
+    if (!Number.isFinite(count) || count < 0) {
+      continue;
+    }
+    out[source] = count;
+  }
+  return out;
+}
+
+function extractPlannedSources(plan?: Record<string, unknown>): string[] {
+  if (!plan) {
+    return [];
+  }
+  const steps = plan["steps"];
+  if (!Array.isArray(steps)) {
+    return [];
+  }
+  const sources: string[] = [];
+  for (const step of steps) {
+    if (!step || typeof step !== "object") {
+      continue;
+    }
+    const source = (step as Record<string, unknown>)["source"];
+    if (typeof source !== "string" || !source.trim()) {
+      continue;
+    }
+    sources.push(source.trim());
+  }
+  return sources;
 }
 
 function normalizeSourceName(source?: string): string {
