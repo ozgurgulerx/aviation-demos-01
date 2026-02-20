@@ -17,6 +17,18 @@ from openai import AzureOpenAI
 load_dotenv()
 
 
+def _client_tuning_kwargs() -> dict:
+    try:
+        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
+    except Exception:
+        timeout_seconds = 45.0
+    try:
+        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
+    except Exception:
+        max_retries = 1
+    return {"timeout": timeout_seconds, "max_retries": max_retries}
+
+
 def _init_client() -> AzureOpenAI:
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -25,6 +37,7 @@ def _init_client() -> AzureOpenAI:
             azure_endpoint=endpoint,
             api_key=api_key,
             api_version="2024-06-01",
+            **_client_tuning_kwargs(),
         )
     credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
@@ -32,6 +45,7 @@ def _init_client() -> AzureOpenAI:
         azure_endpoint=endpoint,
         azure_ad_token_provider=token_provider,
         api_version="2024-06-01",
+        **_client_tuning_kwargs(),
     )
 
 
@@ -123,4 +137,3 @@ Rules:
             ],
         )
         return _strip_fences(response.choices[0].message.content or "")
-

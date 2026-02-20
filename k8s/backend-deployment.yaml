@@ -7,11 +7,12 @@ metadata:
     app: aviation-rag-backend
 spec:
   replicas: 2
+  progressDeadlineSeconds: 1200
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: aviation-rag-backend
@@ -32,6 +33,19 @@ spec:
       containers:
       - name: backend
         image: ${AZURE_CONTAINER_REGISTRY}/${IMAGE_NAME}:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - >
+          exec gunicorn --bind 0.0.0.0:5001
+          --worker-class "${GUNICORN_WORKER_CLASS}"
+          --workers "${GUNICORN_WORKERS}"
+          --threads "${GUNICORN_THREADS}"
+          --timeout "${GUNICORN_TIMEOUT_SECONDS}"
+          --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT_SECONDS}"
+          --keep-alive "${GUNICORN_KEEPALIVE_SECONDS}"
+          --max-requests "${GUNICORN_MAX_REQUESTS}"
+          --max-requests-jitter "${GUNICORN_MAX_REQUESTS_JITTER}"
+          api_server:app
         ports:
         - containerPort: 5001
           name: http
@@ -43,26 +57,33 @@ spec:
         resources:
           requests:
             memory: "512Mi"
-            cpu: "250m"
+            cpu: "500m"
           limits:
             memory: "2Gi"
             cpu: "1"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 5001
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 36
         livenessProbe:
           httpGet:
             path: /health
             port: 5001
-          initialDelaySeconds: 30
-          periodSeconds: 15
+          initialDelaySeconds: 90
+          periodSeconds: 20
           timeoutSeconds: 5
-          failureThreshold: 18
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /health
             port: 5001
-          initialDelaySeconds: 10
-          periodSeconds: 5
-          timeoutSeconds: 3
-          failureThreshold: 12
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
       imagePullSecrets:
       - name: acr-secret
 ---

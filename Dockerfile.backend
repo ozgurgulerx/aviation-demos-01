@@ -35,5 +35,14 @@ EXPOSE 5001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5001/health || exit 1
 
+ENV GUNICORN_WORKER_CLASS=gthread \
+    GUNICORN_WORKERS=3 \
+    GUNICORN_THREADS=4 \
+    GUNICORN_TIMEOUT_SECONDS=240 \
+    GUNICORN_GRACEFUL_TIMEOUT_SECONDS=30 \
+    GUNICORN_KEEPALIVE_SECONDS=5 \
+    GUNICORN_MAX_REQUESTS=200 \
+    GUNICORN_MAX_REQUESTS_JITTER=50
+
 # Run with gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "2", "--timeout", "180", "--max-requests", "100", "api_server:app"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:5001 --worker-class ${GUNICORN_WORKER_CLASS} --workers ${GUNICORN_WORKERS} --threads ${GUNICORN_THREADS} --timeout ${GUNICORN_TIMEOUT_SECONDS} --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT_SECONDS} --keep-alive ${GUNICORN_KEEPALIVE_SECONDS} --max-requests ${GUNICORN_MAX_REQUESTS} --max-requests-jitter ${GUNICORN_MAX_REQUESTS_JITTER} api_server:app"]

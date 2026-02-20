@@ -4,11 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/api_server.py'
-      - 'src/unified_retriever.py'
-      - 'src/query_router.py'
-      - 'src/sql_generator.py'
-      - 'src/pii_filter.py'
+      - 'src/**/*.py'
       - 'requirements.txt'
       - 'Dockerfile.backend'
       - 'k8s/**'
@@ -48,6 +44,16 @@ env:
   ENVIRONMENT: ${{ vars.ENVIRONMENT || 'production' }}
   AF_SESSION_TTL_SECONDS: ${{ vars.AF_SESSION_TTL_SECONDS || '3600' }}
   AF_MAX_SESSIONS: ${{ vars.AF_MAX_SESSIONS || '500' }}
+  AZURE_OPENAI_TIMEOUT_SECONDS: ${{ vars.AZURE_OPENAI_TIMEOUT_SECONDS || '45' }}
+  AZURE_OPENAI_MAX_RETRIES: ${{ vars.AZURE_OPENAI_MAX_RETRIES || '1' }}
+  GUNICORN_WORKER_CLASS: ${{ vars.GUNICORN_WORKER_CLASS || 'gthread' }}
+  GUNICORN_WORKERS: ${{ vars.GUNICORN_WORKERS || '3' }}
+  GUNICORN_THREADS: ${{ vars.GUNICORN_THREADS || '4' }}
+  GUNICORN_TIMEOUT_SECONDS: ${{ vars.GUNICORN_TIMEOUT_SECONDS || '240' }}
+  GUNICORN_GRACEFUL_TIMEOUT_SECONDS: ${{ vars.GUNICORN_GRACEFUL_TIMEOUT_SECONDS || '30' }}
+  GUNICORN_KEEPALIVE_SECONDS: ${{ vars.GUNICORN_KEEPALIVE_SECONDS || '5' }}
+  GUNICORN_MAX_REQUESTS: ${{ vars.GUNICORN_MAX_REQUESTS || '200' }}
+  GUNICORN_MAX_REQUESTS_JITTER: ${{ vars.GUNICORN_MAX_REQUESTS_JITTER || '50' }}
   FABRIC_KQL_ENDPOINT: ${{ vars.FABRIC_KQL_ENDPOINT }}
   FABRIC_GRAPH_ENDPOINT: ${{ vars.FABRIC_GRAPH_ENDPOINT }}
   FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
@@ -169,6 +175,15 @@ jobs:
           kubectl apply -f /tmp/k8s-rendered/backend-configmap.yaml
           kubectl apply -f /tmp/k8s-rendered/backend-deployment.yaml
 
+      - name: Stamp deployment with config and secret hashes
+        run: |
+          CONFIG_HASH=$(kubectl get configmap backend-config -n "${{ env.K8S_NAMESPACE }}" -o json | jq -cS '.data' | sha256sum | awk '{print $1}')
+          SECRET_HASH=$(kubectl get secret backend-secrets -n "${{ env.K8S_NAMESPACE }}" -o json | jq -cS '.data' | sha256sum | awk '{print $1}')
+          kubectl patch deployment aviation-rag-backend \
+            --namespace="${{ env.K8S_NAMESPACE }}" \
+            --type='merge' \
+            -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"rollouts.codex.dev/config-hash\":\"${CONFIG_HASH}\",\"rollouts.codex.dev/secret-hash\":\"${SECRET_HASH}\"}}}}}"
+
       - name: Update deployment image
         run: |
           kubectl set image deployment/aviation-rag-backend \
@@ -177,12 +192,20 @@ jobs:
 
       - name: Wait for rollout
         run: |
-          if ! kubectl rollout status deployment/aviation-rag-backend --namespace="${{ env.K8S_NAMESPACE }}" --timeout=600s; then
+          if ! kubectl rollout status deployment/aviation-rag-backend --namespace="${{ env.K8S_NAMESPACE }}" --timeout=900s; then
             echo "::error::Backend rollout timed out. Collecting diagnostics..."
             kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend || true
             kubectl get rs -n "${{ env.K8S_NAMESPACE }}" -l app=aviation-rag-backend || true
             kubectl get pods -n "${{ env.K8S_NAMESPACE }}" -l app=aviation-rag-backend -o wide || true
+            kubectl get configmap backend-config -n "${{ env.K8S_NAMESPACE }}" -o yaml || true
             kubectl describe deployment aviation-rag-backend -n "${{ env.K8S_NAMESPACE }}" || true
+            kubectl get events -n "${{ env.K8S_NAMESPACE }}" --sort-by=.lastTimestamp | tail -n 80 || true
+            for pod in $(kubectl get pods -n "${{ env.K8S_NAMESPACE }}" -l app=aviation-rag-backend -o name); do
+              echo "===== ${pod} ====="
+              kubectl describe "${pod}" -n "${{ env.K8S_NAMESPACE }}" || true
+              kubectl logs "${pod}" -n "${{ env.K8S_NAMESPACE }}" --tail=200 || true
+              kubectl logs "${pod}" -n "${{ env.K8S_NAMESPACE }}" --previous --tail=200 || true
+            done
             exit 1
           fi
 

@@ -65,6 +65,18 @@ FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "")
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _client_tuning_kwargs() -> dict:
+    try:
+        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
+    except Exception:
+        timeout_seconds = 45.0
+    try:
+        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
+    except Exception:
+        max_retries = 1
+    return {"timeout": timeout_seconds, "max_retries": max_retries}
+
+
 @dataclass
 class Citation:
     """Citation for a source used in the answer."""
@@ -132,6 +144,7 @@ class UnifiedRetriever:
                 azure_endpoint=OPENAI_ENDPOINT,
                 api_key=OPENAI_KEY,
                 api_version="2024-06-01",
+                **_client_tuning_kwargs(),
             )
         else:
             credential = DefaultAzureCredential()
@@ -142,6 +155,7 @@ class UnifiedRetriever:
                 azure_endpoint=OPENAI_ENDPOINT,
                 azure_ad_token_provider=token_provider,
                 api_version="2024-06-01",
+                **_client_tuning_kwargs(),
             )
 
         # Search clients (multi-index)

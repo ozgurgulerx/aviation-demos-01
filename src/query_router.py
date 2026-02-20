@@ -12,6 +12,19 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 load_dotenv()
 
+
+def _client_tuning_kwargs() -> dict:
+    try:
+        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
+    except Exception:
+        timeout_seconds = 45.0
+    try:
+        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
+    except Exception:
+        max_retries = 1
+    return {"timeout": timeout_seconds, "max_retries": max_retries}
+
+
 ROUTING_PROMPT = """You are a query router for an aviation safety Q&A system with multiple data sources.
 
 ## Available Data Sources
@@ -63,6 +76,7 @@ class QueryRouter:
                 azure_endpoint=endpoint,
                 api_key=api_key,
                 api_version="2024-06-01",
+                **_client_tuning_kwargs(),
             )
         else:
             credential = DefaultAzureCredential()
@@ -73,6 +87,7 @@ class QueryRouter:
                 azure_endpoint=endpoint,
                 azure_ad_token_provider=token_provider,
                 api_version="2024-06-01",
+                **_client_tuning_kwargs(),
             )
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-nano")
 
