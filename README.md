@@ -32,6 +32,8 @@ The project includes an end-to-end ASRS ingestion flow:
 - `AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME` (optional, defaults to `text-embedding-3-small`)
 - `AZURE_OPENAI_VOICE_DEPLOYMENT_NAME` (optional, defaults to `aviation-voice-tts`)
 - `AZURE_OPENAI_VOICE_API_VERSION` (optional, defaults to `2025-03-01-preview`)
+- `AZURE_OPENAI_AUTH_MODE` (optional: `token`/`auto`/`api-key`, defaults to `token`)
+- Token-mode options: `AZURE_OPENAI_TENANT_ID`, `AZURE_OPENAI_CLIENT_ID`, `AZURE_OPENAI_CLIENT_SECRET`, or managed identity (`AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID`)
 - `APPLICATIONINSIGHTS_CONNECTION_STRING` (recommended for runtime telemetry export)
 - DB settings when using postgres mode: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`
 
@@ -114,7 +116,7 @@ PG_SERVER_RG="<postgres-resource-group>" \
 - `PGDATABASE`
 - `PGUSER`
 - `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_DEPLOYMENT_NAME` (optional, default `gpt-5-nano`)
+- `AZURE_OPENAI_DEPLOYMENT_NAME` (optional, default `aviation-chat-gpt5-mini`)
 - `AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME` (optional, default `text-embedding-3-small`)
 - `AZURE_SEARCH_ENDPOINT`
 

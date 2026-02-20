@@ -1,0 +1,28 @@
+.git
+.github
+.gitignore
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+
+# Large local/demo assets that must not go into container context
+artifacts/
+data/
+documentation/
+aviation.db
+
+# Frontend build/runtime caches
+node_modules/
+src/node_modules/
+src/.next/
+src/tsconfig.tsbuildinfo
+
+# Local env files
+.env
+src/.env
+src/.env.local
