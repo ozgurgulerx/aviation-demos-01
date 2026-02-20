@@ -256,18 +256,28 @@ jobs:
           }
 
           if check_acr_access "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
+            echo "USE_IMAGE_PULL_SECRET=false" >> "$GITHUB_ENV"
             exit 0
           fi
 
           echo "::warning::AKS cannot currently pull from ACR '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'. Attempting to attach ACR..."
-          az aks update --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --attach-acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+          attach_output=""
+          attach_status=0
+          set +e
+          attach_output="$(az aks update --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --attach-acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" 2>&1)"
+          attach_status=$?
+          set -e
+          echo "$attach_output"
 
           echo "Re-checking AKS to ACR image pull permissions..."
-          if ! check_acr_access "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
-            echo "::error::AKS kubelet identity still cannot pull from ACR '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'."
-            echo "::error::Verify AcrPull role assignment for the AKS kubelet identity and ensure ACR tenant/subscription alignment."
-            exit 1
+          if [ "$attach_status" -eq 0 ] && check_acr_access "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
+            echo "USE_IMAGE_PULL_SECRET=false" >> "$GITHUB_ENV"
+            exit 0
           fi
+
+          echo "::warning::AKS kubelet identity still cannot pull from ACR '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'."
+          echo "::warning::Falling back to acr-secret imagePullSecret for this deployment."
+          echo "USE_IMAGE_PULL_SECRET=true" >> "$GITHUB_ENV"
 
       - name: Render Kubernetes manifests
         run: ./scripts/render-k8s-manifests.sh /tmp/k8s-rendered
@@ -293,8 +303,33 @@ jobs:
           kubectl apply -f /tmp/k8s-rendered/backend-configmap.yaml
           kubectl apply -f /tmp/k8s-rendered/backend-deployment.yaml
 
-      - name: Enforce AKS-managed ACR auth
+      - name: Configure backend image pull auth
         run: |
+          if [ "${USE_IMAGE_PULL_SECRET:-false}" = "true" ]; then
+            echo "::warning::Configuring acr-secret fallback image pull credentials."
+            ACR_USERNAME="$(az acr credential show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query username -o tsv)"
+            ACR_PASSWORD="$(az acr credential show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query 'passwords[0].value' -o tsv)"
+
+            if [ -z "$ACR_USERNAME" ] || [ -z "$ACR_PASSWORD" ]; then
+              echo "::error::Unable to retrieve ACR credentials for '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'."
+              echo "::error::Enable ACR admin user or grant the workflow identity permission to list ACR credentials."
+              exit 1
+            fi
+
+            kubectl create secret docker-registry acr-secret \
+              --namespace="${{ env.K8S_NAMESPACE }}" \
+              --docker-server="${{ env.AZURE_CONTAINER_REGISTRY }}" \
+              --docker-username="$ACR_USERNAME" \
+              --docker-password="$ACR_PASSWORD" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            kubectl patch deployment aviation-rag-backend \
+              --namespace="${{ env.K8S_NAMESPACE }}" \
+              --type='merge' \
+              -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-secret"}]}}}}'
+            exit 0
+          fi
+
           if kubectl get deployment aviation-rag-backend -n "${{ env.K8S_NAMESPACE }}" -o jsonpath='{.spec.template.spec.imagePullSecrets[*].name}' | grep -q .; then
             echo "::warning::Removing deployment imagePullSecrets to rely on AKS kubelet identity for ACR pulls."
             kubectl patch deployment aviation-rag-backend \
@@ -323,6 +358,7 @@ jobs:
           tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
           drift_reapply_attempts=0
           max_drift_reapply_attempts=3
+          use_pull_secret="${USE_IMAGE_PULL_SECRET:-false}"
 
           echo "Waiting for deployment to converge (image=${expected_image}, generation=${tracked_generation})"
           while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -362,7 +398,28 @@ jobs:
               continue
             fi
 
-            if [ -n "$template_pull_secrets" ]; then
+            if [ "$use_pull_secret" = "true" ] && [ "$template_pull_secrets" != "acr-secret" ]; then
+              drift_reapply_attempts=$((drift_reapply_attempts + 1))
+              echo "::warning::Deployment auth drift detected during rollout."
+              echo "::warning::Expected imagePullSecrets 'acr-secret' but found '$template_pull_secrets'. Re-applying fallback secret (attempt ${drift_reapply_attempts}/${max_drift_reapply_attempts})."
+
+              kubectl patch deployment aviation-rag-backend \
+                --namespace="${{ env.K8S_NAMESPACE }}" \
+                --type='merge' \
+                -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-secret"}]}}}}'
+
+              tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "$tracked_generation")"
+
+              if [ "$drift_reapply_attempts" -ge "$max_drift_reapply_attempts" ]; then
+                echo "::error::Deployment auth drift persisted after ${max_drift_reapply_attempts} re-apply attempts."
+                exit 1
+              fi
+
+              sleep "$poll_interval"
+              continue
+            fi
+
+            if [ "$use_pull_secret" != "true" ] && [ -n "$template_pull_secrets" ]; then
               drift_reapply_attempts=$((drift_reapply_attempts + 1))
               echo "::warning::Deployment auth drift detected during rollout."
               echo "::warning::Unexpected imagePullSecrets '$template_pull_secrets'. Removing to keep AKS-managed ACR auth (attempt ${drift_reapply_attempts}/${max_drift_reapply_attempts})."
