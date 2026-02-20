@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""
+Agent Framework runtime orchestration for Aviation RAG.
+
+This module implements:
+- Agent/session lifecycle
+- RAG context-provider execution
+- Tool-call/tool-result events
+- AF-native SSE event payloads
+- OpenTelemetry export bootstrap (Azure Monitor / App Insights)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Generator, Iterable, List, Optional
+
+from af_context_provider import AviationRagContextProvider
+from af_tools import AviationRagTools, build_agent_framework_tools
+from unified_retriever import Citation, UnifiedRetriever
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SessionState:
+    session: Any
+    last_seen: float
+
+
+class AgentFrameworkRuntime:
+    """Runtime facade for AF-based RAG execution and streaming."""
+
+    _otel_initialized = False
+
+    def __init__(self):
+        self.retriever = UnifiedRetriever(enable_pii_filter=True)
+        self.context_provider = AviationRagContextProvider(self.retriever)
+        self.toolset = AviationRagTools(self.retriever, self.context_provider)
+
+        self.session_ttl_seconds = int(os.getenv("AF_SESSION_TTL_SECONDS", "3600"))
+        self.max_sessions = int(os.getenv("AF_MAX_SESSIONS", "500"))
+        self._sessions: Dict[str, _SessionState] = {}
+        self._session_lock = threading.Lock()
+
+        self._agent: Any = None
+        self._af_enabled = False
+        self._framework_label = "local-fallback"
+
+        self._init_observability()
+        self._init_agent_framework()
+
+    @property
+    def af_enabled(self) -> bool:
+        return self._af_enabled
+
+    def _init_observability(self) -> None:
+        if AgentFrameworkRuntime._otel_initialized:
+            return
+
+        conn_str = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING", "").strip()
+        if not conn_str:
+            return
+
+        try:
+            from azure.monitor.opentelemetry.exporter import (  # type: ignore
+                AzureMonitorMetricExporter,
+                AzureMonitorTraceExporter,
+            )
+            from opentelemetry import metrics, trace  # type: ignore
+            from opentelemetry.sdk.metrics import MeterProvider  # type: ignore
+            from opentelemetry.sdk.metrics.export import (  # type: ignore
+                PeriodicExportingMetricReader,
+            )
+            from opentelemetry.sdk.resources import Resource  # type: ignore
+            from opentelemetry.sdk.trace import TracerProvider  # type: ignore
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
+
+            resource = Resource.create(
+                {
+                    "service.name": os.getenv("OTEL_SERVICE_NAME", "aviation-rag-backend"),
+                    "service.version": os.getenv("APP_VERSION", "0.1.0"),
+                    "deployment.environment": os.getenv("ENVIRONMENT", "development"),
+                }
+            )
+
+            tracer_provider = TracerProvider(resource=resource)
+            tracer_provider.add_span_processor(
+                BatchSpanProcessor(
+                    AzureMonitorTraceExporter(connection_string=conn_str),
+                )
+            )
+            trace.set_tracer_provider(tracer_provider)
+
+            metric_reader = PeriodicExportingMetricReader(
+                AzureMonitorMetricExporter(connection_string=conn_str)
+            )
+            meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+            metrics.set_meter_provider(meter_provider)
+
+            AgentFrameworkRuntime._otel_initialized = True
+            logger.info("OpenTelemetry initialized with Azure Monitor exporters")
+        except Exception as exc:
+            logger.warning("OpenTelemetry setup skipped: %s", exc)
+
+        # Optional AF-level setup when package is available.
+        try:
+            from agent_framework.observability import setup_observability  # type: ignore
+
+            otlp_endpoint = os.getenv("OTLP_ENDPOINT", "").strip()
+            if otlp_endpoint:
+                setup_observability(otlp_endpoint=otlp_endpoint)
+            else:
+                setup_observability()
+        except Exception:
+            # Not fatal; SDK bootstrap above is enough for standard OTel export.
+            pass
+
+    def _init_agent_framework(self) -> None:
+        try:
+            from agent_framework import Agent  # type: ignore
+        except Exception as exc:
+            logger.warning("Agent Framework package unavailable: %s", exc)
+            self._agent = None
+            self._af_enabled = False
+            return
+
+        client = self._build_af_client()
+        if client is None:
+            logger.warning("Agent Framework client initialization failed; using fallback")
+            self._agent = None
+            self._af_enabled = False
+            return
+
+        try:
+            self._agent = self._build_agent_instance(Agent, client)
+            self._af_enabled = self._agent is not None
+            self._framework_label = "agent-framework" if self._af_enabled else "local-fallback"
+            if self._af_enabled:
+                logger.info("Agent Framework runtime initialized successfully")
+        except Exception as exc:
+            logger.warning("Agent Framework initialization failed: %s", exc)
+            self._agent = None
+            self._af_enabled = False
+
+    def _build_af_client(self) -> Optional[Any]:
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-nano")
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        project_endpoint = os.getenv("AZURE_FOUNDRY_PROJECT_ENDPOINT")
+
+        client_ctors: List[Any] = []
+        try:
+            from agent_framework.azure import AzureOpenAIResponsesClient  # type: ignore
+
+            client_ctors.append(AzureOpenAIResponsesClient)
+        except Exception:
+            pass
+
+        try:
+            from agent_framework.openai import OpenAIResponsesClient  # type: ignore
+
+            client_ctors.append(OpenAIResponsesClient)
+        except Exception:
+            pass
+
+        for ctor in client_ctors:
+            sig = inspect.signature(ctor)
+            kwargs: Dict[str, Any] = {}
+            params = sig.parameters
+
+            if "deployment_name" in params:
+                kwargs["deployment_name"] = deployment_name
+            elif "model_id" in params:
+                kwargs["model_id"] = deployment_name
+
+            if "endpoint" in params and endpoint:
+                kwargs["endpoint"] = endpoint
+            if "project_endpoint" in params and project_endpoint:
+                kwargs["project_endpoint"] = project_endpoint
+
+            if "credential" in params:
+                try:
+                    from azure.identity import DefaultAzureCredential
+
+                    kwargs["credential"] = DefaultAzureCredential()
+                except Exception:
+                    pass
+
+            try:
+                return ctor(**kwargs)
+            except Exception as exc:
+                logger.debug("Client ctor %s failed with kwargs %s: %s", ctor, kwargs, exc)
+
+        return None
+
+    def _build_agent_instance(self, agent_cls: Any, chat_client: Any) -> Optional[Any]:
+        sig = inspect.signature(agent_cls)
+        params = sig.parameters
+        af_tools = build_agent_framework_tools(self.toolset)
+
+        instructions = (
+            "You are an aviation safety analyst. Use provided context and tools to answer "
+            "questions accurately, and include citations when available."
+        )
+
+        kwargs: Dict[str, Any] = {}
+        if "name" in params:
+            kwargs["name"] = "aviation-rag-agent"
+        if "chat_client" in params:
+            kwargs["chat_client"] = chat_client
+        if "instructions" in params:
+            kwargs["instructions"] = instructions
+        if "tools" in params and af_tools:
+            kwargs["tools"] = af_tools
+        if "context_providers" in params:
+            kwargs["context_providers"] = [self.context_provider]
+        elif "context_provider" in params:
+            kwargs["context_provider"] = self.context_provider
+
+        try:
+            return agent_cls(**kwargs)
+        except Exception:
+            # Fallback to minimal constructor if signature assumptions were too strict.
+            return agent_cls(chat_client=chat_client, name="aviation-rag-agent")
+
+    def _prune_sessions(self, now: float) -> None:
+        expired = [
+            sid for sid, state in self._sessions.items() if now - state.last_seen > self.session_ttl_seconds
+        ]
+        for sid in expired:
+            self._sessions.pop(sid, None)
+
+        if len(self._sessions) <= self.max_sessions:
+            return
+
+        for sid, _state in sorted(self._sessions.items(), key=lambda kv: kv[1].last_seen)[
+            : len(self._sessions) - self.max_sessions
+        ]:
+            self._sessions.pop(sid, None)
+
+    def _get_or_create_session(self, session_id: str) -> Any:
+        now = time.time()
+        with self._session_lock:
+            self._prune_sessions(now)
+            existing = self._sessions.get(session_id)
+            if existing:
+                existing.last_seen = now
+                return existing.session
+
+            session = {"id": session_id}
+            if self._af_enabled and self._agent is not None:
+                session = self._create_af_session(session_id) or session
+
+            self._sessions[session_id] = _SessionState(session=session, last_seen=now)
+            return session
+
+    def _create_af_session(self, session_id: str) -> Any:
+        if self._agent is None:
+            return None
+
+        if hasattr(self._agent, "get_session"):
+            try:
+                return self._agent.get_session(service_session_id=session_id)
+            except Exception:
+                pass
+
+        if hasattr(self._agent, "create_session"):
+            create = self._agent.create_session
+            for kwargs in ({"service_session_id": session_id}, {}):
+                try:
+                    return create(**kwargs)
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+
+        return None
+
+    def run_stream(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        retrieval_mode: str = "code-rag",
+        query_profile: str = "pilot-brief",
+        required_sources: Optional[List[str]] = None,
+        freshness_sla_minutes: Optional[int] = None,
+        explain_retrieval: bool = False,
+        risk_mode: str = "standard",
+        ask_recommendation: bool = False,
+    ) -> Generator[Dict[str, Any], None, None]:
+        sid = session_id or str(uuid.uuid4())
+
+        yield {
+            "type": "agent_update",
+            "stage": "start",
+            "message": "Agent session initialized",
+            "sessionId": sid,
+            "framework": self._framework_label,
+        }
+
+        pii_result = self.retriever.check_pii(query)
+        if pii_result.has_pii:
+            warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
+            for event in self._emit_text_chunks(warning):
+                yield event
+            yield {
+                "type": "agent_done",
+                "isVerified": False,
+                "route": "BLOCKED",
+                "reasoning": "PII policy blocked request",
+                "sessionId": sid,
+                "framework": self._framework_label,
+            }
+            return
+
+        if self._af_enabled:
+            try:
+                yield from self._run_with_agent_framework(
+                    query,
+                    sid,
+                    retrieval_mode,
+                    query_profile=query_profile,
+                    required_sources=required_sources or [],
+                    freshness_sla_minutes=freshness_sla_minutes,
+                    explain_retrieval=explain_retrieval,
+                    risk_mode=risk_mode,
+                    ask_recommendation=ask_recommendation,
+                )
+                return
+            except Exception as exc:
+                logger.exception("Agent Framework run failed")
+                yield {
+                    "type": "agent_update",
+                    "stage": "fallback",
+                    "message": f"AF runtime failed ({exc}); switching to local fallback",
+                    "sessionId": sid,
+                }
+
+        yield from self._run_with_local_pipeline(
+            query,
+            sid,
+            retrieval_mode,
+            query_profile=query_profile,
+            required_sources=required_sources or [],
+            freshness_sla_minutes=freshness_sla_minutes,
+            explain_retrieval=explain_retrieval,
+            risk_mode=risk_mode,
+            ask_recommendation=ask_recommendation,
+        )
+
+    def _run_with_agent_framework(
+        self,
+        query: str,
+        session_id: str,
+        retrieval_mode: str,
+        query_profile: str,
+        required_sources: List[str],
+        freshness_sla_minutes: Optional[int],
+        explain_retrieval: bool,
+        risk_mode: str,
+        ask_recommendation: bool,
+    ) -> Generator[Dict[str, Any], None, None]:
+        session = self._get_or_create_session(session_id)
+        call_id = str(uuid.uuid4())
+
+        yield {
+            "type": "tool_call",
+            "id": call_id,
+            "name": "context_provider.build_context",
+            "arguments": {
+                "query": query,
+                "retrieval_mode": retrieval_mode,
+                "query_profile": query_profile,
+                "required_sources": required_sources,
+                "freshness_sla_minutes": freshness_sla_minutes,
+                "explain_retrieval": explain_retrieval,
+                "risk_mode": risk_mode,
+                "ask_recommendation": ask_recommendation,
+            },
+        }
+
+        ctx = self.context_provider.build_context(
+            query,
+            retrieval_mode=retrieval_mode,
+            query_profile=query_profile,
+            required_sources=required_sources,
+            freshness_sla_minutes=freshness_sla_minutes,
+            explain_retrieval=explain_retrieval,
+            risk_mode=risk_mode,
+            ask_recommendation=ask_recommendation,
+        )
+        if ctx.retrieval_plan:
+            yield {"type": "retrieval_plan", "plan": ctx.retrieval_plan}
+        for trace in ctx.source_traces:
+            yield trace
+        yield {
+            "type": "tool_result",
+            "id": call_id,
+            "name": "context_provider.build_context",
+            "result": ctx.to_event_payload(),
+        }
+
+        prompt = (
+            "Use the retrieval context below to answer the user. "
+            "If context is insufficient, say that clearly.\n\n"
+            f"{ctx.context_text}\n\n"
+            f"User question: {query}"
+        )
+
+        answer = self._invoke_agent(prompt=prompt, session=session, session_id=session_id)
+        if not answer.strip():
+            answer = self.retriever._synthesize_answer(
+                query,
+                {
+                    "sql_results": ctx.sql_results[:12],
+                    "semantic_context": [
+                        {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
+                        for row in ctx.semantic_results[:8]
+                    ],
+                },
+                ctx.route,
+            )
+
+        for event in self._emit_text_chunks(answer):
+            yield event
+
+        if ctx.citations:
+            yield {"type": "citations", "citations": self._format_citations(ctx.citations)}
+
+        yield {
+            "type": "agent_done",
+            "isVerified": len(ctx.citations) > 0,
+            "route": ctx.route,
+            "reasoning": ctx.reasoning,
+            "sessionId": session_id,
+            "framework": self._framework_label,
+        }
+
+    def _run_with_local_pipeline(
+        self,
+        query: str,
+        session_id: str,
+        retrieval_mode: str,
+        query_profile: str,
+        required_sources: List[str],
+        freshness_sla_minutes: Optional[int],
+        explain_retrieval: bool,
+        risk_mode: str,
+        ask_recommendation: bool,
+    ) -> Generator[Dict[str, Any], None, None]:
+        call_id = str(uuid.uuid4())
+        yield {
+            "type": "tool_call",
+            "id": call_id,
+            "name": "run_rag_lookup",
+            "arguments": {
+                "query": query,
+                "retrieval_mode": retrieval_mode,
+                "query_profile": query_profile,
+                "required_sources": required_sources,
+                "freshness_sla_minutes": freshness_sla_minutes,
+                "explain_retrieval": explain_retrieval,
+                "risk_mode": risk_mode,
+                "ask_recommendation": ask_recommendation,
+            },
+        }
+
+        tool_result = self.toolset.run_rag_lookup(
+            query,
+            retrieval_mode=retrieval_mode,
+            query_profile=query_profile,
+            required_sources=required_sources,
+            freshness_sla_minutes=freshness_sla_minutes,
+            explain_retrieval=explain_retrieval,
+            risk_mode=risk_mode,
+            ask_recommendation=ask_recommendation,
+        )
+        route = tool_result.get("route", "HYBRID")
+        reasoning = tool_result.get("reasoning", "Fallback retrieval path")
+        sql_results = tool_result.get("sql_results", [])
+        semantic_results = tool_result.get("semantic_results", [])
+        citations_payload = tool_result.get("citations", [])
+        if tool_result.get("retrieval_plan"):
+            yield {"type": "retrieval_plan", "plan": tool_result.get("retrieval_plan")}
+        for trace in tool_result.get("source_traces", []):
+            yield trace
+
+        yield {
+            "type": "tool_result",
+            "id": call_id,
+            "name": "run_rag_lookup",
+            "result": {
+                "route": route,
+                "reasoning": reasoning,
+                "sql_result_count": len(sql_results),
+                "semantic_result_count": len(semantic_results),
+                "citation_count": len(citations_payload),
+                "source_result_counts": {
+                    src: len(rows)
+                    for src, rows in (tool_result.get("source_results", {}) or {}).items()
+                },
+            },
+        }
+
+        answer = self.retriever._synthesize_answer(
+            query,
+            {
+                "sql_results": sql_results[:12],
+                "semantic_context": [
+                    {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
+                    for row in semantic_results[:8]
+                ],
+            },
+            route,
+        )
+
+        for event in self._emit_text_chunks(answer):
+            yield event
+
+        if citations_payload:
+            citations = [
+                Citation(
+                    source_type=c.get("source_type", "SEMANTIC"),
+                    identifier=c.get("identifier", ""),
+                    title=c.get("title", ""),
+                    content_preview=c.get("content_preview", ""),
+                    score=float(c.get("score", 0.0)),
+                )
+                for c in citations_payload
+            ]
+            yield {"type": "citations", "citations": self._format_citations(citations)}
+
+        yield {
+            "type": "agent_done",
+            "isVerified": len(citations_payload) > 0,
+            "route": route,
+            "reasoning": reasoning,
+            "sessionId": session_id,
+            "framework": "local-fallback",
+        }
+
+    def _invoke_agent(self, prompt: str, session: Any, session_id: str) -> str:
+        if self._agent is None:
+            return ""
+
+        # Prefer streaming APIs when available, then fallback to a single run call.
+        if hasattr(self._agent, "run_stream"):
+            stream = self._call_with_common_kwargs(self._agent.run_stream, prompt, session, session_id)
+            streamed = self._consume_stream(stream)
+            if streamed:
+                return streamed
+
+        if hasattr(self._agent, "run"):
+            result = self._call_with_common_kwargs(self._agent.run, prompt, session, session_id)
+            return self._extract_text(result)
+
+        if hasattr(self._agent, "invoke"):
+            result = self._call_with_common_kwargs(self._agent.invoke, prompt, session, session_id)
+            return self._extract_text(result)
+
+        return ""
+
+    def _call_with_common_kwargs(self, fn: Any, prompt: str, session: Any, session_id: str) -> Any:
+        attempts = (
+            {"session": session},
+            {"session_id": session_id},
+            {"conversation_id": session_id},
+            {},
+        )
+        for kwargs in attempts:
+            try:
+                value = fn(prompt, **kwargs)
+                return self._resolve_awaitable(value)
+            except TypeError:
+                continue
+        value = fn(prompt)
+        return self._resolve_awaitable(value)
+
+    def _resolve_awaitable(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return asyncio.run(value)
+        return value
+
+    def _consume_stream(self, stream_obj: Any) -> str:
+        if stream_obj is None:
+            return ""
+
+        chunks: List[str] = []
+
+        if hasattr(stream_obj, "__aiter__"):
+            async def consume_async() -> List[str]:
+                parts: List[str] = []
+                async for item in stream_obj:
+                    text = self._extract_text(item)
+                    if text:
+                        parts.append(text)
+                return parts
+
+            chunks.extend(asyncio.run(consume_async()))
+            return "".join(chunks).strip()
+
+        if isinstance(stream_obj, Iterable) and not isinstance(stream_obj, (str, bytes, dict)):
+            for item in stream_obj:
+                text = self._extract_text(item)
+                if text:
+                    chunks.append(text)
+            return "".join(chunks).strip()
+
+        return self._extract_text(stream_obj)
+
+    def _extract_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in ("content", "text", "message", "answer", "data"):
+                field = value.get(key)
+                if isinstance(field, str):
+                    return field
+            return str(value)
+
+        for attr in ("content", "text", "message", "answer"):
+            if hasattr(value, attr):
+                field = getattr(value, attr)
+                if isinstance(field, str):
+                    return field
+
+        if hasattr(value, "data"):
+            data = getattr(value, "data")
+            if isinstance(data, str):
+                return data
+            if isinstance(data, dict):
+                return self._extract_text(data)
+
+        return str(value)
+
+    def _emit_text_chunks(self, text: str, chunk_words: int = 8) -> Generator[Dict[str, Any], None, None]:
+        words = text.split()
+        if not words:
+            return
+
+        for idx in range(0, len(words), chunk_words):
+            chunk = " ".join(words[idx : idx + chunk_words])
+            if idx + chunk_words < len(words):
+                chunk += " "
+            yield {"type": "agent_update", "content": chunk}
+
+    def _format_citations(self, citations: List[Citation]) -> List[Dict[str, Any]]:
+        now = datetime.now(timezone.utc).isoformat()
+        dataset_by_provider = {
+            "SQL": "aviation_db",
+            "KQL": "fabric-eventhouse",
+            "GRAPH": "fabric-graph",
+            "NOSQL": "nosql",
+            "VECTOR_OPS": "idx_ops_narratives",
+            "VECTOR_REG": "idx_regulatory",
+            "VECTOR_AIRPORT": "idx_airport_ops_docs",
+            "SEMANTIC": "aviation-index",
+        }
+        formatted: List[Dict[str, Any]] = []
+        for idx, citation in enumerate(citations, start=1):
+            provider = citation.source_type or "SEMANTIC"
+            dataset = citation.dataset or dataset_by_provider.get(provider, "aviation-index")
+            formatted.append(
+                {
+                    "id": idx,
+                    "provider": provider,
+                    "dataset": dataset,
+                    "rowId": citation.identifier,
+                    "timestamp": now,
+                    "confidence": citation.score or 0.9,
+                    "excerpt": citation.content_preview,
+                }
+            )
+        return formatted
+
+    def run_once(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        retrieval_mode: str = "code-rag",
+        query_profile: str = "pilot-brief",
+        required_sources: Optional[List[str]] = None,
+        freshness_sla_minutes: Optional[int] = None,
+        explain_retrieval: bool = False,
+        risk_mode: str = "standard",
+        ask_recommendation: bool = False,
+    ) -> Dict[str, Any]:
+        answer_parts: List[str] = []
+        citations: List[Dict[str, Any]] = []
+        metadata: Dict[str, Any] = {}
+
+        retrieval_plan: Dict[str, Any] = {}
+        for event in self.run_stream(
+            query,
+            session_id=session_id,
+            retrieval_mode=retrieval_mode,
+            query_profile=query_profile,
+            required_sources=required_sources,
+            freshness_sla_minutes=freshness_sla_minutes,
+            explain_retrieval=explain_retrieval,
+            risk_mode=risk_mode,
+            ask_recommendation=ask_recommendation,
+        ):
+            if event.get("type") == "agent_update" and event.get("content"):
+                answer_parts.append(str(event["content"]))
+            elif event.get("type") == "citations":
+                citations = list(event.get("citations", []))
+            elif event.get("type") == "retrieval_plan":
+                retrieval_plan = dict(event.get("plan", {}))
+            elif event.get("type") == "agent_done":
+                metadata = event
+
+        return {
+            "answer": "".join(answer_parts).strip(),
+            "citations": citations,
+            "retrieval_plan": retrieval_plan,
+            "route": metadata.get("route", "HYBRID"),
+            "reasoning": metadata.get("reasoning", ""),
+            "framework": metadata.get("framework", self._framework_label),
+            "is_verified": bool(metadata.get("isVerified")),
+        }

@@ -1,0 +1,62 @@
+name: Migrate Database to PostgreSQL
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "migrate" to confirm database migration'
+        required: true
+        default: ''
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'migrate'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install psycopg2-binary python-dotenv
+
+      - name: Run migration
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          python scripts/02_load_database.py
+
+      - name: Verify migration
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          python -c "
+          import psycopg2
+          import os
+          conn = psycopg2.connect(
+              host=os.environ['PGHOST'],
+              port=os.environ['PGPORT'],
+              database=os.environ['PGDATABASE'],
+              user=os.environ['PGUSER'],
+              password=os.environ['PGPASSWORD'],
+              sslmode='require'
+          )
+          cur = conn.cursor()
+          # [TBD] Update table names for aviation schema
+          cur.execute('SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema()')
+          print(f'Tables migrated: {cur.fetchone()[0]}')
+          conn.close()
+          "

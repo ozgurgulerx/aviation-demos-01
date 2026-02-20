@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+src/node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build outputs
+.next/
+src/.next/
+*.egg-info/
+dist/
+build/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+src/.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Database (local development)
+*.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Cache
+.cache/
+*.cache
+
+# Kubernetes secrets (keep templates, exclude actual secrets)
+k8s/backend-secret.yaml
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Local development docs
+.claude/

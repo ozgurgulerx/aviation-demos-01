@@ -1,0 +1,160 @@
+name: Infrastructure Health Check
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-aviation-rag' }}
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
+  NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
+  PG_RESOURCE_GROUP: ${{ vars.PG_RESOURCE_GROUP || 'rg-aviation-rag' }}
+  PG_SERVER_NAME: ${{ vars.PG_SERVER_NAME }}
+  BACKEND_PUBLIC_SERVICE: ${{ vars.BACKEND_PUBLIC_SERVICE || 'aviation-rag-backend-lb' }}
+  BACKEND_INTERNAL_SERVICE: ${{ vars.BACKEND_INTERNAL_SERVICE || 'aviation-rag-backend-internal' }}
+  PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate required variables
+        run: |
+          required=(PG_SERVER_NAME PII_ENDPOINT)
+          for var_name in "${required[@]}"; do
+            if [ -z "${!var_name:-}" ]; then
+              echo "::error::Missing required repository variable: ${var_name}"
+              exit 1
+            fi
+          done
+
+      - name: Check and start PostgreSQL
+        id: postgres
+        run: |
+          STATE=$(az postgres flexible-server show --name "${{ env.PG_SERVER_NAME }}" --resource-group "${{ env.PG_RESOURCE_GROUP }}" --query state -o tsv)
+          echo "PostgreSQL state: $STATE"
+          echo "initial_state=$STATE" >> "$GITHUB_OUTPUT"
+          if [ "$STATE" != "Ready" ]; then
+            az postgres flexible-server start --name "${{ env.PG_SERVER_NAME }}" --resource-group "${{ env.PG_RESOURCE_GROUP }}"
+            echo "started=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "started=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check and start AKS
+        id: aks
+        run: |
+          STATE=$(az aks show --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --query powerState.code -o tsv)
+          echo "AKS power state: $STATE"
+          echo "initial_state=$STATE" >> "$GITHUB_OUTPUT"
+          if [ "$STATE" != "Running" ]; then
+            az aks start --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}"
+            echo "started=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "started=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for services to stabilize
+        run: |
+          if [ "${{ steps.aks.outputs.started }}" = "true" ] || [ "${{ steps.postgres.outputs.started }}" = "true" ]; then
+            sleep 120
+          else
+            sleep 30
+          fi
+
+      - name: Get AKS credentials and verify pods
+        run: |
+          az aks get-credentials --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --overwrite-existing
+          kubectl get pods -n "${{ env.NAMESPACE }}"
+
+          NOT_RUNNING=$(kubectl get pods -n "${{ env.NAMESPACE }}" --no-headers | grep -v Running | wc -l)
+          if [ "$NOT_RUNNING" -gt 0 ]; then
+            echo "::warning::Some pods are not in Running state"
+            kubectl get pods -n "${{ env.NAMESPACE }}"
+          fi
+
+      - name: Test backend health endpoint
+        run: |
+          INTERNAL_IP=$(kubectl get svc "${{ env.BACKEND_INTERNAL_SERVICE }}" -n "${{ env.NAMESPACE }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Internal LoadBalancer IP: $INTERNAL_IP"
+
+          PUBLIC_IP=$(kubectl get svc "${{ env.BACKEND_PUBLIC_SERVICE }}" -n "${{ env.NAMESPACE }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Public LoadBalancer IP: $PUBLIC_IP"
+
+          if [ -n "$PUBLIC_IP" ]; then
+            MAX_RETRIES=5
+            RETRY_INTERVAL=15
+            SUCCESS=false
+
+            for i in $(seq 1 "$MAX_RETRIES"); do
+              HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "http://$PUBLIC_IP/health" --connect-timeout 10 || echo "000")
+              if [ "$HEALTH" = "200" ]; then
+                SUCCESS=true
+                break
+              fi
+              if [ "$i" -lt "$MAX_RETRIES" ]; then
+                sleep "$RETRY_INTERVAL"
+              fi
+            done
+
+            if [ "$SUCCESS" = "false" ]; then
+              echo "::warning::Backend health check failed after $MAX_RETRIES attempts (last status: $HEALTH)"
+            fi
+          else
+            echo "::warning::No public LoadBalancer IP available, skipping health check"
+          fi
+
+      - name: Test PII container
+        run: |
+          RESPONSE=$(curl -s -X POST "${{ env.PII_ENDPOINT }}/language/:analyze-text?api-version=2023-04-01" \
+            -H "Content-Type: application/json" \
+            -d '{"kind":"PiiEntityRecognition","parameters":{"modelVersion":"latest"},"analysisInput":{"documents":[{"id":"1","language":"en","text":"test"}]}}' \
+            --connect-timeout 10 || echo '{"error":"timeout"}')
+
+          if echo "$RESPONSE" | grep -q "error"; then
+            echo "::warning::PII container may be unavailable"
+            echo "$RESPONSE"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Infrastructure Health Check Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Initial State | Action Taken |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|---------------|--------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          PG_STATE=$(az postgres flexible-server show --name "${{ env.PG_SERVER_NAME }}" --resource-group "${{ env.PG_RESOURCE_GROUP }}" --query state -o tsv)
+          AKS_STATE=$(az aks show --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --query powerState.code -o tsv)
+
+          PG_INITIAL="${{ steps.postgres.outputs.initial_state }}"
+          AKS_INITIAL="${{ steps.aks.outputs.initial_state }}"
+          PG_STARTED="${{ steps.postgres.outputs.started }}"
+          AKS_STARTED="${{ steps.aks.outputs.started }}"
+
+          if [ "$PG_STARTED" = "true" ]; then
+            echo "| PostgreSQL | $PG_INITIAL | Started -> $PG_STATE |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| PostgreSQL | $PG_INITIAL | Already running |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$AKS_STARTED" = "true" ]; then
+            echo "| AKS Cluster | $AKS_INITIAL | Started -> $AKS_STATE |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| AKS Cluster | $AKS_INITIAL | Already running |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          POD_COUNT=$(kubectl get pods -n "${{ env.NAMESPACE }}" --no-headers 2>/dev/null | grep Running | wc -l || echo "0")
+          echo "| Backend Pods | - | $POD_COUNT running |" >> "$GITHUB_STEP_SUMMARY"

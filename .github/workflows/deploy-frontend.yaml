@@ -1,0 +1,153 @@
+name: Deploy Frontend to App Service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/app/**'
+      - 'src/components/**'
+      - 'src/lib/**'
+      - 'src/hooks/**'
+      - 'src/types/**'
+      - 'src/data/**'
+      - 'src/package.json'
+      - 'src/next.config.mjs'
+      - 'src/tailwind.config.ts'
+      - '.github/workflows/deploy-frontend.yaml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'aviation-rag-frontend' }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-aviation-rag' }}
+  NODE_VERSION: ${{ vars.NODE_VERSION || '20.x' }}
+  BACKEND_URL: ${{ vars.BACKEND_URL }}
+  PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
+  PII_CONTAINER_ENDPOINT: ${{ vars.PII_CONTAINER_ENDPOINT }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./src
+        run: npm ci
+
+      - name: Build application
+        working-directory: ./src
+        run: npm run build
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate required frontend runtime variables
+        run: |
+          required=(BACKEND_URL PII_ENDPOINT PII_CONTAINER_ENDPOINT)
+          for var_name in "${required[@]}"; do
+            if [ -z "${!var_name:-}" ]; then
+              echo "::error::Missing required repository variable: ${var_name}"
+              exit 1
+            fi
+          done
+
+      - name: Sync App Service settings
+        run: |
+          az webapp config appsettings set \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --settings \
+              BACKEND_URL="${{ env.BACKEND_URL }}" \
+              PII_ENDPOINT="${{ env.PII_ENDPOINT }}" \
+              PII_CONTAINER_ENDPOINT="${{ env.PII_CONTAINER_ENDPOINT }}" \
+              WEBSITE_VNET_ROUTE_ALL=1 \
+              PORT=3000 \
+              WEBSITES_PORT=3000
+
+      - name: Prepare deployment package
+        working-directory: ./src
+        run: |
+          mkdir -p /tmp/deploy/.next
+
+          SERVER_JS=$(find .next/standalone -type f -name "server.js" ! -path "*/node_modules/*" | head -1)
+          if [ -z "$SERVER_JS" ]; then
+            echo "ERROR: server.js not found in standalone output"
+            exit 1
+          fi
+
+          STANDALONE_PATH=$(dirname "$SERVER_JS")
+          cp "$STANDALONE_PATH/server.js" /tmp/deploy/
+          cp "$STANDALONE_PATH/package.json" /tmp/deploy/
+          cp -r "$STANDALONE_PATH/node_modules" /tmp/deploy/
+
+          if [ -d "$STANDALONE_PATH/.next" ]; then
+            cp -r "$STANDALONE_PATH/.next"/* /tmp/deploy/.next/
+          fi
+
+          cp -r .next/static /tmp/deploy/.next/static
+          mkdir -p /tmp/deploy/public
+          cp -r public/* /tmp/deploy/public/ 2>/dev/null || true
+
+          cd /tmp/deploy && zip -r /tmp/app.zip .
+
+      - name: Deploy to Azure App Service
+        run: |
+          az webapp deploy \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --src-path /tmp/app.zip \
+            --type zip \
+            --restart true
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting for app to start..."
+          sleep 30
+
+          HEALTH=$(curl -s "https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health" -m 15)
+          if ! echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "Health check failed: $HEALTH"
+            exit 1
+          fi
+
+          RESPONSE=$(curl -s -X POST "https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/pii" \
+            -H "Content-Type: application/json" \
+            -d '{"text":"test"}' \
+            -m 30)
+
+          if ! echo "$RESPONSE" | grep -q "blocked"; then
+            echo "PII API failed: $RESPONSE"
+            exit 1
+          fi
+
+          HTML=$(curl -sL "https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/chat")
+          CHUNK=$(echo "$HTML" | grep -o 'app/chat/page-[a-f0-9]*\.js' | head -1)
+
+          if [ -n "$CHUNK" ]; then
+            STATUS=$(curl -sI "https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/_next/static/chunks/$CHUNK" | grep "HTTP" | head -1)
+            if ! echo "$STATUS" | grep -q "200"; then
+              echo "JS chunk 404: $CHUNK - $STATUS"
+              exit 1
+            fi
+          else
+            echo "Could not extract chunk name from HTML"
+            exit 1
+          fi
+
+          echo "Deployment verified successfully"

@@ -1,0 +1,140 @@
+name: Deploy Backend to AKS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/api_server.py'
+      - 'src/unified_retriever.py'
+      - 'src/query_router.py'
+      - 'src/sql_generator.py'
+      - 'src/pii_filter.py'
+      - 'requirements.txt'
+      - 'Dockerfile.backend'
+      - 'k8s/**'
+      - 'scripts/render-k8s-manifests.sh'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'aviationragacr' }}
+  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'aviationragacr.azurecr.io' }}
+  IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
+  AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || 'rg-aviation-rag' }}
+  K8S_NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
+
+  AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+  AZURE_OPENAI_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'gpt-5-nano' }}
+  AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME: ${{ vars.AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME || 'text-embedding-3-small' }}
+  AZURE_SEARCH_ENDPOINT: ${{ vars.AZURE_SEARCH_ENDPOINT }}
+  PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
+  PII_CONTAINER_ENDPOINT: ${{ vars.PII_CONTAINER_ENDPOINT }}
+  PGHOST: ${{ vars.PGHOST }}
+  PGPORT: ${{ vars.PGPORT || '5432' }}
+  PGDATABASE: ${{ vars.PGDATABASE || 'aviationrag' }}
+  PGUSER: ${{ vars.PGUSER || 'aviationrag_readonly' }}
+  FLASK_ENV: ${{ vars.FLASK_ENV || 'production' }}
+  LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
+  USE_POSTGRES: ${{ vars.USE_POSTGRES || 'true' }}
+  OTEL_SERVICE_NAME: ${{ vars.OTEL_SERVICE_NAME || 'aviation-rag-backend' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'production' }}
+  AF_SESSION_TTL_SECONDS: ${{ vars.AF_SESSION_TTL_SECONDS || '3600' }}
+  AF_MAX_SESSIONS: ${{ vars.AF_MAX_SESSIONS || '500' }}
+  FABRIC_KQL_ENDPOINT: ${{ vars.FABRIC_KQL_ENDPOINT }}
+  FABRIC_GRAPH_ENDPOINT: ${{ vars.FABRIC_GRAPH_ENDPOINT }}
+  FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+
+      - name: Build and push Docker image
+        run: |
+          docker build -f Dockerfile.backend -t "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" .
+          docker tag "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          docker push "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker push "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate required runtime variables
+        run: |
+          required=(AZURE_OPENAI_ENDPOINT AZURE_SEARCH_ENDPOINT PII_ENDPOINT PII_CONTAINER_ENDPOINT PGHOST)
+          for var_name in "${required[@]}"; do
+            if [ -z "${!var_name:-}" ]; then
+              echo "::error::Missing required repository variable: ${var_name}"
+              exit 1
+            fi
+          done
+
+      - name: Get AKS credentials
+        run: az aks get-credentials --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --overwrite-existing
+
+      - name: Render Kubernetes manifests
+        run: ./scripts/render-k8s-manifests.sh /tmp/k8s-rendered
+
+      - name: Apply namespace and service manifests
+        run: |
+          kubectl apply -f /tmp/k8s-rendered/namespace.yaml
+          kubectl apply -f /tmp/k8s-rendered/backend-service.yaml
+
+      - name: Create or update backend secrets
+        run: |
+          kubectl create secret generic backend-secrets \
+            --namespace="${{ env.K8S_NAMESPACE }}" \
+            --from-literal=AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}" \
+            --from-literal=AZURE_SEARCH_ADMIN_KEY="${{ secrets.AZURE_SEARCH_ADMIN_KEY }}" \
+            --from-literal=PGPASSWORD="${{ secrets.PGPASSWORD }}" \
+            --from-literal=FABRIC_BEARER_TOKEN="${{ secrets.FABRIC_BEARER_TOKEN }}" \
+            --from-literal=APPLICATIONINSIGHTS_CONNECTION_STRING="${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy backend manifests
+        run: |
+          kubectl apply -f /tmp/k8s-rendered/backend-configmap.yaml
+          kubectl apply -f /tmp/k8s-rendered/backend-deployment.yaml
+
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/aviation-rag-backend \
+            backend="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            --namespace="${{ env.K8S_NAMESPACE }}"
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/aviation-rag-backend --namespace="${{ env.K8S_NAMESPACE }}" --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          echo "Checking pod status..."
+          kubectl get pods -n "${{ env.K8S_NAMESPACE }}" -l app=aviation-rag-backend
+          echo "Checking service..."
+          kubectl get svc -n "${{ env.K8S_NAMESPACE }}"

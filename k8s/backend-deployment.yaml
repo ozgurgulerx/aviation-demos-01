@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aviation-rag-backend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: aviation-rag-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aviation-rag-backend
+  template:
+    metadata:
+      labels:
+        app: aviation-rag-backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: aviation-rag-backend
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: backend
+        image: ${AZURE_CONTAINER_REGISTRY}/${IMAGE_NAME}:latest
+        ports:
+        - containerPort: 5001
+          name: http
+        envFrom:
+        - configMapRef:
+            name: backend-config
+        - secretRef:
+            name: backend-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5001
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 18
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12
+      imagePullSecrets:
+      - name: acr-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aviation-rag-backend
+  namespace: ${K8S_NAMESPACE}
+spec:
+  selector:
+    app: aviation-rag-backend
+  ports:
+  - port: 5001
+    targetPort: 5001
+    name: http
+  type: ClusterIP

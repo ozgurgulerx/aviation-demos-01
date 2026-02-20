@@ -1,0 +1,139 @@
+import { z } from "zod";
+
+// PII Detection Types
+export interface PiiEntity {
+  text: string;
+  category: string;
+  offset: number;
+  length: number;
+  confidenceScore: number;
+}
+
+export interface PiiCheckResult {
+  hasPii: boolean;
+  entities: PiiEntity[];
+  redactedText?: string;
+}
+
+// Chat Types
+export interface Message {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  createdAt: Date;
+  citations?: Citation[];
+  isVerified?: boolean;
+  toolCalls?: ToolCall[];
+}
+
+export interface Citation {
+  id: number;
+  provider: string;
+  dataset: string;
+  rowId: string;
+  timestamp: string;
+  confidence: number;
+  excerpt?: string;
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  result?: unknown;
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  messages: Message[];
+  createdAt: Date;
+  updatedAt: Date;
+  isSaved?: boolean;
+}
+
+// Watchlist Types
+export interface WatchlistItem {
+  id: string;
+  type: "company" | "investor";
+  name: string;
+  addedAt: Date;
+}
+
+// Source Panel Types
+export interface SourceReference {
+  citationId: number;
+  provider: string;
+  dataset: string;
+  rowId: string;
+  timestamp: string;
+  confidence: number;
+  excerpt?: string;
+  isActive?: boolean;
+}
+
+export type TelemetryEventStatus = "running" | "completed" | "error" | "info";
+
+export interface TelemetryEvent {
+  id: string;
+  type:
+    | "agent_update"
+    | "tool_call"
+    | "tool_result"
+    | "retrieval_plan"
+    | "source_call_start"
+    | "source_call_done"
+    | "agent_done"
+    | "agent_error"
+    | "text"
+    | "progress";
+  stage: string;
+  message: string;
+  status: TelemetryEventStatus;
+  timestamp: string;
+  source?: string;
+  rowCount?: number;
+  citationCount?: number;
+  framework?: string;
+  durationMs?: number;
+  eventId?: string;
+  parentEventId?: string;
+  retrievalReason?: string;
+  sourceMeta?: {
+    storeType?: string;
+    endpointLabel?: string;
+    freshness?: string;
+  };
+  evidenceRefs?: number[];
+}
+
+export interface EvidenceManifestItem {
+  id: string;
+  source: string;
+  dataset: string;
+  rowId: string;
+  confidence?: number;
+  usedInAnswer: boolean;
+  timestamp?: string;
+}
+
+export interface SourceHealthStatus {
+  source: string;
+  status: "idle" | "querying" | "ready" | "error";
+  rowCount: number;
+  updatedAt?: string;
+}
+
+// API Response Types
+export interface ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+export const SourceHealthSchema = z.object({
+  source: z.string(),
+  status: z.enum(["idle", "querying", "ready", "error"]),
+  rowCount: z.number(),
+  updatedAt: z.string().optional(),
+});
