@@ -130,6 +130,7 @@ jobs:
 
       - name: Summary
         if: always()
+        continue-on-error: true
         run: |
           echo "## Infrastructure Health Check Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"

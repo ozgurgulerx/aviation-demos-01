@@ -16,6 +16,10 @@ on:
       - '.github/workflows/deploy-frontend.yaml'
   workflow_dispatch:
 
+concurrency:
+  group: deploy-frontend-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
