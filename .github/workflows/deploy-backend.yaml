@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 env:
-  AZURE_CONTAINER_REGISTRY_NAME: avrag705508acr
-  AZURE_CONTAINER_REGISTRY: avrag705508acr.azurecr.io
+  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'avrag705508acr' }}
+  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'avrag705508acr.azurecr.io' }}
   IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
   IMAGE_TAG: ${{ github.sha }}
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
@@ -76,21 +76,49 @@ jobs:
       - name: Resolve ACR name
         run: |
           TARGET="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
-          FALLBACK="avrag705508acr"
+          REGISTRY_SERVER="${{ env.AZURE_CONTAINER_REGISTRY }}"
+          FROM_SERVER="${REGISTRY_SERVER%%.*}"
 
-          if az acr show --name "$TARGET" >/dev/null 2>&1; then
-            echo "Using ACR target: $TARGET"
-            exit 0
+          CANDIDATES=()
+          [ -n "$TARGET" ] && CANDIDATES+=("$TARGET")
+          [ -n "$FROM_SERVER" ] && CANDIDATES+=("$FROM_SERVER")
+          CANDIDATES+=("avrag705508acr" "aviationragacr")
+
+          UNIQUE=()
+          for candidate in "${CANDIDATES[@]}"; do
+            [ -n "$candidate" ] || continue
+            skip=0
+            for existing in "${UNIQUE[@]}"; do
+              if [ "$existing" = "$candidate" ]; then
+                skip=1
+                break
+              fi
+            done
+            [ "$skip" -eq 1 ] || UNIQUE+=("$candidate")
+          done
+
+          SELECTED=""
+          for candidate in "${UNIQUE[@]}"; do
+            if az acr show --name "$candidate" >/dev/null 2>&1; then
+              SELECTED="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SELECTED" ]; then
+            echo "::error::Unable to resolve an accessible ACR from candidates: ${UNIQUE[*]}"
+            echo "::group::ACRs visible to current Azure context"
+            az acr list --query '[].name' -o tsv || true
+            echo "::endgroup::"
+            exit 1
           fi
 
-          if [ "$TARGET" != "$FALLBACK" ] && az acr show --name "$FALLBACK" >/dev/null 2>&1; then
-            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Falling back to '$FALLBACK'."
-            echo "AZURE_CONTAINER_REGISTRY_NAME=$FALLBACK" >> "$GITHUB_ENV"
-            exit 0
+          if [ "$SELECTED" != "$TARGET" ]; then
+            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Using '$SELECTED'."
           fi
 
-          echo "::error::ACR '$TARGET' not found and fallback '$FALLBACK' unavailable."
-          exit 1
+          echo "Using ACR target: $SELECTED"
+          echo "AZURE_CONTAINER_REGISTRY_NAME=$SELECTED" >> "$GITHUB_ENV"
 
       - name: Login to Azure Container Registry
         run: az acr login --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
@@ -132,21 +160,49 @@ jobs:
       - name: Resolve ACR name
         run: |
           TARGET="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
-          FALLBACK="avrag705508acr"
+          REGISTRY_SERVER="${{ env.AZURE_CONTAINER_REGISTRY }}"
+          FROM_SERVER="${REGISTRY_SERVER%%.*}"
 
-          if az acr show --name "$TARGET" >/dev/null 2>&1; then
-            echo "Using ACR target: $TARGET"
-            exit 0
+          CANDIDATES=()
+          [ -n "$TARGET" ] && CANDIDATES+=("$TARGET")
+          [ -n "$FROM_SERVER" ] && CANDIDATES+=("$FROM_SERVER")
+          CANDIDATES+=("avrag705508acr" "aviationragacr")
+
+          UNIQUE=()
+          for candidate in "${CANDIDATES[@]}"; do
+            [ -n "$candidate" ] || continue
+            skip=0
+            for existing in "${UNIQUE[@]}"; do
+              if [ "$existing" = "$candidate" ]; then
+                skip=1
+                break
+              fi
+            done
+            [ "$skip" -eq 1 ] || UNIQUE+=("$candidate")
+          done
+
+          SELECTED=""
+          for candidate in "${UNIQUE[@]}"; do
+            if az acr show --name "$candidate" >/dev/null 2>&1; then
+              SELECTED="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SELECTED" ]; then
+            echo "::error::Unable to resolve an accessible ACR from candidates: ${UNIQUE[*]}"
+            echo "::group::ACRs visible to current Azure context"
+            az acr list --query '[].name' -o tsv || true
+            echo "::endgroup::"
+            exit 1
           fi
 
-          if [ "$TARGET" != "$FALLBACK" ] && az acr show --name "$FALLBACK" >/dev/null 2>&1; then
-            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Falling back to '$FALLBACK'."
-            echo "AZURE_CONTAINER_REGISTRY_NAME=$FALLBACK" >> "$GITHUB_ENV"
-            exit 0
+          if [ "$SELECTED" != "$TARGET" ]; then
+            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Using '$SELECTED'."
           fi
 
-          echo "::error::ACR '$TARGET' not found and fallback '$FALLBACK' unavailable."
-          exit 1
+          echo "Using ACR target: $SELECTED"
+          echo "AZURE_CONTAINER_REGISTRY_NAME=$SELECTED" >> "$GITHUB_ENV"
 
       - name: Validate required runtime variables
         run: |
