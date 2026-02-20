@@ -27,8 +27,11 @@ The project includes an end-to-end ASRS ingestion flow:
 
 - `ASRS_EXPORT_URL` (for fetch script)
 - `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_DEPLOYMENT_NAME` (recommended: `aviation-chat-gpt5-mini` or `gpt-5-mini`)
 - `AZURE_SEARCH_ENDPOINT`
 - `AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME` (optional, defaults to `text-embedding-3-small`)
+- `AZURE_OPENAI_VOICE_DEPLOYMENT_NAME` (optional, defaults to `aviation-voice-tts`)
+- `AZURE_OPENAI_VOICE_API_VERSION` (optional, defaults to `2025-03-01-preview`)
 - `APPLICATIONINSIGHTS_CONNECTION_STRING` (recommended for runtime telemetry export)
 - DB settings when using postgres mode: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`
 

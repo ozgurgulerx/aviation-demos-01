@@ -4,9 +4,10 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { User, Bot, CheckCircle2, AlertCircle } from "lucide-react";
+import { User, Bot, CheckCircle2, AlertCircle, Volume2, Square } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Message as MessageType } from "@/types";
 
@@ -14,12 +15,18 @@ interface MessageProps {
   message: MessageType;
   onCitationClick?: (id: number) => void;
   activeCitationId?: number | null;
+  onSpeakMessage?: (messageId: string, content: string) => void;
+  isSpeaking?: boolean;
+  voiceEnabled?: boolean;
 }
 
 export function Message({
   message,
   onCitationClick,
   activeCitationId,
+  onSpeakMessage,
+  isSpeaking = false,
+  voiceEnabled = true,
 }: MessageProps) {
   const isUser = message.role === "user";
   // Prevent hydration mismatch with Framer Motion
@@ -88,6 +95,22 @@ export function Message({
         </div>
 
         {/* Verification badge for assistant messages */}
+        {!isUser && (
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => onSpeakMessage?.(message.id, message.content)}
+              disabled={!onSpeakMessage || !voiceEnabled}
+            >
+              {isSpeaking ? <Square className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+              {isSpeaking ? "Stop audio" : "Read aloud"}
+            </Button>
+            {!voiceEnabled && <span className="text-xs text-muted-foreground">Voice is off</span>}
+          </div>
+        )}
+
         {!isUser && message.citations && message.citations.length > 0 && (
           <div className="flex items-center gap-2">
             <Badge variant="success" className="text-xs gap-1">

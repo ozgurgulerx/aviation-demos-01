@@ -34,6 +34,9 @@ interface ChatThreadProps {
   sourceHealth?: SourceHealthStatus[];
   onCitationClick?: (id: number) => void;
   activeCitationId?: number | null;
+  onSpeakMessage?: (messageId: string, content: string) => void;
+  speakingMessageId?: string | null;
+  voiceEnabled?: boolean;
   onSendMessage?: (message: string) => void;
   onRetryLast?: () => void;
 }
@@ -68,6 +71,9 @@ export function ChatThread({
   sourceHealth = [],
   onCitationClick,
   activeCitationId,
+  onSpeakMessage,
+  speakingMessageId,
+  voiceEnabled = true,
   onSendMessage,
   onRetryLast,
 }: ChatThreadProps) {
@@ -161,6 +167,9 @@ export function ChatThread({
                 message={message}
                 onCitationClick={onCitationClick}
                 activeCitationId={activeCitationId}
+                onSpeakMessage={onSpeakMessage}
+                isSpeaking={speakingMessageId === message.id}
+                voiceEnabled={voiceEnabled}
               />
             ))}
 
