@@ -60,6 +60,18 @@ python scripts/03_create_search_index.py
 python scripts/04_upload_documents.py --data data/processed
 ```
 
+## Azure Tenant Context (Required)
+
+- Account: `admin@MngEnvMCAP705508.onmicrosoft.com`
+- Tenant ID: `52095a81-130f-4b06-83f1-9859b2c73de6`
+- Subscription: `ME-MngEnvMCAP705508-ozgurguler-1` (`6a539906-6ce2-4e3b-84ee-89f701de18d8`)
+
+Always verify Azure CLI context before provisioning/deploying:
+
+```bash
+az account show --query "{user:user.name,tenantId:tenantId,name:name,id:id}" -o table
+```
+
 ## Architecture
 
 ```
