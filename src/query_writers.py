@@ -10,45 +10,18 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+
+from azure_openai_client import init_azure_openai_client
 
 load_dotenv()
 
 OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 
-def _client_tuning_kwargs() -> dict:
-    try:
-        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
-    except Exception:
-        timeout_seconds = 45.0
-    try:
-        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
-    except Exception:
-        max_retries = 1
-    return {"timeout": timeout_seconds, "max_retries": max_retries}
-
-
-def _init_client() -> AzureOpenAI:
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY")
-    if api_key:
-        return AzureOpenAI(
-            azure_endpoint=endpoint,
-            api_key=api_key,
-            api_version=OPENAI_API_VERSION,
-            **_client_tuning_kwargs(),
-        )
-    credential = DefaultAzureCredential()
-    token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
-    return AzureOpenAI(
-        azure_endpoint=endpoint,
-        azure_ad_token_provider=token_provider,
-        api_version=OPENAI_API_VERSION,
-        **_client_tuning_kwargs(),
-    )
+def _init_client():
+    client, _ = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+    return client
 
 
 def _strip_fences(text: str) -> str:

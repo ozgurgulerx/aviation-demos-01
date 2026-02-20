@@ -6,24 +6,12 @@ SQL Generator - Generates SQL from natural language queries.
 import os
 import re
 from dotenv import load_dotenv
-from openai import AzureOpenAI
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+from azure_openai_client import init_azure_openai_client
 
 load_dotenv()
 
 OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-
-
-def _client_tuning_kwargs() -> dict:
-    try:
-        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
-    except Exception:
-        timeout_seconds = 45.0
-    try:
-        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
-    except Exception:
-        max_retries = 1
-    return {"timeout": timeout_seconds, "max_retries": max_retries}
 
 
 FULL_SCHEMA = """
@@ -74,27 +62,7 @@ class SQLGenerator:
     """Generate SQL queries from natural language using LLM."""
 
     def __init__(self):
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-
-        if api_key:
-            self.client = AzureOpenAI(
-                azure_endpoint=endpoint,
-                api_key=api_key,
-                api_version=OPENAI_API_VERSION,
-                **_client_tuning_kwargs(),
-            )
-        else:
-            credential = DefaultAzureCredential()
-            token_provider = get_bearer_token_provider(
-                credential, "https://cognitiveservices.azure.com/.default"
-            )
-            self.client = AzureOpenAI(
-                azure_endpoint=endpoint,
-                azure_ad_token_provider=token_provider,
-                api_version=OPENAI_API_VERSION,
-                **_client_tuning_kwargs(),
-            )
+        self.client, _ = init_azure_openai_client(api_version=OPENAI_API_VERSION)
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 
     def generate(self, query: str) -> str:

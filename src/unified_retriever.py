@@ -18,12 +18,11 @@ from typing import Any, List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-from openai import AzureOpenAI
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 
+from azure_openai_client import init_azure_openai_client
 from query_router import QueryRouter
 from query_writers import SQLWriter
 from sql_generator import SQLGenerator
@@ -41,18 +40,7 @@ else:
 DB_PATH = Path(os.getenv("SQLITE_PATH", "aviation.db"))
 
 # Azure OpenAI configuration
-OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-LLM_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
-EMBEDDING_DEPLOYMENT = os.getenv("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
 OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-
-# Azure AI Search configuration
-SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-SEARCH_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY")
-SEARCH_INDEX_OPS = os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "idx_ops_narratives")
-SEARCH_INDEX_REGULATORY = os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "idx_regulatory")
-SEARCH_INDEX_AIRPORT = os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "idx_airport_ops_docs")
 SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG_NAME", "aviation-semantic-config")
 try:
     _RERANK_RAW_CANDIDATES = max(1, int(os.getenv("CONTEXT_VECTOR_RAW_CANDIDATES", "20") or "20"))
@@ -66,18 +54,6 @@ FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def _client_tuning_kwargs() -> dict:
-    try:
-        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
-    except Exception:
-        timeout_seconds = 45.0
-    try:
-        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
-    except Exception:
-        max_retries = 1
-    return {"timeout": timeout_seconds, "max_retries": max_retries}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -149,37 +125,29 @@ class UnifiedRetriever:
 
     def __init__(self, enable_pii_filter: bool = True):
         # LLM client
-        if OPENAI_KEY:
-            self.llm = AzureOpenAI(
-                azure_endpoint=OPENAI_ENDPOINT,
-                api_key=OPENAI_KEY,
-                api_version=OPENAI_API_VERSION,
-                **_client_tuning_kwargs(),
-            )
-        else:
-            credential = DefaultAzureCredential()
-            token_provider = get_bearer_token_provider(
-                credential, "https://cognitiveservices.azure.com/.default"
-            )
-            self.llm = AzureOpenAI(
-                azure_endpoint=OPENAI_ENDPOINT,
-                azure_ad_token_provider=token_provider,
-                api_version=OPENAI_API_VERSION,
-                **_client_tuning_kwargs(),
-            )
+        self.llm, self.llm_auth_mode = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+        self.llm_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
+        self.embedding_deployment = os.getenv(
+            "AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small"
+        )
 
         # Search clients (multi-index)
+        search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
+        search_key = os.getenv("AZURE_SEARCH_ADMIN_KEY")
+        search_index_ops = os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "idx_ops_narratives")
+        search_index_regulatory = os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "idx_regulatory")
+        search_index_airport = os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "idx_airport_ops_docs")
         self.search_clients: Dict[str, SearchClient] = {}
         self.vector_source_to_index = {
-            "VECTOR_OPS": SEARCH_INDEX_OPS,
-            "VECTOR_REG": SEARCH_INDEX_REGULATORY,
-            "VECTOR_AIRPORT": SEARCH_INDEX_AIRPORT,
+            "VECTOR_OPS": search_index_ops,
+            "VECTOR_REG": search_index_regulatory,
+            "VECTOR_AIRPORT": search_index_airport,
         }
-        if SEARCH_ENDPOINT and SEARCH_KEY:
-            search_credential = AzureKeyCredential(SEARCH_KEY)
+        if search_endpoint and search_key:
+            search_credential = AzureKeyCredential(search_key)
             for index_name in sorted(set(self.vector_source_to_index.values())):
                 self.search_clients[index_name] = SearchClient(
-                    endpoint=SEARCH_ENDPOINT,
+                    endpoint=search_endpoint,
                     index_name=index_name,
                     credential=search_credential,
                 )
@@ -244,7 +212,9 @@ class UnifiedRetriever:
         # Specialized components
         self.router = QueryRouter()
         self.sql_generator = SQLGenerator()
-        self.sql_writer = SQLWriter(model=os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME") or LLM_DEPLOYMENT)
+        self.sql_writer = SQLWriter(
+            model=os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME") or self.llm_deployment
+        )
         self.use_legacy_sql_generator = _env_bool("USE_LEGACY_SQL_GENERATOR", False)
 
         # PII filter
@@ -262,7 +232,7 @@ class UnifiedRetriever:
     def get_embedding(self, text: str) -> List[float]:
         """Get embedding from Azure OpenAI."""
         response = self.llm.embeddings.create(
-            model=EMBEDDING_DEPLOYMENT,
+            model=self.embedding_deployment,
             input=text[:8000]
         )
         return response.data[0].embedding
@@ -722,7 +692,7 @@ class UnifiedRetriever:
         filter_expression: Optional[str] = None,
     ) -> Tuple[List[Dict], List[Citation]]:
         """Search a specific semantic index using hybrid/vector retrieval."""
-        index_name = self.vector_source_to_index.get(source, SEARCH_INDEX_OPS)
+        index_name = self.vector_source_to_index.get(source) or self.vector_source_to_index.get("VECTOR_OPS", "idx_ops_narratives")
         client = self.search_clients.get(index_name)
         if client is None:
             return [self._source_unavailable_row(source, f"search_index_unavailable:{index_name}")], []
@@ -1359,7 +1329,7 @@ Retrieved Data:
 
         try:
             response = self.llm.chat.completions.create(
-                model=LLM_DEPLOYMENT,
+                model=self.llm_deployment,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": context_str}

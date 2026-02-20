@@ -71,9 +71,7 @@ def _build_client(auth_mode: str) -> Tuple[AzureOpenAI, str]:
     if not endpoint:
         raise ValueError("Missing AZURE_OPENAI_ENDPOINT")
 
-    use_api_key = auth_mode == "api-key" or (auth_mode == "auto" and bool(api_key))
-
-    if use_api_key:
+    if auth_mode == "api-key":
         if not api_key:
             raise ValueError("AZURE_OPENAI_API_KEY is required when --auth-mode=api-key")
         return (
@@ -88,27 +86,45 @@ def _build_client(auth_mode: str) -> Tuple[AzureOpenAI, str]:
         )
 
     credential = DefaultAzureCredential()
-    token_provider = get_bearer_token_provider(
-        credential, "https://cognitiveservices.azure.com/.default"
+    token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
+    token_client = AzureOpenAI(
+        azure_endpoint=endpoint,
+        azure_ad_token_provider=token_provider,
+        api_version=api_version,
+        timeout=30,
+        max_retries=1,
     )
-    return (
-        AzureOpenAI(
-            azure_endpoint=endpoint,
-            azure_ad_token_provider=token_provider,
-            api_version=api_version,
-            timeout=30,
-            max_retries=1,
-        ),
-        "entra-token",
-    )
+    if auth_mode == "token":
+        return token_client, "entra-token"
 
-
-def _chat_check(client: AzureOpenAI, deployment: str) -> Tuple[bool, str]:
+    # auto mode: prefer token when available, otherwise fallback to API key.
     try:
-        response = client.chat.completions.create(
-            model=deployment,
-            messages=[{"role": "user", "content": "Reply with: OK"}],
+        credential.get_token("https://cognitiveservices.azure.com/.default")
+        return token_client, "entra-token"
+    except Exception:
+        if not api_key:
+            return token_client, "entra-token"
+        return (
+            AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_key=api_key,
+                api_version=api_version,
+                timeout=30,
+                max_retries=1,
+            ),
+            "api-key",
         )
+
+
+def _chat_check(client: AzureOpenAI, deployment: str, reasoning_effort: str = "") -> Tuple[bool, str]:
+    try:
+        request_kwargs = {
+            "model": deployment,
+            "messages": [{"role": "user", "content": "Reply with: OK"}],
+        }
+        if reasoning_effort:
+            request_kwargs["reasoning_effort"] = reasoning_effort
+        response = client.chat.completions.create(**request_kwargs)
         content = (response.choices[0].message.content or "").strip()
         return True, content[:120] if content else "(empty response)"
     except Exception as exc:  # noqa: BLE001
@@ -166,7 +182,13 @@ def main() -> int:
         "--auth-mode",
         choices=["auto", "api-key", "token"],
         default="auto",
-        help="Auth mode for --live checks. auto prefers API key when present.",
+        help="Auth mode for --live checks. auto prefers Entra token and falls back to API key.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high", ""],
+        default="low",
+        help="Reasoning effort used for gpt-5-mini checks in --live mode.",
     )
     args = parser.parse_args()
 
@@ -233,6 +255,14 @@ def main() -> int:
         print(f"[{status}] chat deployment '{deployment}': {detail}")
         if not ok:
             failures += 1
+        if "gpt-5-mini" in deployment.lower() and args.reasoning_effort:
+            ok_low, detail_low = _chat_check(client, deployment, reasoning_effort=args.reasoning_effort)
+            status_low = "PASS" if ok_low else "FAIL"
+            print(
+                f"[{status_low}] chat deployment '{deployment}' (reasoning_effort={args.reasoning_effort}): {detail_low}"
+            )
+            if not ok_low:
+                failures += 1
 
     if embedding_model:
         ok, detail = _embedding_check(client, embedding_model)

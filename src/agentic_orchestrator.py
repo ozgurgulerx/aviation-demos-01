@@ -9,10 +9,9 @@ import json
 import os
 from typing import Any, Dict, List
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from openai import AzureOpenAI
 
+from azure_openai_client import init_azure_openai_client
 from contracts.agentic_plan import AgenticPlan, CoverageItem, EvidenceRequirement, Intent, TimeWindow, ToolCall
 from intent_graph_provider import IntentGraphSnapshot
 
@@ -21,36 +20,9 @@ load_dotenv()
 OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 
-def _client_tuning_kwargs() -> dict:
-    try:
-        timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
-    except Exception:
-        timeout_seconds = 45.0
-    try:
-        max_retries = max(0, int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1")))
-    except Exception:
-        max_retries = 1
-    return {"timeout": timeout_seconds, "max_retries": max_retries}
-
-
-def _init_client() -> AzureOpenAI:
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY")
-    if api_key:
-        return AzureOpenAI(
-            azure_endpoint=endpoint,
-            api_key=api_key,
-            api_version=OPENAI_API_VERSION,
-            **_client_tuning_kwargs(),
-        )
-    credential = DefaultAzureCredential()
-    token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
-    return AzureOpenAI(
-        azure_endpoint=endpoint,
-        azure_ad_token_provider=token_provider,
-        api_version=OPENAI_API_VERSION,
-        **_client_tuning_kwargs(),
-    )
+def _init_client():
+    client, _ = init_azure_openai_client(api_version=OPENAI_API_VERSION)
+    return client
 
 
 def _supports_explicit_temperature(model_name: str) -> bool:
@@ -64,6 +36,19 @@ def _supports_explicit_temperature(model_name: str) -> bool:
         or model.startswith("o3")
         or model.startswith("o4")
         or normalized == "modelrouter"
+    )
+
+
+def _supports_reasoning_effort(model_name: str) -> bool:
+    model = (model_name or "").strip().lower()
+    normalized = model.replace("-", "").replace("_", "")
+    return (
+        model.startswith("gpt-5")
+        or normalized.startswith("gpt5")
+        or "gpt5" in normalized
+        or model.startswith("o1")
+        or model.startswith("o3")
+        or model.startswith("o4")
     )
 
 
@@ -103,6 +88,7 @@ class AgenticOrchestrator:
             or os.getenv("AZURE_OPENAI_REASONING_DEPLOYMENT_NAME")
             or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-mini")
         )
+        self.reasoning_effort = (os.getenv("AZURE_OPENAI_REASONING_EFFORT", "low") or "low").strip().lower()
 
     def create_plan(
         self,
@@ -137,6 +123,8 @@ class AgenticOrchestrator:
             }
             if _supports_explicit_temperature(self.model):
                 request_kwargs["temperature"] = 0
+            if self.reasoning_effort and _supports_reasoning_effort(self.model):
+                request_kwargs["reasoning_effort"] = self.reasoning_effort
 
             response = self.client.chat.completions.create(**request_kwargs)
             raw = response.choices[0].message.content or "{}"
