@@ -223,6 +223,12 @@ class PlanExecutor:
                     constraints=call.params,
                 )
             if sql_query.strip().startswith("-- NEED_SCHEMA"):
+                if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
+                    rows, citations = self.retriever.query_runway_constraints_fallback(
+                        user_query,
+                        airports=entities.get("airports") if isinstance(entities, dict) else None,
+                    )
+                    return rows, citations, sql_query
                 return [{"error": sql_query}], [], sql_query
             rows, citations = self._execute_sql_raw(sql_query)
             return rows, citations, sql_query
@@ -239,6 +245,10 @@ class PlanExecutor:
                     constraints=call.params,
                 )
             if kql_query.strip().startswith("// NEED_SCHEMA"):
+                if not self.retriever.strict_source_mode:
+                    window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
+                    rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
+                    return rows, citations, kql_query
                 return [{"error": kql_query, "error_code": "kql_schema_missing"}], [], kql_query
             window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
             rows, citations = self.retriever.query_kql(kql_query, window_minutes=window)

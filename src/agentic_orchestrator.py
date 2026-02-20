@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
@@ -100,10 +101,12 @@ class AgenticOrchestrator:
         schemas: Dict[str, Any],
         required_sources: List[str] | None = None,
     ) -> AgenticPlan:
+        inferred_entities = self._extract_entities_from_query(user_query)
+        merged_entities = self._merge_entities(entities, inferred_entities)
         payload = {
             "user_query": user_query,
             "runtime_context": runtime_context,
-            "entities": entities,
+            "entities": merged_entities,
             "intent_graph": intent_graph.data,
             "tool_catalog": tool_catalog,
             "schemas": {
@@ -132,6 +135,14 @@ class AgenticOrchestrator:
             plan = AgenticPlan.from_dict(parsed)
             if not plan.tool_calls:
                 return self._fallback_plan(user_query, runtime_context, intent_graph, required_sources or [])
+            if not any(plan.entities.get(k) for k in ("airports", "routes", "stations", "alternates")):
+                plan.entities = merged_entities
+            plan = self._ensure_required_evidence_calls(
+                plan,
+                user_query=user_query,
+                intent_graph=intent_graph,
+                allowed_tools=[str(t).upper() for t in (tool_catalog.get("allowed_tools") or [])],
+            )
             return self._enforce_required_sources(plan, required_sources or [])
         except Exception:
             return self._fallback_plan(user_query, runtime_context, intent_graph, required_sources or [])
@@ -152,6 +163,7 @@ class AgenticOrchestrator:
 
         tool_calls: List[ToolCall] = []
         call_idx = 1
+        inferred_entities = self._extract_entities_from_query(query)
 
         # Graph expansion first for pilot brief intents.
         if intent_name.startswith("PilotBrief"):
@@ -217,7 +229,7 @@ class AgenticOrchestrator:
         return AgenticPlan(
             intent=Intent(name=intent_name, confidence=0.51),
             time_window=TimeWindow(horizon_min=int(runtime_context.get("default_time_horizon_min", 120) or 120)),
-            entities={"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []},
+            entities=inferred_entities,
             required_evidence=[EvidenceRequirement.from_dict(req) for req in required_evidence],
             tool_calls=tool_calls,
             coverage=coverage,
@@ -225,6 +237,131 @@ class AgenticOrchestrator:
             schema_requests=[],
             warnings=["LLM routing unavailable; fallback orchestration used."],
         )
+
+    def _merge_entities(self, base: Dict[str, Any], inferred: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        merged: Dict[str, List[str]] = {
+            "airports": [],
+            "flight_ids": [],
+            "routes": [],
+            "stations": [],
+            "alternates": [],
+        }
+        for key in merged.keys():
+            out: List[str] = []
+            for source in (base or {}, inferred or {}):
+                values = source.get(key) if isinstance(source, dict) else []
+                if not isinstance(values, list):
+                    continue
+                for value in values:
+                    text = str(value).strip()
+                    if text and text not in out:
+                        out.append(text)
+            merged[key] = out
+        return merged
+
+    def _extract_entities_from_query(self, query: str) -> Dict[str, List[str]]:
+        text = query or ""
+        upper = text.upper()
+        lower = text.lower()
+        airports: List[str] = []
+        for code in re.findall(r"\b[A-Z]{4}\b", upper):
+            if code not in airports:
+                airports.append(code)
+        city_map = {
+            "new york": ["KJFK", "KLGA", "KEWR"],
+            "nyc": ["KJFK", "KLGA", "KEWR"],
+            "istanbul": ["LTFM", "LTBA", "LTFJ"],
+        }
+        for city, city_airports in city_map.items():
+            if city in lower:
+                for airport in city_airports:
+                    if airport not in airports:
+                        airports.append(airport)
+        return {
+            "airports": airports[:8],
+            "flight_ids": [],
+            "routes": [],
+            "stations": [],
+            "alternates": [],
+        }
+
+    def _ensure_required_evidence_calls(
+        self,
+        plan: AgenticPlan,
+        user_query: str,
+        intent_graph: IntentGraphSnapshot,
+        allowed_tools: List[str],
+    ) -> AgenticPlan:
+        existing_by_evidence: Dict[str, set[str]] = {}
+        existing_tools: set[str] = set()
+        graph_call_id: str | None = None
+        for call in plan.tool_calls:
+            tool = self._canonical_tool_name(call.tool)
+            if tool:
+                existing_tools.add(tool)
+            if tool == "GRAPH" and graph_call_id is None:
+                graph_call_id = call.id
+            evidence = str((call.params or {}).get("evidence_type", "")).strip()
+            if evidence:
+                existing_by_evidence.setdefault(evidence, set()).add(tool or call.tool)
+
+        allow_all = not allowed_tools
+        next_id = len(plan.tool_calls) + 1
+        for req in plan.required_evidence:
+            evidence = req.name
+            if evidence in existing_by_evidence and existing_by_evidence[evidence]:
+                continue
+            candidates = [self._canonical_tool_name(t) for t in intent_graph.tools_for_evidence(evidence)]
+            candidates = [c for c in candidates if c]
+            selected_tool = ""
+            for candidate in candidates:
+                if allow_all or candidate in allowed_tools:
+                    selected_tool = candidate
+                    break
+            if not selected_tool:
+                continue
+            depends_on: List[str] = []
+            if selected_tool != "GRAPH" and graph_call_id:
+                depends_on = [graph_call_id]
+            operation = "lookup"
+            if selected_tool == "SQL":
+                operation = "sql_lookup"
+            elif selected_tool == "KQL":
+                operation = "kql_lookup"
+            elif selected_tool.startswith("VECTOR_"):
+                operation = "semantic_lookup"
+            elif selected_tool == "GRAPH":
+                operation = "entity_expansion"
+            plan.tool_calls.append(
+                ToolCall(
+                    id=f"call_{next_id}",
+                    tool=selected_tool,
+                    operation=operation,
+                    depends_on=depends_on,
+                    query=user_query,
+                    params={"evidence_type": evidence},
+                )
+            )
+            next_id += 1
+            existing_by_evidence.setdefault(evidence, set()).add(selected_tool)
+            existing_tools.add(selected_tool)
+
+        coverage_map: Dict[str, CoverageItem] = {item.evidence: item for item in plan.coverage}
+        for req in plan.required_evidence:
+            evidence = req.name
+            via_tools = sorted(existing_by_evidence.get(evidence, set()))
+            status = "planned" if via_tools else "missing"
+            if evidence in coverage_map:
+                coverage_map[evidence].status = status
+                coverage_map[evidence].via_tools = via_tools
+            else:
+                coverage_map[evidence] = CoverageItem(
+                    evidence=evidence,
+                    status=status,
+                    via_tools=via_tools,
+                )
+        plan.coverage = list(coverage_map.values())
+        return plan
 
     def _infer_intent(self, query: str) -> str:
         q = query.lower()

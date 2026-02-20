@@ -6,12 +6,14 @@ Routes queries to appropriate sources and returns answers with citations.
 
 import csv
 import gzip
+import io
 import json
 import os
 import re
 import sqlite3
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple
@@ -54,6 +56,21 @@ FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 ROOT = Path(__file__).resolve().parents[1]
+
+CITY_AIRPORT_MAP: Dict[str, List[str]] = {
+    "new york": ["KJFK", "KLGA", "KEWR"],
+    "nyc": ["KJFK", "KLGA", "KEWR"],
+    "istanbul": ["LTFM", "LTBA", "LTFJ"],
+    "london": ["EGLL", "EGKK", "EGSS"],
+}
+
+IATA_TO_ICAO_MAP: Dict[str, str] = {
+    "JFK": "KJFK",
+    "LGA": "KLGA",
+    "EWR": "KEWR",
+    "IST": "LTFM",
+    "SAW": "LTFJ",
+}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -274,6 +291,233 @@ class UnifiedRetriever:
             if len(deduped) >= 8:
                 break
         return deduped
+
+    def _extract_airports_from_query(self, query: str) -> List[str]:
+        text = query or ""
+        upper = text.upper()
+        lower = text.lower()
+        out: List[str] = []
+
+        # ICAO codes in free text (case-sensitive to avoid matching regular words).
+        for match in re.findall(r"\b[A-Z]{4}\b", text):
+            if match not in out:
+                out.append(match)
+
+        # Common IATA references used by users in natural language.
+        for match in re.findall(r"\b[A-Z]{3}\b", upper):
+            icao = IATA_TO_ICAO_MAP.get(match)
+            if icao and icao not in out:
+                out.append(icao)
+
+        # City-level shortcuts for common demo routes.
+        for city, airports in CITY_AIRPORT_MAP.items():
+            if city in lower:
+                for airport in airports:
+                    if airport not in out:
+                        out.append(airport)
+
+        return out[:8]
+
+    def _extract_airports_from_sql(self, sql_query: str) -> List[str]:
+        if not sql_query:
+            return []
+        return self._extract_airports_from_query(sql_query)
+
+    def _latest_runways_file(self) -> Optional[Path]:
+        return (
+            self._latest_matching("data/g-ourairports_recent/runways_*.csv")
+            or self._latest_matching("data/b-runways.csv")
+        )
+
+    def _query_runway_constraints_fallback(self, query: str, airports: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], List[Citation]]:
+        runways_file = self._latest_runways_file()
+        if not runways_file:
+            return (
+                [self._source_unavailable_row("SQL", "runway_constraints_fallback_dataset_missing")],
+                [],
+            )
+
+        airport_list = [a.upper() for a in (airports or self._extract_airports_from_query(query)) if a]
+        if not airport_list:
+            airport_list = ["KJFK", "KLGA", "KEWR"]
+        airport_set = set(airport_list)
+
+        rows: List[Dict[str, Any]] = []
+        with runways_file.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                airport = str(row.get("airport_ident") or "").upper().strip()
+                if airport not in airport_set:
+                    continue
+                le_ident = str(row.get("le_ident") or "").strip()
+                he_ident = str(row.get("he_ident") or "").strip()
+                runway_id = "/".join([x for x in [le_ident, he_ident] if x]) or str(row.get("id") or "unknown")
+                rows.append(
+                    {
+                        "airport": airport,
+                        "runway_id": runway_id,
+                        "constraint_type": "runway_profile",
+                        "effective_from": None,
+                        "effective_to": None,
+                        "length_ft": int(float(row.get("length_ft") or 0)) if row.get("length_ft") else None,
+                        "width_ft": int(float(row.get("width_ft") or 0)) if row.get("width_ft") else None,
+                        "surface": row.get("surface"),
+                        "lighted": row.get("lighted"),
+                        "source_file": str(runways_file),
+                    }
+                )
+                if len(rows) >= 60:
+                    break
+
+        if not rows:
+            return (
+                [self._source_error_row("SQL", "runway_constraints_unavailable", f"no runway rows matched {airport_list}")],
+                [],
+            )
+
+        citations = [
+            Citation(
+                source_type="SQL",
+                identifier=f"runway_{idx}",
+                title=f"{row.get('airport')} {row.get('runway_id')}",
+                content_preview=str(row)[:120],
+                score=0.85,
+                dataset="ourairports-runways-fallback",
+            )
+            for idx, row in enumerate(rows[:10], start=1)
+        ]
+        return rows, citations
+
+    def _load_gzip_text(self, local_file: Optional[Path], remote_url: str) -> Optional[str]:
+        try:
+            if local_file and local_file.exists():
+                with gzip.open(local_file, "rt", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+            with urllib.request.urlopen(remote_url, timeout=20) as resp:
+                payload = resp.read()
+            return gzip.decompress(payload).decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+    def _metar_rows_for_airports(self, airports: List[str], max_rows: int = 12) -> List[Dict[str, Any]]:
+        metars_file = self._latest_matching("data/a-metars.cache.csv.gz")
+        text = self._load_gzip_text(
+            metars_file,
+            "https://aviationweather.gov/data/cache/metars.cache.csv.gz",
+        )
+        if not text:
+            return []
+
+        latest_by_station: Dict[str, Dict[str, Any]] = {}
+        reader = csv.DictReader(io.StringIO(text))
+        airport_set = {a.upper() for a in airports}
+        for row in reader:
+            station = str(row.get("station_id") or "").upper().strip()
+            if station not in airport_set:
+                continue
+            existing = latest_by_station.get(station)
+            current_ts = str(row.get("observation_time") or "")
+            existing_ts = str(existing.get("observation_time") or "") if existing else ""
+            if not existing or current_ts > existing_ts:
+                latest_by_station[station] = row
+
+        out: List[Dict[str, Any]] = []
+        for station in airports:
+            row = latest_by_station.get(station.upper())
+            if not row:
+                continue
+            out.append(
+                {
+                    "station_id": row.get("station_id"),
+                    "observation_time": row.get("observation_time"),
+                    "raw_text": row.get("raw_text"),
+                    "flight_category": row.get("flight_category"),
+                    "wind_speed_kt": row.get("wind_speed_kt"),
+                    "wind_gust_kt": row.get("wind_gust_kt"),
+                    "visibility_statute_mi": row.get("visibility_statute_mi"),
+                    "source_file": str(metars_file) if metars_file else "aviationweather_cache_feed",
+                }
+            )
+            if len(out) >= max_rows:
+                break
+        return out
+
+    def _taf_rows_for_airports(self, airports: List[str], max_rows: int = 12) -> List[Dict[str, Any]]:
+        tafs_file = self._latest_matching("data/a-tafs.cache.xml.gz")
+        text = self._load_gzip_text(
+            tafs_file,
+            "https://aviationweather.gov/data/cache/tafs.cache.xml.gz",
+        )
+        if not text:
+            return []
+
+        try:
+            root = ET.fromstring(text)
+        except Exception:
+            return []
+
+        airport_set = {a.upper() for a in airports}
+        out: List[Dict[str, Any]] = []
+        for taf in root.findall(".//TAF"):
+            station = (taf.findtext("station_id") or "").upper().strip()
+            if station not in airport_set:
+                continue
+            out.append(
+                {
+                    "station_id": station,
+                    "issue_time": taf.findtext("issue_time"),
+                    "valid_time_from": taf.findtext("valid_time_from"),
+                    "valid_time_to": taf.findtext("valid_time_to"),
+                    "raw_text": (taf.findtext("raw_text") or "").strip(),
+                    "source_file": str(tafs_file) if tafs_file else "aviationweather_cache_feed",
+                }
+            )
+            if len(out) >= max_rows:
+                break
+        return out
+
+    def _notam_docs_for_airports(self, query: str, max_rows: int = 30) -> List[Dict[str, Any]]:
+        airports = self._extract_airports_from_query(query)
+        facility_targets = {a[1:] if a.startswith("K") and len(a) == 4 else a for a in airports}
+        local_candidates = [
+            self._latest_matching("data/h-notam_recent/*/search_location_us_hubs_all.jsonl"),
+            self._latest_matching("data/h-notam_recent/*/search_location_us_hubs.jsonl"),
+            self._latest_matching("data/h-notam_recent/*/search_location_istanbul_all.jsonl"),
+            self._latest_matching("data/h-notam_recent/*/search_location_istanbul.jsonl"),
+        ]
+
+        docs: List[Dict[str, Any]] = []
+        for file in [f for f in local_candidates if f]:
+            try:
+                with file.open("r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        facility = str(obj.get("facilityDesignator") or "").upper().strip()
+                        if facility_targets and facility not in facility_targets:
+                            icao_msg = str(obj.get("icaoMessage") or "").upper()
+                            if not any(airport in icao_msg for airport in airports):
+                                continue
+                        docs.append(
+                            {
+                                "facilityDesignator": obj.get("facilityDesignator"),
+                                "notamNumber": obj.get("notamNumber"),
+                                "issueDate": obj.get("issueDate"),
+                                "startDate": obj.get("startDate"),
+                                "endDate": obj.get("endDate"),
+                                "sourceType": obj.get("sourceType"),
+                                "airportName": obj.get("airportName"),
+                                "icaoMessage": str(obj.get("icaoMessage") or "")[:400],
+                                "source_file": str(file),
+                            }
+                        )
+                        if len(docs) >= max_rows:
+                            return docs
+            except Exception:
+                continue
+        return docs
 
     def _kusto_rows(self, endpoint: str, csl: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         db_name = FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "").strip()
@@ -602,6 +846,13 @@ class UnifiedRetriever:
 
         validation_error = self._validate_sql_query(sql_query)
         if validation_error:
+            if (
+                str(validation_error.get("code")) == "sql_schema_missing"
+                and "runway_constraints" in str(validation_error.get("detail", "")).lower()
+                and not self.strict_source_mode
+            ):
+                airports = self._extract_airports_from_sql(sql_query)
+                return self._query_runway_constraints_fallback(sql_query, airports=airports)
             return [
                 self._source_error_row(
                     source="SQL",
@@ -675,7 +926,15 @@ class UnifiedRetriever:
             if not self.allow_legacy_sql_fallback:
                 row = self._source_error_row("SQL", "sql_generation_failed", str(exc))
                 return [row], "", []
-            sql = self.sql_generator.generate(enhanced_query)
+            try:
+                sql = self.sql_generator.generate(enhanced_query)
+            except Exception as fallback_exc:
+                row = self._source_error_row(
+                    "SQL",
+                    "sql_generation_failed",
+                    f"primary_writer_error={exc}; legacy_writer_error={fallback_exc}",
+                )
+                return [row], "", []
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
             return [self._source_error_row("SQL", "sql_schema_missing", sql, {"sql": sql})], sql, []
@@ -750,31 +1009,40 @@ class UnifiedRetriever:
 
         results_list: List[Dict[str, Any]] = []
         citations: List[Citation] = []
+        try:
+            for r in results:
+                result_dict = dict(r)
+                result_dict["vector_source"] = source
+                result_dict["vector_index"] = index_name
+                score_raw = float(r.get("@search.score", 0.0) or 0.0)
+                score_rerank = float(r.get("@search.reranker_score", 0.0) or 0.0)
+                score_final = score_rerank if score_rerank > 0 else score_raw
+                result_dict["__vector_score_raw"] = score_raw
+                result_dict["__vector_score_rerank"] = score_rerank
+                result_dict["__vector_score_final"] = score_final
+                results_list.append(result_dict)
 
-        for r in results:
-            result_dict = dict(r)
-            result_dict["vector_source"] = source
-            result_dict["vector_index"] = index_name
-            score_raw = float(r.get("@search.score", 0.0) or 0.0)
-            score_rerank = float(r.get("@search.reranker_score", 0.0) or 0.0)
-            score_final = score_rerank if score_rerank > 0 else score_raw
-            result_dict["__vector_score_raw"] = score_raw
-            result_dict["__vector_score_rerank"] = score_rerank
-            result_dict["__vector_score_final"] = score_final
-            results_list.append(result_dict)
-
-            report_id = r.get("asrs_report_id") or r.get("id", "")
-            citation_title = r.get("title") or f"{source} {report_id}"
-            citations.append(
-                Citation(
-                    source_type=source,
-                    identifier=str(report_id),
-                    title=str(citation_title),
-                    content_preview=str(r.get("content", ""))[:120],
-                    score=score_final,
-                    dataset=index_name,
+                report_id = r.get("asrs_report_id") or r.get("id", "")
+                citation_title = r.get("title") or f"{source} {report_id}"
+                citations.append(
+                    Citation(
+                        source_type=source,
+                        identifier=str(report_id),
+                        title=str(citation_title),
+                        content_preview=str(r.get("content", ""))[:120],
+                        score=score_final,
+                        dataset=index_name,
+                    )
                 )
-            )
+        except Exception as exc:
+            return [
+                self._source_error_row(
+                    source=source,
+                    code="semantic_runtime_error",
+                    detail=str(exc),
+                    extra={"index": index_name},
+                )
+            ], []
 
         results_list.sort(key=lambda row: float(row.get("__vector_score_final", 0.0) or 0.0), reverse=True)
         citations.sort(key=lambda c: c.score, reverse=True)
@@ -861,16 +1129,26 @@ class UnifiedRetriever:
                         )
                     ], []
                 else:
-                    tokens = self._query_tokens(query)
-                    if tokens:
-                        values = ",".join(f"'{t}'" for t in tokens)
+                    airports = self._extract_airports_from_query(query)
+                    if airports:
+                        values = ",".join(f"'{a}'" for a in airports)
                         csl = (
-                            "opensky_states "
-                            f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
-                            "| take 50"
+                            "weather_obs "
+                            f"| where toupper(station_id) in ({values}) or toupper(icao) in ({values}) "
+                            f"| where timestamp > ago({max(1, int(window_minutes))}m) "
+                            "| top 40 by timestamp desc"
                         )
                     else:
-                        csl = "opensky_states | take 50"
+                        tokens = self._query_tokens(query)
+                        if tokens:
+                            values = ",".join(f"'{t}'" for t in tokens)
+                            csl = (
+                                "opensky_states "
+                                f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                                "| take 50"
+                            )
+                        else:
+                            csl = "opensky_states | take 50"
 
                 validation_error = self._validate_kql_query(csl)
                 if validation_error:
@@ -927,6 +1205,24 @@ class UnifiedRetriever:
 
         # Local deterministic fallback for demo readiness.
         rows: List[Dict[str, Any]] = []
+        airports = self._extract_airports_from_query(query)
+        if airports:
+            metar_rows = self._metar_rows_for_airports(airports, max_rows=12)
+            rows.extend(metar_rows)
+            taf_rows = self._taf_rows_for_airports(airports, max_rows=12)
+            rows.extend(taf_rows)
+
+        if rows:
+            citation = Citation(
+                source_type="KQL",
+                identifier="eventhouse_weather_fallback",
+                title=f"Eventhouse weather fallback ({', '.join(airports[:3])})",
+                content_preview=str(rows[:3])[:120],
+                score=0.9,
+                dataset="eventhouse-weather-fallback",
+            )
+            return rows, [citation]
+
         states_file = self._latest_matching("data/e-opensky_recent/opensky_states_all_*.json")
         if states_file:
             try:
@@ -1095,25 +1391,7 @@ class UnifiedRetriever:
         if not FABRIC_NOSQL_ENDPOINT and not self.allow_mock_nosql_fallback:
             return [self._source_unavailable_row("NOSQL", "FABRIC_NOSQL_ENDPOINT not configured and fallback disabled")], []
 
-        notam_file = self._latest_matching("data/h-notam_recent/*/search_location_istanbul.jsonl")
-        docs: List[Dict[str, Any]] = []
-        if notam_file:
-            with notam_file.open("r", encoding="utf-8", errors="ignore") as f:
-                for idx, line in enumerate(f):
-                    if idx >= 30:
-                        break
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    docs.append(
-                        {
-                            "facilityDesignator": obj.get("facilityDesignator"),
-                            "notamNumber": obj.get("notamNumber"),
-                            "startDate": obj.get("startDate"),
-                            "endDate": obj.get("endDate"),
-                        }
-                    )
+        docs = self._notam_docs_for_airports(query, max_rows=30)
         citation = Citation(
             source_type="NOSQL",
             identifier="notam_snapshot",
@@ -1123,6 +1401,10 @@ class UnifiedRetriever:
             dataset="nosql-mock",
         )
         return docs, [citation]
+
+    def query_runway_constraints_fallback(self, query: str, airports: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], List[Citation]]:
+        """Expose runway constraint fallback rows for planner/executor fallback flows."""
+        return self._query_runway_constraints_fallback(query, airports=airports)
 
     # =========================================================================
     # Route Execution Methods

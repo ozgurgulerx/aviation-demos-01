@@ -13,6 +13,16 @@ from unified_retriever import UnifiedRetriever  # noqa: E402
 
 class SourceExecutionPolicyTests(unittest.TestCase):
     def _build_retriever(self) -> UnifiedRetriever:
+        class _Writer:
+            def __init__(self, sql: str = "SELECT id, title FROM asrs_reports LIMIT 1", should_raise: bool = False):
+                self.sql = sql
+                self.should_raise = should_raise
+
+            def generate(self, *_args, **_kwargs):
+                if self.should_raise:
+                    raise RuntimeError("writer failure")
+                return self.sql
+
         retriever = object.__new__(UnifiedRetriever)
         retriever.strict_source_mode = False
         retriever.allow_sqlite_fallback = True
@@ -33,6 +43,9 @@ class SourceExecutionPolicyTests(unittest.TestCase):
             "VECTOR_REG": "idx_regulatory",
             "VECTOR_AIRPORT": "idx_airport_ops_docs",
         }
+        retriever.sql_writer = _Writer()
+        retriever.sql_generator = _Writer()
+        retriever.use_legacy_sql_generator = False
         retriever._latest_matching = lambda _pattern: None
         return retriever
 
@@ -63,6 +76,17 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         retriever = self._build_retriever()
         rows, _citations = retriever.execute_sql_query("SELECT * FROM missing_table")
         self.assertEqual(rows[0].get("error_code"), "sql_schema_missing")
+
+    def test_query_sql_handles_writer_failures_without_crashing(self):
+        retriever = self._build_retriever()
+        retriever.allow_legacy_sql_fallback = True
+        retriever.sql_writer.should_raise = True
+        retriever.sql_generator.should_raise = True
+
+        rows, sql, _citations = retriever.query_sql("top facilities")
+
+        self.assertEqual(sql, "")
+        self.assertEqual(rows[0].get("error_code"), "sql_generation_failed")
 
     def test_source_mode_blocks_sql_when_unavailable(self):
         retriever = self._build_retriever()
