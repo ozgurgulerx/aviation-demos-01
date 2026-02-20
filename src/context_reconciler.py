@@ -121,6 +121,12 @@ def _raw_relevance(row: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _row_has_error(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return bool(row.get("error") or row.get("error_code"))
+
+
 def normalize_scores(items: List[Dict[str, Any]]) -> None:
     by_source: Dict[str, List[float]] = {}
     for item in items:
@@ -193,7 +199,12 @@ def build_evidence_slots(
             continue
         optional = bool(req.get("optional", False))
         required_total += 0 if optional else 1
-        candidates = [it for it in items if str(it.get("evidence_type", "")).strip() == name]
+        candidates = [
+            it
+            for it in items
+            if str(it.get("evidence_type", "")).strip() == name
+            and not _row_has_error(it.get("row", {}) or {})
+        ]
         authoritative_candidates: List[Dict[str, Any]] = []
         if not candidates:
             for source in authoritative_map.get(name, []):

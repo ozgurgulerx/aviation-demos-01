@@ -214,14 +214,29 @@ class PlanExecutor:
         if source == "SQL":
             sql_query = call.query
             if not sql_query or not self._looks_like_sql(sql_query):
-                sql_query = self._get_sql_writer().generate(
-                    user_query=user_query,
-                    evidence_type=evidence_type or "generic",
-                    sql_schema=schemas.get("sql_schema", {}),
-                    entities=entities,
-                    time_window=time_window,
-                    constraints=call.params,
-                )
+                try:
+                    sql_query = self._get_sql_writer().generate(
+                        user_query=user_query,
+                        evidence_type=evidence_type or "generic",
+                        sql_schema=schemas.get("sql_schema", {}),
+                        entities=entities,
+                        time_window=time_window,
+                        constraints=call.params,
+                    )
+                except Exception as exc:
+                    if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
+                        rows, citations = self.retriever.query_runway_constraints_fallback(
+                            user_query,
+                            airports=entities.get("airports") if isinstance(entities, dict) else None,
+                        )
+                        rows.append(
+                            {
+                                "warning": "sql_generation_failed_using_runway_fallback",
+                                "detail": str(exc),
+                            }
+                        )
+                        return rows, citations, None
+                    return [{"error": str(exc), "error_code": "sql_generation_failed"}], [], None
             if sql_query.strip().startswith("-- NEED_SCHEMA"):
                 if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
                     rows, citations = self.retriever.query_runway_constraints_fallback(
@@ -236,14 +251,27 @@ class PlanExecutor:
         if source == "KQL":
             kql_query = call.query
             if not kql_query or not self._looks_like_kql(kql_query):
-                kql_query = self._get_kql_writer().generate(
-                    user_query=user_query,
-                    evidence_type=evidence_type or "generic",
-                    kql_schema=schemas.get("kql_schema", {}),
-                    entities=entities,
-                    time_window=time_window,
-                    constraints=call.params,
-                )
+                try:
+                    kql_query = self._get_kql_writer().generate(
+                        user_query=user_query,
+                        evidence_type=evidence_type or "generic",
+                        kql_schema=schemas.get("kql_schema", {}),
+                        entities=entities,
+                        time_window=time_window,
+                        constraints=call.params,
+                    )
+                except Exception as exc:
+                    if not self.retriever.strict_source_mode:
+                        window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
+                        rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
+                        rows.append(
+                            {
+                                "warning": "kql_generation_failed_using_weather_fallback",
+                                "detail": str(exc),
+                            }
+                        )
+                        return rows, citations, None
+                    return [{"error": str(exc), "error_code": "kql_generation_failed"}], [], None
             if kql_query.strip().startswith("// NEED_SCHEMA"):
                 if not self.retriever.strict_source_mode:
                     window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))

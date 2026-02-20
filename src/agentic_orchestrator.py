@@ -183,6 +183,8 @@ class AgenticOrchestrator:
             ev_name = str(req.get("name", "")).strip()
             tools = intent_graph.tools_for_evidence(ev_name)
             canonical_tools = [self._canonical_tool_name(t) for t in tools if self._canonical_tool_name(t)]
+            if ev_name == "NOTAM":
+                canonical_tools = ["NOSQL", *[tool for tool in canonical_tools if tool != "NOSQL"]]
             evidence_tool_map[ev_name] = canonical_tools
             for tool in canonical_tools[:1]:
                 depends_on = ["call_1"] if tool_calls and tool_calls[0].operation == "entity_expansion" else []
@@ -309,10 +311,18 @@ class AgenticOrchestrator:
         next_id = len(plan.tool_calls) + 1
         for req in plan.required_evidence:
             evidence = req.name
-            if evidence in existing_by_evidence and existing_by_evidence[evidence]:
-                continue
+            evidence_tools = existing_by_evidence.get(evidence, set())
+            if evidence_tools:
+                if not (
+                    evidence == "NOTAM"
+                    and ("NOSQL" in allowed_tools or allow_all)
+                    and "NOSQL" not in evidence_tools
+                ):
+                    continue
             candidates = [self._canonical_tool_name(t) for t in intent_graph.tools_for_evidence(evidence)]
             candidates = [c for c in candidates if c]
+            if evidence == "NOTAM" and ("NOSQL" in allowed_tools or allow_all):
+                candidates = ["NOSQL", *[c for c in candidates if c != "NOSQL"]]
             selected_tool = ""
             for candidate in candidates:
                 if allow_all or candidate in allowed_tools:

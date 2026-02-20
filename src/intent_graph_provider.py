@@ -46,6 +46,7 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"name": "GRAPH", "kind": "graph"},
         {"name": "KQL", "kind": "kql"},
         {"name": "SQL", "kind": "sql"},
+        {"name": "NOSQL", "kind": "nosql"},
         {"name": "VECTOR_REG", "kind": "search"},
         {"name": "VECTOR_OPS", "kind": "search"},
         {"name": "VECTOR_AIRPORT", "kind": "search"},
@@ -72,7 +73,8 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
     "authoritative_in": [
         {"evidence": "METAR", "tool": "KQL", "priority": 1},
         {"evidence": "TAF", "tool": "KQL", "priority": 1},
-        {"evidence": "NOTAM", "tool": "VECTOR_REG", "priority": 1},
+        {"evidence": "NOTAM", "tool": "NOSQL", "priority": 1},
+        {"evidence": "NOTAM", "tool": "VECTOR_REG", "priority": 2},
         {"evidence": "RunwayConstraints", "tool": "SQL", "priority": 1},
         {"evidence": "Hazards", "tool": "KQL", "priority": 1},
         {"evidence": "SOPClause", "tool": "VECTOR_REG", "priority": 1},
@@ -188,4 +190,3 @@ class IntentGraphProvider:
             if isinstance(payload, dict) and "intents" in payload and "requires" in payload:
                 return payload
         return None
-
