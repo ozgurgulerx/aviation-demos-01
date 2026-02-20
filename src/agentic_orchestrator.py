@@ -6,53 +6,26 @@ LLM orchestrator for code-rag agentic planning.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any, Dict, List
 
-from dotenv import load_dotenv
+logger = logging.getLogger(__name__)
 
 from azure_openai_client import get_shared_client
 from contracts.agentic_plan import AgenticPlan, CoverageItem, EvidenceRequirement, Intent, TimeWindow, ToolCall
 from intent_graph_provider import IntentGraphSnapshot
-
-load_dotenv()
-
-# Common 4-letter English words that should not be treated as ICAO airport codes.
-_ENGLISH_4LETTER_BLOCKLIST: set[str] = {
-    "WHAT", "WITH", "FROM", "YOUR", "SHOW", "THIS", "THAT", "WHEN",
-    "WILL", "HAVE", "DOES", "BEEN", "WERE", "THEY", "THEM", "THEN",
-    "THAN", "EACH", "MADE", "FIND", "HERE", "MANY", "SOME", "LIKE",
-    "LONG", "MAKE", "JUST", "OVER", "SUCH", "TAKE", "YEAR", "ALSO",
-    "INTO", "MOST", "ONLY", "COME", "VERY", "WELL", "BACK", "MUCH",
-    "GIVE", "EVEN", "WANT", "GOOD", "LOOK", "LAST", "TELL", "NEED",
-    "NEAR", "AREA", "BOTH", "KEEP", "HELP", "LINE", "TURN", "MOVE",
-    "LIVE", "REAL", "LEFT", "SAME", "ABLE", "OPEN", "SEEM", "SURE",
-    "HIGH", "RISK", "EVER", "NEXT", "TYPE", "LIST", "DATA", "USED",
-    "BEST", "DONE", "FULL", "MUST", "KNOW", "TIME", "WENT", "GATE",
-    "TAXI", "LAND", "HOLD", "TAKE", "CALL", "NOTE",
-}
-
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+from shared_utils import (
+    OPENAI_API_VERSION,
+    ENGLISH_4LETTER_BLOCKLIST as _ENGLISH_4LETTER_BLOCKLIST,
+    supports_explicit_temperature as _supports_explicit_temperature,
+)
 
 
 def _init_client():
     client, _ = get_shared_client(api_version=OPENAI_API_VERSION)
     return client
-
-
-def _supports_explicit_temperature(model_name: str) -> bool:
-    model = (model_name or "").strip().lower()
-    normalized = model.replace("-", "").replace("_", "")
-    return not (
-        model.startswith("gpt-5")
-        or normalized.startswith("gpt5")
-        or "gpt5" in normalized
-        or model.startswith("o1")
-        or model.startswith("o3")
-        or model.startswith("o4")
-        or normalized == "modelrouter"
-    )
 
 
 def _supports_reasoning_effort(model_name: str) -> bool:
@@ -160,6 +133,7 @@ class AgenticOrchestrator:
             )
             return self._enforce_required_sources(plan, required_sources or [])
         except Exception:
+            logger.warning("Agentic planning failed, falling back to heuristic plan", exc_info=True)
             return self._fallback_plan(user_query, runtime_context, intent_graph, required_sources or [])
 
     def _fallback_plan(

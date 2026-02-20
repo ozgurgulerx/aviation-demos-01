@@ -162,10 +162,6 @@ export function TimelinePanel({
             );
           })}
         </div>
-        <p className="mb-3 text-[11px] text-muted-foreground">
-          Click a row-count chip to inspect retrieved records for that datastore.
-        </p>
-
         <AnimatePresence initial={false}>
           {expanded && (
             <motion.div
@@ -174,8 +170,6 @@ export function TimelinePanel({
               exit={reducedMotion ? { opacity: 1, y: 0 } : { opacity: 0, y: -4 }}
               transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
             >
-              <LiveOpsPulse sourceHealth={sourceHealth} />
-
               <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
                 {latestEvents.length === 0 ? (
                   <p className="text-xs text-muted-foreground">
@@ -366,51 +360,6 @@ function EventChip({ type }: { type: TelemetryEvent["type"] }) {
   }
 
   return null;
-}
-
-function LiveOpsPulse({ sourceHealth }: { sourceHealth: SourceHealthStatus[] }) {
-  const kql = sourceHealth.find((source) => source.source === "KQL");
-  const graph = sourceHealth.find((source) => source.source === "GRAPH");
-  const live = sourceHealth.filter((source) => source.mode === "live").length;
-  const fallback = sourceHealth.filter((source) => source.mode === "fallback").length;
-  const latestUpdate = sourceHealth
-    .map((source) => source.updatedAt)
-    .filter(Boolean)
-    .sort()
-    .pop();
-
-  return (
-    <div className="mb-3 grid gap-2 rounded-xl border border-border bg-card p-3 text-xs md:grid-cols-4">
-      <div>
-        <p className="text-muted-foreground">Live operations pulse</p>
-        <p className="font-semibold text-foreground">{kql?.rowCount ?? 0} KQL rows</p>
-      </div>
-      <div>
-        <p className="text-muted-foreground">Impact graph pulse</p>
-        <p className="font-semibold text-foreground">{graph?.rowCount ?? 0} graph rows</p>
-      </div>
-      <div>
-        <p className="text-muted-foreground">Data path</p>
-        <p className="font-semibold text-foreground">
-          {live} live / {fallback} fallback
-        </p>
-      </div>
-      <div>
-        <p className="text-muted-foreground">Last source update</p>
-        <p className="font-semibold text-foreground">
-          {latestUpdate
-            ? new Date(latestUpdate).toLocaleTimeString("en-US", {
-                hour12: false,
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-                timeZone: "UTC",
-              }) + " UTC"
-            : "N/A"}
-        </p>
-      </div>
-    </div>
-  );
 }
 
 function StatusIcon({ status }: { status: TelemetryEvent["status"] }) {

@@ -113,8 +113,8 @@ export function Message({
           )}
         </div>
 
-        {/* Verification badge for assistant messages */}
-        {!isUser && (
+        {/* Voice controls for assistant messages (only when voice is on) */}
+        {!isUser && voiceEnabled && (
           <div className="flex items-center gap-2">
             <Button
               size="sm"
@@ -131,7 +131,6 @@ export function Message({
               />
               {voiceLabel}
             </Button>
-            {!voiceEnabled && <span className="text-xs text-muted-foreground">Voice is off</span>}
           </div>
         )}
 

@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Generator, List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
@@ -27,17 +26,19 @@ from query_router import QueryRouter
 from query_writers import SQLWriter
 from sql_generator import SQLGenerator
 from pii_filter import PiiFilter, PiiCheckResult
+from shared_utils import (
+    OPENAI_API_VERSION,
+    ENGLISH_4LETTER_BLOCKLIST as _ENGLISH_4LETTER_BLOCKLIST,
+    CITY_AIRPORT_MAP,
+    IATA_TO_ICAO_MAP,
+    env_bool as _env_bool,
+    env_csv as _env_csv,
+)
 
 logger = logging.getLogger(__name__)
 
-# Load .env file
-load_dotenv()
-
 # Database configuration — PostgreSQL only.
 # When PG is unavailable, SQL is simply marked as unavailable (no SQLite fallback).
-
-# Azure OpenAI configuration
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG_NAME", "aviation-semantic-config")
 try:
     _RERANK_RAW_CANDIDATES = max(1, int(os.getenv("CONTEXT_VECTOR_RAW_CANDIDATES", "20") or "20"))
@@ -54,62 +55,6 @@ FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 def _get_fabric_bearer_token() -> str:
     """Re-read bearer token from env on each call so rotated tokens take effect."""
     return os.getenv("FABRIC_BEARER_TOKEN", "")
-
-
-CITY_AIRPORT_MAP: Dict[str, List[str]] = {
-    "new york": ["KJFK", "KLGA", "KEWR"],
-    "nyc": ["KJFK", "KLGA", "KEWR"],
-    "istanbul": ["LTFM", "LTBA", "LTFJ"],
-    "london": ["EGLL", "EGKK", "EGSS"],
-}
-
-IATA_TO_ICAO_MAP: Dict[str, str] = {
-    "JFK": "KJFK",
-    "LGA": "KLGA",
-    "EWR": "KEWR",
-    "IST": "LTFM",
-    "SAW": "LTFJ",
-}
-
-# Common 4-letter English words that should not be treated as ICAO airport codes.
-_ENGLISH_4LETTER_BLOCKLIST: set[str] = {
-    "WHAT", "WITH", "FROM", "YOUR", "SHOW", "THIS", "THAT", "WHEN",
-    "WILL", "HAVE", "DOES", "BEEN", "WERE", "THEY", "THEM", "THEN",
-    "THAN", "EACH", "MADE", "FIND", "HERE", "MANY", "SOME", "LIKE",
-    "LONG", "MAKE", "JUST", "OVER", "SUCH", "TAKE", "YEAR", "ALSO",
-    "INTO", "MOST", "ONLY", "COME", "VERY", "WELL", "BACK", "MUCH",
-    "GIVE", "EVEN", "WANT", "GOOD", "LOOK", "LAST", "TELL", "NEED",
-    "NEAR", "AREA", "BOTH", "KEEP", "HELP", "LINE", "TURN", "MOVE",
-    "LIVE", "REAL", "LEFT", "SAME", "ABLE", "OPEN", "SEEM", "SURE",
-    "HIGH", "RISK", "EVER", "NEXT", "TYPE", "LIST", "DATA", "USED",
-    "BEST", "DONE", "FULL", "MUST", "KNOW", "TIME", "WENT", "GATE",
-    "TAXI", "LAND", "HOLD", "TAKE", "CALL", "NOTE",
-}
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    return raw.lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_csv(name: str, default: str) -> List[str]:
-    raw = (os.getenv(name, default) or default).strip()
-    if not raw:
-        return []
-    seen = set()
-    out: List[str] = []
-    for token in raw.split(","):
-        value = token.strip()
-        if not value:
-            continue
-        lowered = value.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        out.append(lowered)
-    return out
 
 
 @dataclass
@@ -568,13 +513,21 @@ class UnifiedRetriever:
             "checks": checks,
         }
 
-    def _get_pg_connection(self) -> Any:
-        """Acquire a connection from the PostgreSQL pool."""
+    def _get_pg_connection(self, read_only: bool = False) -> Any:
+        """Acquire a connection from the PostgreSQL pool.
+
+        When *read_only* is ``True`` the connection is returned with
+        ``autocommit = False`` so callers can wrap SQL in a
+        ``SET TRANSACTION READ ONLY`` block.
+        """
         if self._pg_pool is None:
             return None
         try:
             conn = self._pg_pool.getconn()
-            conn.autocommit = True
+            if read_only:
+                conn.autocommit = False
+            else:
+                conn.autocommit = True
             return conn
         except Exception as exc:
             logger.warning("Failed to acquire PG connection: %s", exc)
@@ -719,7 +672,8 @@ class UnifiedRetriever:
                 return {"code": "sql_validation_failed", "detail": f"sql_contains_blocked_operation: {pattern}"}
 
         # Check for semicolons outside of string literals to prevent multi-statement injection.
-        stripped = re.sub(r'"[^"]*"', '', sql)
+        stripped = re.sub(r'\$([a-zA-Z_]\w*)?\$.*?\$\1\$', '', sql, flags=re.DOTALL)
+        stripped = re.sub(r'"[^"]*"', '', stripped)
         stripped = re.sub(r"'[^']*'", '', stripped)
         if ";" in stripped:
             return {"code": "sql_validation_failed", "detail": "sql_multiple_statements_not_allowed"}
@@ -759,17 +713,23 @@ class UnifiedRetriever:
                 )
             ], []
 
-        conn = self._get_pg_connection()
+        conn = self._get_pg_connection(read_only=True)
         if conn is None:
             return [self._source_unavailable_row("SQL", "pg_pool_connection_unavailable")], []
         try:
             cur = conn.cursor()
+            cur.execute("SET TRANSACTION READ ONLY")
             cur.execute(sql_query)
             rows = cur.fetchall()
             columns = [desc[0] for desc in cur.description] if cur.description else []
             dict_rows = [dict(zip(columns, row)) for row in rows]
             cur.close()
+            conn.commit()
         except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             return [
                 self._source_error_row(
                     source="SQL",
@@ -1437,20 +1397,17 @@ class UnifiedRetriever:
         result.reasoning = route_result.get("reasoning", result.reasoning)
         return result
 
-    def _synthesize_answer(self, query: str, context: dict, route: str) -> str:
-        """Generate natural language answer from retrieved context."""
-        _t0_synth = time.perf_counter()
+    _ROUTE_INSTRUCTIONS: Dict[str, str] = {
+        "SQL": "Focus on the precise data from SQL results.",
+        "SEMANTIC": "Focus on document content and similarity matches.",
+        "HYBRID": "Combine structured data with semantic context for a comprehensive answer.",
+        "AGENTIC": "Prioritize evidence reconciliation across multiple source types.",
+    }
 
-        route_instructions = {
-            "SQL": "Focus on the precise data from SQL results.",
-            "SEMANTIC": "Focus on document content and similarity matches.",
-            "HYBRID": "Combine structured data with semantic context for a comprehensive answer.",
-            "AGENTIC": "Prioritize evidence reconciliation across multiple source types.",
-        }
-
-        system_prompt = f"""You are a helpful aviation data analyst assistant.
+    def _synthesis_system_prompt(self, route: str) -> str:
+        return f"""You are a helpful aviation data analyst assistant.
 Answer the user's question based on the provided context.
-{route_instructions.get(route, '')}
+{self._ROUTE_INSTRUCTIONS.get(route, '')}
 
 Guidelines:
 - Be concise but informative
@@ -1458,6 +1415,10 @@ Guidelines:
 - If showing multiple items, use a clear list or table format
 - Reference the data sources when relevant
 - If the context is insufficient, say so clearly"""
+
+    def _synthesize_answer(self, query: str, context: dict, route: str) -> str:
+        """Generate natural language answer from retrieved context."""
+        _t0_synth = time.perf_counter()
 
         context_str = f"""
 Query: {query}
@@ -1470,7 +1431,7 @@ Retrieved Data:
             response = self.llm.chat.completions.create(
                 model=self.llm_deployment,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": self._synthesis_system_prompt(route)},
                     {"role": "user", "content": context_str}
                 ]
             )
@@ -1486,24 +1447,6 @@ Retrieved Data:
         """Stream synthesis tokens as agent_update events (true streaming)."""
         _t0_synth = time.perf_counter()
 
-        route_instructions = {
-            "SQL": "Focus on the precise data from SQL results.",
-            "SEMANTIC": "Focus on document content and similarity matches.",
-            "HYBRID": "Combine structured data with semantic context for a comprehensive answer.",
-            "AGENTIC": "Prioritize evidence reconciliation across multiple source types.",
-        }
-
-        system_prompt = f"""You are a helpful aviation data analyst assistant.
-Answer the user's question based on the provided context.
-{route_instructions.get(route, '')}
-
-Guidelines:
-- Be concise but informative
-- Format numbers nicely
-- If showing multiple items, use a clear list or table format
-- Reference the data sources when relevant
-- If the context is insufficient, say so clearly"""
-
         context_str = f"""
 Query: {query}
 
@@ -1515,7 +1458,7 @@ Retrieved Data:
             stream = self.llm.chat.completions.create(
                 model=self.llm_deployment,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": self._synthesis_system_prompt(route)},
                     {"role": "user", "content": context_str},
                 ],
                 stream=True,

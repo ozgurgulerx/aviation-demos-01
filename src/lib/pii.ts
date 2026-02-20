@@ -178,14 +178,24 @@ function runFallbackPiiDetection(text: string, categories: PiiCategory[]): PiiCh
   };
 }
 
+// Module-level token cache with 50-minute TTL (Azure tokens expire after ~60 min).
+let _cachedToken: string | null = null;
+let _tokenFetchedAt = 0;
+const TOKEN_TTL_MS = 50 * 60 * 1000; // 50 minutes
+
 /**
  * Get Azure AD access token for Cognitive Services
  */
 async function getAzureAccessToken(): Promise<string | null> {
-  // Check for cached token first
-  const cachedToken = process.env.AZURE_ACCESS_TOKEN;
-  if (cachedToken) {
-    return cachedToken;
+  // Check for env-provided token first (e.g. managed identity injected token)
+  const envToken = process.env.AZURE_ACCESS_TOKEN;
+  if (envToken) {
+    return envToken;
+  }
+
+  // Return cached CLI token if still fresh
+  if (_cachedToken && Date.now() - _tokenFetchedAt < TOKEN_TTL_MS) {
+    return _cachedToken;
   }
 
   // Try to get token using Azure CLI (for local dev) — async to avoid blocking the event loop
@@ -198,8 +208,15 @@ async function getAzureAccessToken(): Promise<string | null> {
       ["account", "get-access-token", "--resource", "https://cognitiveservices.azure.com", "--query", "accessToken", "-o", "tsv"],
       { timeout: 10000 }
     );
-    return stdout.trim() || null;
+    const token = stdout.trim() || null;
+    if (token) {
+      _cachedToken = token;
+      _tokenFetchedAt = Date.now();
+    }
+    return token;
   } catch {
+    _cachedToken = null;
+    _tokenFetchedAt = 0;
     return null;
   }
 }

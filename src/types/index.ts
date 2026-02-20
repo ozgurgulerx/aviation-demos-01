@@ -36,6 +36,7 @@ export interface Citation {
   excerpt?: string;
 }
 
+/** @deprecated Retained for Message type compatibility; not used at runtime. */
 export interface ToolCall {
   id: string;
   name: string;

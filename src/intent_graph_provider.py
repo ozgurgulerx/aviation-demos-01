@@ -9,6 +9,7 @@ Fallback source is static/default in-process JSON graph.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -16,9 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-from dotenv import load_dotenv
+logger = logging.getLogger(__name__)
 
-load_dotenv()
+import shared_utils  # noqa: F401  — ensures load_dotenv() runs
 
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT", "").strip()
 def _get_fabric_bearer_token() -> str:
@@ -168,8 +169,10 @@ class IntentGraphProvider:
                 if "intents" in snapshot and "requires" in snapshot:
                     return snapshot
         except urllib.error.HTTPError:
+            logger.warning("Intent graph HTTP fetch failed", exc_info=True)
             return None
         except Exception:
+            logger.warning("Intent graph fetch failed", exc_info=True)
             return None
         return None
 

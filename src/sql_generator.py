@@ -5,13 +5,9 @@ SQL Generator - Generates SQL from natural language queries.
 
 import os
 import re
-from dotenv import load_dotenv
 
 from azure_openai_client import get_shared_client
-
-load_dotenv()
-
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+from shared_utils import OPENAI_API_VERSION
 
 
 FULL_SCHEMA = """

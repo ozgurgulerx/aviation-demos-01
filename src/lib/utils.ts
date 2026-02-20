@@ -32,18 +32,6 @@ export function formatDateTime(date: Date | string): string {
   }).format(d);
 }
 
-export function formatCurrency(
-  amount: number,
-  currency: string = "USD"
-): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency,
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
-
 export function formatCompactNumber(num: number): string {
   return new Intl.NumberFormat("en-US", {
     notation: "compact",
@@ -54,4 +42,10 @@ export function formatCompactNumber(num: number): string {
 
 export function generateId(): string {
   return crypto.randomUUID();
+}
+
+export function deduplicateCitations<T extends { id: number }>(citations: T[]): T[] {
+  return citations.filter(
+    (citation, index, array) => array.findIndex((item) => item.id === citation.id) === index
+  );
 }

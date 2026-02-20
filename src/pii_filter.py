@@ -69,6 +69,8 @@ class PiiFilter:
         self.endpoint = endpoint or PII_ENDPOINT
         self.confidence_threshold = confidence_threshold
         self._is_available = None
+        self._is_available_checked_at: float = 0.0
+        self._availability_ttl = float(os.getenv("PII_AVAILABILITY_TTL_SECONDS", "300"))
         # Result cache: keyed by SHA-256 of input text, stores (result, expires_at).
         self._cache: Dict[str, Tuple[PiiCheckResult, float]] = {}
         self._cache_ttl: float = float(os.getenv("PII_CACHE_TTL_SECONDS", "60"))
@@ -77,7 +79,8 @@ class PiiFilter:
     def is_available(self) -> bool:
         """Check if PII service is available."""
         if self._is_available is not None:
-            return self._is_available
+            if (time.monotonic() - self._is_available_checked_at) < self._availability_ttl:
+                return self._is_available
 
         try:
             response = requests.get(f"{self.endpoint}/status", timeout=5)
@@ -89,6 +92,7 @@ class PiiFilter:
             except Exception:
                 self._is_available = False
 
+        self._is_available_checked_at = time.monotonic()
         return self._is_available
 
     def _cache_key(self, text: str) -> str:

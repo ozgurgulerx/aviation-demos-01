@@ -4,18 +4,14 @@ Query Router - Classifies queries into retrieval paths.
 Routes: SQL, SEMANTIC, HYBRID
 """
 
-import os
 import json
 import logging
-from dotenv import load_dotenv
+import os
 
 from azure_openai_client import get_shared_client
+from shared_utils import OPENAI_API_VERSION
 
 logger = logging.getLogger(__name__)
-
-load_dotenv()
-
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 
 ROUTING_PROMPT = """You are a query router for an aviation safety Q&A system with multiple data sources.

@@ -87,7 +87,7 @@ jobs:
         run: cd src && python -m py_compile api_server.py unified_retriever.py query_router.py pii_filter.py
 
       - name: Run tests
-        run: python -m pytest tests/ -v --tb=short || true
+        run: python -m pytest tests/ -v --tb=short -m "not integration"
 
   build-and-push:
     needs: lint-and-test

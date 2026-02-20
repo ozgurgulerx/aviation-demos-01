@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
     console.log("═".repeat(70));
     console.log(`📡 Service: ${serviceInfo.type}`);
     console.log(`🌐 Endpoint: ${serviceInfo.endpoint}`);
-    console.log(`💬 Message: "${userMessage.substring(0, 100)}${userMessage.length > 100 ? '...' : ''}"`);
+    console.log(`💬 Message length: ${userMessage.length} chars`);
     console.log("─".repeat(70));
 
     const result = await checkPii({ text: userMessage });
@@ -54,7 +54,7 @@ export async function POST(request: NextRequest) {
       console.log(`🚨 Detected PII Categories: ${categories.join(", ")}`);
       console.log(`📋 Entities Found:`);
       result.entities.forEach((entity) => {
-        console.log(`   • "${entity.text}" → ${entity.category} (${(entity.confidenceScore * 100).toFixed(0)}% confidence)`);
+        console.log(`   • [REDACTED ${entity.length} chars] → ${entity.category} (${(entity.confidenceScore * 100).toFixed(0)}% confidence)`);
       });
       console.log(`💬 User Warning: "${warningMessage}"`);
       console.log("═".repeat(70) + "\n");

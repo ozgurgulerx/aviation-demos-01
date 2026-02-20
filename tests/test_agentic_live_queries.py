@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, List
 
+import pytest
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from openai import AzureOpenAI
@@ -62,6 +63,7 @@ CASES: List[Dict[str, Any]] = [
 ]
 
 
+@pytest.mark.integration
 class AgenticLiveQueriesTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

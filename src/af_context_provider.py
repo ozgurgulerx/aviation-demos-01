@@ -27,27 +27,7 @@ from plan_executor import PlanExecutor
 from retrieval_plan import RetrievalRequest, RetrievalPlan, SourcePlan, build_retrieval_plan
 from schema_provider import SchemaProvider
 from unified_retriever import Citation, UnifiedRetriever
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "")
-    if not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        return default
+from shared_utils import utc_now as _utc_now, env_bool as _env_bool, env_int as _env_int
 
 
 @dataclass
@@ -148,6 +128,7 @@ class AviationRagContextProvider:
                     ask_recommendation=ask_recommendation,
                 )
             except Exception as exc:
+                logger.warning("Agentic orchestration failed, falling back to legacy planner", exc_info=True)
                 fallback_note = f"Agentic orchestration failed, using legacy planner ({exc})"
         else:
             fallback_note = "Legacy retrieval planner used"

@@ -19,10 +19,7 @@ logger = logging.getLogger(__name__)
 from contracts.agentic_plan import AgenticPlan, ToolCall
 from query_writers import KQLWriter, SQLWriter
 from unified_retriever import Citation, UnifiedRetriever
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from shared_utils import utc_now as _utc_now, safe_preview_value, build_rows_preview, KNOWN_TOOLS, TOOL_ALIASES, canon_tool
 
 
 @dataclass
@@ -340,21 +337,8 @@ class PlanExecutor:
 
         return [{"error": sql_query, "error_code": "sql_schema_missing"}], [], sql_query
 
-    _KNOWN_TOOLS = {"KQL", "SQL", "GRAPH", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT", "NOSQL"}
-    _TOOL_ALIASES = {
-        "EVENTHOUSEKQL": "KQL",
-        "WAREHOUSESQL": "SQL",
-        "FABRICGRAPH": "GRAPH",
-        "GRAPHTRAVERSAL": "GRAPH",
-        "FOUNDRYIQ": "VECTOR_REG",
-        "AZUREAISEARCH": "VECTOR_REG",
-        "LAKEHOUSEDELTA": "KQL",
-    }
-
     def _canon_tool(self, raw: str) -> str:
-        value = (raw or "").strip().upper()
-        mapped = self._TOOL_ALIASES.get(value, value)
-        return mapped if mapped in self._KNOWN_TOOLS else ""
+        return canon_tool(raw)
 
     def _looks_like_sql(self, text: str) -> bool:
         return bool(re.match(r"^\s*(SELECT|WITH)\b", text, re.IGNORECASE))
@@ -454,36 +438,7 @@ class PlanExecutor:
         max_columns: int = 8,
         max_chars: int = 180,
     ) -> Tuple[List[str], List[Dict[str, Any]], bool]:
-        if not rows:
-            return [], [], False
-
-        hidden_keys = {"content_vector"}
-        columns: List[str] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            for key in row.keys():
-                if not isinstance(key, str) or key.startswith("__") or key in hidden_keys:
-                    continue
-                if key not in columns:
-                    columns.append(key)
-                    if len(columns) >= max_columns:
-                        break
-            if len(columns) >= max_columns:
-                break
-
-        preview: List[Dict[str, Any]] = []
-        for row in rows[:max_rows]:
-            if not isinstance(row, dict):
-                continue
-            item: Dict[str, Any] = {}
-            for column in columns:
-                if column in row:
-                    item[column] = self._safe_preview_value(row[column], max_chars=max_chars)
-            if item:
-                preview.append(item)
-
-        return columns, preview, len(rows) > len(preview)
+        return build_rows_preview(rows, max_rows, max_columns, max_chars)
 
     def _rows_have_errors(self, rows: List[Dict[str, Any]]) -> bool:
         for row in rows:
@@ -494,24 +449,4 @@ class PlanExecutor:
         return False
 
     def _safe_preview_value(self, value: Any, max_chars: int = 180) -> Any:
-        if value is None or isinstance(value, (int, float, bool)):
-            return value
-
-        if isinstance(value, str):
-            return value if len(value) <= max_chars else value[: max_chars - 3] + "..."
-
-        if hasattr(value, "isoformat"):
-            try:
-                return value.isoformat()
-            except Exception:
-                pass
-
-        if isinstance(value, (dict, list, tuple)):
-            try:
-                serialized = json.dumps(value, ensure_ascii=True)
-            except Exception:
-                serialized = str(value)
-            return serialized if len(serialized) <= max_chars else serialized[: max_chars - 3] + "..."
-
-        rendered = str(value)
-        return rendered if len(rendered) <= max_chars else rendered[: max_chars - 3] + "..."
+        return safe_preview_value(value, max_chars)

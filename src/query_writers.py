@@ -10,13 +10,8 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-from dotenv import load_dotenv
-
 from azure_openai_client import get_shared_client
-
-load_dotenv()
-
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+from shared_utils import OPENAI_API_VERSION, supports_explicit_temperature as _supports_explicit_temperature
 
 
 def _init_client():
@@ -28,21 +23,6 @@ def _strip_fences(text: str) -> str:
     out = re.sub(r"^```(?:sql|kql|json)?\s*", "", text.strip(), flags=re.IGNORECASE)
     out = re.sub(r"\s*```$", "", out)
     return out.strip()
-
-
-def _supports_explicit_temperature(model_name: str) -> bool:
-    """GPT-5/o-series deployments reject explicit temperature overrides."""
-    model = (model_name or "").strip().lower()
-    normalized = model.replace("-", "").replace("_", "")
-    return not (
-        model.startswith("gpt-5")
-        or normalized.startswith("gpt5")
-        or "gpt5" in normalized
-        or model.startswith("o1")
-        or model.startswith("o3")
-        or model.startswith("o4")
-        or normalized == "modelrouter"
-    )
 
 
 class SQLWriter:

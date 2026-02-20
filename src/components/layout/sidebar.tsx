@@ -18,7 +18,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import {
   SAMPLE_CONVERSATIONS,
@@ -99,17 +98,6 @@ export function Sidebar({
               />
             </div>
 
-            <div className="rounded-xl border border-primary/20 bg-primary/5 p-3 text-xs">
-              <div className="mb-1.5 flex items-center justify-between gap-2">
-                <span className="font-semibold text-primary">Mission Status</span>
-                <Badge variant="success" className="text-[10px]">
-                  Live
-                </Badge>
-              </div>
-              <p className="text-muted-foreground">
-                Intent mapping and evidence checks are active for this flight-brief demo.
-              </p>
-            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -175,21 +163,6 @@ export function Sidebar({
             </Section>
           )}
 
-          {!isCollapsed && (
-            <>
-              <Separator className="my-1" />
-              <Section title="Reference" icon={<Database className="h-3.5 w-3.5" />}>
-                <Link
-                  href="/data-sources"
-                  className="flex w-full items-center justify-between rounded-lg border border-transparent px-2.5 py-2 text-left text-sm text-muted-foreground transition-colors hover:border-border hover:bg-surface-2 hover:text-foreground"
-                >
-                  <span className="font-medium text-foreground">Data Sources</span>
-                  <span className="text-xs text-muted-foreground">Detail</span>
-                </Link>
-              </Section>
-
-            </>
-          )}
         </div>
       </ScrollArea>
     </motion.aside>

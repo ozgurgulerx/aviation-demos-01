@@ -389,19 +389,10 @@ export function MessageComposer({
 
       {/* Helper text with PII guidance link */}
       <div className="flex items-center justify-between mt-3">
-        <p
-          className={cn(
-            "text-xs flex items-center gap-1.5 transition-colors duration-300",
-            piiStatus === "blocked" ? "text-red-500" : "text-muted-foreground"
-          )}
-        >
-          <Shield className="h-3.5 w-3.5" />
-          <span>
-            {piiStatus === "blocked"
-              ? "Please remove personal information and try again"
-              : "Press Enter to send. Personal information (SSN, credit cards, etc.) is automatically blocked."
-            }
-          </span>
+        <p className="text-xs text-muted-foreground">
+          {piiStatus === "blocked"
+            ? "Remove personal information and try again"
+            : "Enter to send \u00b7 Shift+Enter for new line"}
         </p>
         <PiiGuidanceDialog />
       </div>

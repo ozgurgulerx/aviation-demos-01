@@ -23,7 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { ArchitectureMap } from "@/components/architecture/architecture-map";
-import { cn, generateId } from "@/lib/utils";
+import { cn, deduplicateCitations, generateId } from "@/lib/utils";
 import { parseSSEFrames, toOperationalAlert, toTelemetryEvent, updateSourceHealth } from "@/lib/chat";
 import { normalizeSourceId } from "@/lib/datastore";
 import {
@@ -173,7 +173,7 @@ function extractIntentPayloadFromPlan(plan?: Record<string, unknown>): Reasoning
   if (!payload.confidence && payload.intentLabel) {
     const warnings = Array.isArray(plan.warnings) ? plan.warnings.length : 0;
     const verified = plan.is_verified === true;
-    payload.confidence = verified ? "High" : warnings > 0 ? "Medium" : "Medium";
+    payload.confidence = verified ? "High" : warnings > 0 ? "Medium" : "Low";
   }
 
   return payload;
@@ -358,9 +358,9 @@ export default function ChatPage() {
     SAMPLE_CONVERSATIONS[0]?.messages || []
   );
   const [citations, setCitations] = useState<Citation[]>(
-    SAMPLE_CONVERSATIONS[0]?.messages
-      .flatMap((message) => message.citations || [])
-      .filter((citation, index, array) => array.findIndex((item) => item.id === citation.id) === index) || []
+    deduplicateCitations(
+      SAMPLE_CONVERSATIONS[0]?.messages.flatMap((message) => message.citations || []) || []
+    )
   );
 
   const [activeCitationId, setActiveCitationId] = useState<number | null>(null);
@@ -463,9 +463,9 @@ export default function ChatPage() {
     setActiveConversationId(id);
     setMessages(conversation.messages);
     setCitations(
-      conversation.messages
-        .flatMap((message) => message.citations || [])
-        .filter((citation, index, array) => array.findIndex((item) => item.id === citation.id) === index)
+      deduplicateCitations(
+        conversation.messages.flatMap((message) => message.citations || [])
+      )
     );
     setActiveCitationId(null);
     setShowFollowUps(true);
@@ -1034,11 +1034,7 @@ export default function ChatPage() {
         <div className="relative z-10 border-b border-border bg-card/80 px-4 py-3">
           <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="mission-chip">Flight Briefing Mode</span>
               <Badge variant="outline">{routeLabel}</Badge>
-              <Badge variant={isLoading ? "warning" : "success"}>
-                {isLoading ? "Briefing in progress" : "Ready"}
-              </Badge>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -1049,22 +1045,6 @@ export default function ChatPage() {
                   { value: "pilot-brief", label: "Pilot Brief" },
                   { value: "ops-live", label: "Ops Live" },
                   { value: "compliance", label: "Compliance" },
-                ]}
-              />
-
-              <ToggleGroup
-                value={voiceMode}
-                onValueChange={(value) => {
-                  const next = value as VoiceMode;
-                  setVoiceMode(next);
-                  if (next === "off") {
-                    stopVoicePlayback();
-                  }
-                }}
-                options={[
-                  { value: "off", label: "Voice Off" },
-                  { value: "tr-TR", label: "Voice TR" },
-                  { value: "en-US", label: "Voice EN" },
                 ]}
               />
 
@@ -1091,6 +1071,22 @@ export default function ChatPage() {
               >
                 <div className="mx-auto mt-3 max-w-5xl border-t border-border/50 pt-3">
                   <div className="flex flex-wrap items-center gap-2">
+                    <ToggleGroup
+                      value={voiceMode}
+                      onValueChange={(value) => {
+                        const next = value as VoiceMode;
+                        setVoiceMode(next);
+                        if (next === "off") {
+                          stopVoicePlayback();
+                        }
+                      }}
+                      options={[
+                        { value: "off", label: "Voice Off" },
+                        { value: "tr-TR", label: "Voice TR" },
+                        { value: "en-US", label: "Voice EN" },
+                      ]}
+                    />
+
                     <ToggleGroup
                       value={String(freshnessSlaMinutes)}
                       onValueChange={(value) => setFreshnessSlaMinutes(Number(value))}
@@ -1210,7 +1206,6 @@ export default function ChatPage() {
         onCitationClick={handleCitationClick}
         sourceHealth={sourceHealth}
         route={routeLabel}
-        isLoading={isLoading}
         confidenceLabel={confidenceLabel}
       />
       </div>

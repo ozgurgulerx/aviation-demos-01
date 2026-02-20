@@ -2,7 +2,6 @@
 
 import { motion } from "framer-motion";
 import {
-  Sparkles,
   Radar,
   ShieldAlert,
   Workflow,
@@ -100,40 +99,31 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: 10 }}
-      className="px-4 pb-4"
+      className="px-4 pb-3"
     >
-      <div className="mx-auto max-w-5xl rounded-xl border border-border bg-card p-3">
-        <div className="mb-3 flex items-center gap-2">
-          <Sparkles className="h-3.5 w-3.5 text-gold" />
-          <span className="text-xs font-medium text-muted-foreground">
-            Suggested follow-up briefs
-          </span>
-        </div>
-
-        <div className="flex flex-wrap gap-2">
-          {normalizedSuggestions.map((suggestion, index) => {
-            const Icon = iconMap[suggestion.type];
-            const palette = colorMap[suggestion.type];
-            return (
-              <motion.div
-                key={suggestion.text}
-                initial={{ opacity: 0, scale: 0.94 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: index * 0.04 }}
+      <div className="mx-auto max-w-5xl flex flex-wrap gap-2">
+        {normalizedSuggestions.map((suggestion, index) => {
+          const Icon = iconMap[suggestion.type];
+          const palette = colorMap[suggestion.type];
+          return (
+            <motion.div
+              key={suggestion.text}
+              initial={{ opacity: 0, scale: 0.94 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ delay: index * 0.04 }}
+            >
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onSelect(suggestion.text)}
+                className={`h-auto border ${palette.border} ${palette.bg} px-3 py-2 text-xs transition-all hover:-translate-y-0.5`}
               >
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onSelect(suggestion.text)}
-                  className={`h-auto border ${palette.border} ${palette.bg} px-3 py-2 text-xs transition-all hover:-translate-y-0.5`}
-                >
-                  <Icon className={`h-3.5 w-3.5 ${palette.text}`} />
-                  <span className="text-left">{suggestion.text}</span>
-                </Button>
-              </motion.div>
-            );
-          })}
-        </div>
+                <Icon className={`h-3.5 w-3.5 ${palette.text}`} />
+                <span className="text-left">{suggestion.text}</span>
+              </Button>
+            </motion.div>
+          );
+        })}
       </div>
     </motion.div>
   );

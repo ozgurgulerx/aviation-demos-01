@@ -39,6 +39,9 @@ def health():
 def chat():
     """Main chat endpoint. Streams AF-native events using SSE."""
     data = request.get_json(silent=True) or {}
+    # Single-turn: only the latest user message is used per request.
+    # The backend does not maintain conversation history.
+    # TODO: implement multi-turn by accepting and forwarding the full messages array.
     message = data.get("message")
     retrieval_mode = data.get("retrieval_mode", "code-rag")
     conversation_id = data.get("conversation_id")
@@ -52,6 +55,10 @@ def chat():
 
     if not message:
         return jsonify({"error": "Missing 'message' field"}), 400
+
+    MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "8000"))
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return jsonify({"error": f"Message exceeds maximum length of {MAX_MESSAGE_LENGTH} characters"}), 400
 
     af_runtime = get_runtime()
 
@@ -101,6 +108,10 @@ def query():
         message = data.get("message")
         if not message:
             return jsonify({"error": "Missing 'message' field"}), 400
+
+        MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "8000"))
+        if len(message) > MAX_MESSAGE_LENGTH:
+            return jsonify({"error": f"Message exceeds maximum length of {MAX_MESSAGE_LENGTH} characters"}), 400
 
         retrieval_mode = data.get("retrieval_mode", "code-rag")
         conversation_id = data.get("conversation_id")
@@ -153,4 +164,8 @@ if __name__ == '__main__':
     print("  GET  /api/fabric/preflight - Fabric live-path readiness")
     print("=" * 60)
 
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(
+        host='0.0.0.0',
+        port=int(os.getenv("PORT", "5001")),
+        debug=os.getenv("FLASK_DEBUG", "false").lower() in ("true", "1", "yes"),
+    )
