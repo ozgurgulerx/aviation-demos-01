@@ -688,12 +688,22 @@ export default function ChatPage() {
       const status = voiceStatuses[message.id] || "idle";
       const isReusable =
         !!existingClip && existingClip.text === text && existingClip.language === language;
-      if (isReusable || status === "preparing") {
+      if (isReusable || status === "preparing" || status === "error") {
         continue;
       }
       void prepareVoiceClip(message.id, message.content);
     }
   }, [messages, prepareVoiceClip, stopVoicePlayback, voiceMode, voiceStatuses]);
+
+  useEffect(() => {
+    if (!speakingMessageId) {
+      return;
+    }
+    const messageStillVisible = messages.some((message) => message.id === speakingMessageId);
+    if (!messageStillVisible) {
+      stopVoicePlayback();
+    }
+  }, [messages, speakingMessageId, stopVoicePlayback]);
 
   useEffect(() => {
     if (voiceMode === "off") {
