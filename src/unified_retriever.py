@@ -62,6 +62,7 @@ FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "")
+FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -233,7 +234,7 @@ class UnifiedRetriever:
         matches = sorted(ROOT.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0] if matches else None
 
-    def _post_json(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_json(self, endpoint: str, payload: Any) -> Any:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -249,6 +250,48 @@ class UnifiedRetriever:
             return {"error": f"http_{exc.code}", "detail": exc.read().decode("utf-8", errors="ignore")}
         except Exception as exc:
             return {"error": str(exc)}
+
+    def _is_kusto_endpoint(self, endpoint: str) -> bool:
+        endpoint_l = (endpoint or "").lower()
+        return "kusto.fabric.microsoft.com" in endpoint_l
+
+    def _query_tokens(self, query: str) -> List[str]:
+        tokens = [t.upper() for t in re.findall(r"[A-Za-z0-9]{3,8}", query or "")]
+        deduped: List[str] = []
+        for token in tokens:
+            if token not in deduped:
+                deduped.append(token)
+            if len(deduped) >= 8:
+                break
+        return deduped
+
+    def _kusto_rows(self, endpoint: str, csl: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        db_name = FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "").strip()
+        if not db_name:
+            return [], "missing_fabric_kql_database"
+
+        response = self._post_json(endpoint, {"db": db_name, "csl": csl})
+        if isinstance(response, dict) and response.get("error"):
+            return [], str(response.get("error"))
+        if not isinstance(response, list):
+            return [], "unexpected_kusto_response_type"
+
+        for frame in response:
+            if not isinstance(frame, dict):
+                continue
+            if frame.get("FrameType") != "DataTable":
+                continue
+            if frame.get("TableKind") != "PrimaryResult":
+                continue
+
+            columns = [str(c.get("ColumnName", "")) for c in (frame.get("Columns") or []) if isinstance(c, dict)]
+            rows: List[Dict[str, Any]] = []
+            for row in frame.get("Rows") or []:
+                if not isinstance(row, list):
+                    continue
+                rows.append(dict(zip(columns, row)))
+            return rows, None
+        return [], "kusto_primary_result_not_found"
 
     def source_mode(self, source: str) -> str:
         source_norm = (source or "").upper()
@@ -542,20 +585,44 @@ class UnifiedRetriever:
     def query_kql(self, query: str, window_minutes: int = 60) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve event-window signals from Eventhouse or local fallback."""
         if FABRIC_KQL_ENDPOINT:
-            payload = {"query": query, "window_minutes": window_minutes}
-            response = self._post_json(FABRIC_KQL_ENDPOINT, payload)
-            if isinstance(response, dict) and "error" in response:
-                return [response], []
-            rows = response.get("rows", []) if isinstance(response, dict) else []
-            citation = Citation(
-                source_type="KQL",
-                identifier="eventhouse_live",
-                title="Fabric Eventhouse query",
-                content_preview=str(rows)[:120],
-                score=1.0,
-                dataset="fabric-eventhouse",
-            )
-            return rows, [citation]
+            if self._is_kusto_endpoint(FABRIC_KQL_ENDPOINT):
+                tokens = self._query_tokens(query)
+                if tokens:
+                    values = ",".join(f"'{t}'" for t in tokens)
+                    csl = (
+                        "opensky_states "
+                        f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                        "| take 50"
+                    )
+                else:
+                    csl = "opensky_states | take 50"
+
+                rows, _error = self._kusto_rows(FABRIC_KQL_ENDPOINT, csl)
+                if rows:
+                    citation = Citation(
+                        source_type="KQL",
+                        identifier="eventhouse_live",
+                        title="Fabric Eventhouse query",
+                        content_preview=str(rows)[:120],
+                        score=1.0,
+                        dataset="fabric-eventhouse",
+                    )
+                    return rows, [citation]
+            else:
+                payload = {"query": query, "window_minutes": window_minutes}
+                response = self._post_json(FABRIC_KQL_ENDPOINT, payload)
+                if isinstance(response, dict) and "error" not in response:
+                    rows = response.get("rows", [])
+                    if rows:
+                        citation = Citation(
+                            source_type="KQL",
+                            identifier="eventhouse_live",
+                            title="Fabric Eventhouse query",
+                            content_preview=str(rows)[:120],
+                            score=1.0,
+                            dataset="fabric-eventhouse",
+                        )
+                        return rows, [citation]
 
         # Local deterministic fallback for demo readiness.
         rows: List[Dict[str, Any]] = []
@@ -610,20 +677,40 @@ class UnifiedRetriever:
     def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve graph relationships from Fabric graph endpoint or local overlay graph."""
         if FABRIC_GRAPH_ENDPOINT:
-            payload = {"query": query, "hops": hops}
-            response = self._post_json(FABRIC_GRAPH_ENDPOINT, payload)
-            if isinstance(response, dict) and "error" in response:
-                return [response], []
-            paths = response.get("paths", []) if isinstance(response, dict) else []
-            citation = Citation(
-                source_type="GRAPH",
-                identifier="fabric_graph_live",
-                title="Fabric graph traversal",
-                content_preview=str(paths)[:120],
-                score=1.0,
-                dataset="fabric-graph",
-            )
-            return paths, [citation]
+            if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
+                tokens = self._query_tokens(query)
+                if tokens:
+                    values = ",".join(f"'{t}'" for t in tokens)
+                    csl = f"ops_graph_edges | where src_id in~ ({values}) or dst_id in~ ({values}) | take 50"
+                else:
+                    csl = "ops_graph_edges | take 30"
+
+                paths, _error = self._kusto_rows(FABRIC_GRAPH_ENDPOINT, csl)
+                if paths:
+                    citation = Citation(
+                        source_type="GRAPH",
+                        identifier="fabric_graph_live",
+                        title="Fabric graph traversal",
+                        content_preview=str(paths)[:120],
+                        score=1.0,
+                        dataset="fabric-graph",
+                    )
+                    return paths, [citation]
+            else:
+                payload = {"query": query, "hops": hops}
+                response = self._post_json(FABRIC_GRAPH_ENDPOINT, payload)
+                if isinstance(response, dict) and "error" not in response:
+                    paths = response.get("paths", [])
+                    if paths:
+                        citation = Citation(
+                            source_type="GRAPH",
+                            identifier="fabric_graph_live",
+                            title="Fabric graph traversal",
+                            content_preview=str(paths)[:120],
+                            score=1.0,
+                            dataset="fabric-graph",
+                        )
+                        return paths, [citation]
 
         graph_file = self._latest_matching("data/j-synthetic_ops_overlay/*/synthetic/ops_graph_edges.csv")
         if not graph_file:
@@ -663,20 +750,33 @@ class UnifiedRetriever:
     def query_nosql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve NoSQL-style records from endpoint or local NOTAM snapshots."""
         if FABRIC_NOSQL_ENDPOINT:
-            payload = {"query": query}
-            response = self._post_json(FABRIC_NOSQL_ENDPOINT, payload)
-            if isinstance(response, dict) and "error" in response:
-                return [response], []
-            docs = response.get("docs", []) if isinstance(response, dict) else []
-            citation = Citation(
-                source_type="NOSQL",
-                identifier="nosql_live",
-                title="NoSQL lookup",
-                content_preview=str(docs)[:120],
-                score=1.0,
-                dataset="nosql-live",
-            )
-            return docs, [citation]
+            if self._is_kusto_endpoint(FABRIC_NOSQL_ENDPOINT):
+                docs, _error = self._kusto_rows(FABRIC_NOSQL_ENDPOINT, "hazards_airsigmets | take 30")
+                if docs:
+                    citation = Citation(
+                        source_type="NOSQL",
+                        identifier="nosql_live",
+                        title="NoSQL lookup",
+                        content_preview=str(docs)[:120],
+                        score=1.0,
+                        dataset="nosql-live",
+                    )
+                    return docs, [citation]
+            else:
+                payload = {"query": query}
+                response = self._post_json(FABRIC_NOSQL_ENDPOINT, payload)
+                if isinstance(response, dict) and "error" not in response:
+                    docs = response.get("docs", [])
+                    if docs:
+                        citation = Citation(
+                            source_type="NOSQL",
+                            identifier="nosql_live",
+                            title="NoSQL lookup",
+                            content_preview=str(docs)[:120],
+                            score=1.0,
+                            dataset="nosql-live",
+                        )
+                        return docs, [citation]
 
         notam_file = self._latest_matching("data/h-notam_recent/*/search_location_istanbul.jsonl")
         docs: List[Dict[str, Any]] = []
