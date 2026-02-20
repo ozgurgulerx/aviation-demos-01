@@ -7,12 +7,13 @@ metadata:
     app: aviation-rag-backend
 spec:
   replicas: 2
-  progressDeadlineSeconds: 1200
+  minReadySeconds: 10
+  progressDeadlineSeconds: 1800
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: aviation-rag-backend
@@ -21,6 +22,7 @@ spec:
       labels:
         app: aviation-rag-backend
     spec:
+      terminationGracePeriodSeconds: 60
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -56,8 +58,8 @@ spec:
             name: backend-secrets
         resources:
           requests:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "384Mi"
+            cpu: "250m"
           limits:
             memory: "2Gi"
             cpu: "1"
@@ -67,23 +69,23 @@ spec:
             port: 5001
           periodSeconds: 10
           timeoutSeconds: 5
-          failureThreshold: 36
+          failureThreshold: 48
         livenessProbe:
           httpGet:
             path: /health
             port: 5001
-          initialDelaySeconds: 90
-          periodSeconds: 20
-          timeoutSeconds: 5
-          failureThreshold: 6
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 10
         readinessProbe:
           httpGet:
             path: /health
             port: 5001
-          initialDelaySeconds: 20
-          periodSeconds: 10
+          initialDelaySeconds: 30
+          periodSeconds: 15
           timeoutSeconds: 5
-          failureThreshold: 6
+          failureThreshold: 8
       imagePullSecrets:
       - name: acr-secret
 ---
