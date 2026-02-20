@@ -51,6 +51,17 @@ def _init_client() -> AzureOpenAI:
     )
 
 
+def _supports_explicit_temperature(model_name: str) -> bool:
+    model = (model_name or "").strip().lower()
+    return not (
+        model.startswith("gpt-5")
+        or model.startswith("o1")
+        or model.startswith("o3")
+        or model.startswith("o4")
+        or model == "model-router"
+    )
+
+
 ROUTER_PROMPT = """You are ROUTER_LLM for an aviation Pilot Brief demo.
 Output deterministic execution plan as JSON only.
 
@@ -82,7 +93,11 @@ Plan schema:
 class AgenticOrchestrator:
     def __init__(self):
         self.client = _init_client()
-        self.model = os.getenv("AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME", "gpt-5-mini")
+        self.model = (
+            os.getenv("AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME")
+            or os.getenv("AZURE_OPENAI_REASONING_DEPLOYMENT_NAME")
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-mini")
+        )
 
     def create_plan(
         self,
@@ -107,15 +122,18 @@ class AgenticOrchestrator:
         }
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
+            request_kwargs = {
+                "model": self.model,
+                "response_format": {"type": "json_object"},
+                "messages": [
                     {"role": "system", "content": ROUTER_PROMPT},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
                 ],
-            )
+            }
+            if _supports_explicit_temperature(self.model):
+                request_kwargs["temperature"] = 0
+
+            response = self.client.chat.completions.create(**request_kwargs)
             raw = response.choices[0].message.content or "{}"
             parsed = json.loads(raw)
             plan = AgenticPlan.from_dict(parsed)
