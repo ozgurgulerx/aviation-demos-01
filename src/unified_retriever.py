@@ -55,7 +55,27 @@ FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
-ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_project_root() -> Path:
+    module_dir = Path(__file__).resolve().parent
+    candidates = [module_dir, module_dir.parent]
+    marker_paths = [
+        Path("data/b-runways.csv"),
+        Path("data/a-metars.cache.csv.gz"),
+        Path("data/a-tafs.cache.xml.gz"),
+        Path("data/h-notam_recent"),
+    ]
+    for candidate in candidates:
+        if any((candidate / marker).exists() for marker in marker_paths):
+            return candidate
+    for candidate in candidates:
+        if (candidate / "contracts").exists():
+            return candidate
+    return module_dir
+
+
+ROOT = _resolve_project_root()
 
 CITY_AIRPORT_MAP: Dict[str, List[str]] = {
     "new york": ["KJFK", "KLGA", "KEWR"],
@@ -233,6 +253,7 @@ class UnifiedRetriever:
             model=os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME") or self.llm_deployment
         )
         self.use_legacy_sql_generator = _env_bool("USE_LEGACY_SQL_GENERATOR", False)
+        self._vector_k_param = self._detect_vector_k_param()
 
         # PII filter
         self.enable_pii_filter = enable_pii_filter
@@ -245,6 +266,20 @@ class UnifiedRetriever:
         else:
             self.pii_filter = None
             print("Warning: PII filter disabled")
+
+    def _detect_vector_k_param(self) -> str:
+        """Handle azure-search-documents SDK drift (k vs k_nearest_neighbors)."""
+        try:
+            import inspect
+
+            params = inspect.signature(VectorizedQuery.__init__).parameters
+            if "k" in params:
+                return "k"
+            if "k_nearest_neighbors" in params:
+                return "k_nearest_neighbors"
+        except Exception:
+            pass
+        return "k_nearest_neighbors"
 
     def get_embedding(self, text: str) -> List[float]:
         """Get embedding from Azure OpenAI."""
@@ -826,8 +861,11 @@ class UnifiedRetriever:
             return {"code": "sql_validation_failed", "detail": "only_select_or_with_queries_are_allowed"}
 
         dialect = (self.sql_dialect or "").lower()
-        if dialect == "sqlite" and re.search(r"\bILIKE\b", sql, flags=re.IGNORECASE):
-            return {"code": "sql_dialect_mismatch", "detail": "ILIKE is not supported by sqlite"}
+        if dialect == "sqlite":
+            if re.search(r"\bILIKE\b", sql, flags=re.IGNORECASE):
+                return {"code": "sql_dialect_mismatch", "detail": "ILIKE is not supported by sqlite"}
+            if re.search(r"::\s*[A-Za-z_][A-Za-z0-9_]*", sql):
+                return {"code": "sql_dialect_mismatch", "detail": "PostgreSQL-style :: casts are not supported by sqlite"}
 
         schema = self.current_sql_schema()
         available_tables = {str(t.get("table", "")).lower() for t in schema.get("tables", []) if isinstance(t, dict)}
@@ -962,11 +1000,12 @@ class UnifiedRetriever:
         if embedding is None:
             embedding = self.get_embedding(query)
 
-        vector_query = VectorizedQuery(
-            vector=embedding,
-            k_nearest_neighbors=top_raw,
-            fields="content_vector",
-        )
+        vector_kwargs: Dict[str, Any] = {
+            "vector": embedding,
+            "fields": "content_vector",
+        }
+        vector_kwargs[self._vector_k_param] = top_raw
+        vector_query = VectorizedQuery(**vector_kwargs)
 
         select_fields = [
             "id",
@@ -1003,9 +1042,23 @@ class UnifiedRetriever:
                 try:
                     results = client.search(**search_kwargs)
                 except Exception as fallback_exc:
-                    return [{"error": str(fallback_exc), "index": index_name}], []
+                    return [
+                        self._source_error_row(
+                            source=source,
+                            code="semantic_runtime_error",
+                            detail=str(fallback_exc),
+                            extra={"index": index_name},
+                        )
+                    ], []
             else:
-                return [{"error": str(exc), "index": index_name}], []
+                return [
+                    self._source_error_row(
+                        source=source,
+                        code="semantic_runtime_error",
+                        detail=str(exc),
+                        extra={"index": index_name},
+                    )
+                ], []
 
         results_list: List[Dict[str, Any]] = []
         citations: List[Citation] = []

@@ -72,6 +72,17 @@ class SourceExecutionPolicyTests(unittest.TestCase):
 
         self.assertEqual(rows[0].get("error_code"), "sql_dialect_mismatch")
 
+    def test_execute_sql_query_flags_postgres_cast_mismatch(self):
+        retriever = self._build_retriever()
+        cur = retriever.db.cursor()
+        cur.execute("CREATE TABLE asrs_reports (id INTEGER PRIMARY KEY, title TEXT)")
+
+        rows, _citations = retriever.execute_sql_query(
+            "SELECT id::integer FROM asrs_reports"
+        )
+
+        self.assertEqual(rows[0].get("error_code"), "sql_dialect_mismatch")
+
     def test_execute_sql_query_flags_missing_table(self):
         retriever = self._build_retriever()
         rows, _citations = retriever.execute_sql_query("SELECT * FROM missing_table")
@@ -173,6 +184,22 @@ class SourceExecutionPolicyTests(unittest.TestCase):
             source="UNKNOWN",
         )
         self.assertEqual(rows[0].get("error_code"), "source_unavailable")
+
+    def test_vector_query_search_failure_returns_structured_error(self):
+        retriever = self._build_retriever()
+
+        class _BrokenClient:
+            def search(self, **_kwargs):
+                raise RuntimeError("search backend failure")
+
+        retriever.search_clients = {"idx_ops_narratives": _BrokenClient()}
+        rows, _citations = retriever.query_semantic(
+            "runway risk",
+            top=1,
+            embedding=[0.0] * 1536,
+            source="VECTOR_OPS",
+        )
+        self.assertEqual(rows[0].get("error_code"), "semantic_runtime_error")
 
     def test_unknown_source_returns_error(self):
         retriever = self._build_retriever()
