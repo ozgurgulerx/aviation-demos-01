@@ -49,6 +49,7 @@ interface ChatThreadProps {
   onSpeakMessage?: (messageId: string, content: string) => void;
   speakingMessageId?: string | null;
   voiceEnabled?: boolean;
+  voiceStatuses?: Record<string, "idle" | "preparing" | "ready" | "error">;
   onSendMessage?: (message: string) => void;
 }
 
@@ -83,6 +84,7 @@ export function ChatThread({
   onSpeakMessage,
   speakingMessageId,
   voiceEnabled = true,
+  voiceStatuses = {},
   onSendMessage,
 }: ChatThreadProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -171,6 +173,7 @@ export function ChatThread({
                 onSpeakMessage={onSpeakMessage}
                 isSpeaking={speakingMessageId === message.id}
                 voiceEnabled={voiceEnabled}
+                voiceStatus={voiceStatuses[message.id] || "idle"}
               />
             ))}
 

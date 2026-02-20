@@ -44,6 +44,7 @@ OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 LLM_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
+OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 # Azure AI Search configuration
 SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
@@ -144,7 +145,7 @@ class UnifiedRetriever:
             self.llm = AzureOpenAI(
                 azure_endpoint=OPENAI_ENDPOINT,
                 api_key=OPENAI_KEY,
-                api_version="2024-06-01",
+                api_version=OPENAI_API_VERSION,
                 **_client_tuning_kwargs(),
             )
         else:
@@ -155,7 +156,7 @@ class UnifiedRetriever:
             self.llm = AzureOpenAI(
                 azure_endpoint=OPENAI_ENDPOINT,
                 azure_ad_token_provider=token_provider,
-                api_version="2024-06-01",
+                api_version=OPENAI_API_VERSION,
                 **_client_tuning_kwargs(),
             )
 

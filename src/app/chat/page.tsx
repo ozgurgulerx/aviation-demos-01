@@ -47,6 +47,7 @@ type RetrievalMode = "code-rag" | "foundry-iq";
 type QueryProfile = "pilot-brief" | "ops-live" | "compliance";
 type DemoScenario = "none" | "weather-spike" | "runway-notam" | "ground-bottleneck";
 type VoiceMode = "off" | "tr-TR" | "en-US";
+type VoiceClipStatus = "idle" | "preparing" | "ready" | "error";
 
 function createInitialSourceHealth(): SourceHealthStatus[] {
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
@@ -381,15 +382,18 @@ export default function ChatPage() {
   const [operationalAlert, setOperationalAlert] = useState<OperationalAlert | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>("tr-TR");
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [voiceStatuses, setVoiceStatuses] = useState<Record<string, VoiceClipStatus>>({});
 
   const speechRequestRef = useRef(0);
+  const voicePreparationSeqRef = useRef(0);
+  const voicePreparationByMessageRef = useRef<Record<string, number>>({});
+  const voiceClipByMessageRef = useRef<Record<string, { blob: Blob; text: string; language: string }>>({});
   const retrievalProgressRef = useRef<{ sources: Set<string>; callCount: number }>({
     sources: new Set<string>(),
     callCount: 0,
   });
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   const emitReasoningEvent = useCallback(
     (stage: ReasoningStage, payload?: ReasoningEventPayload, ts?: string) => {
@@ -445,6 +449,9 @@ export default function ChatPage() {
     setRouteLabel("Pending");
     setConfidenceLabel("Awaiting run");
     setOperationalAlert(null);
+    setVoiceStatuses({});
+    voiceClipByMessageRef.current = {};
+    voicePreparationByMessageRef.current = {};
     retrievalProgressRef.current = { sources: new Set<string>(), callCount: 0 };
   }, []);
 
@@ -463,6 +470,9 @@ export default function ChatPage() {
     setShowFollowUps(true);
     setReasoningEvents([]);
     setSourceSnapshots({});
+    setVoiceStatuses({});
+    voiceClipByMessageRef.current = {};
+    voicePreparationByMessageRef.current = {};
     retrievalProgressRef.current = { sources: new Set<string>(), callCount: 0 };
   }, []);
 
@@ -527,36 +537,47 @@ export default function ChatPage() {
       URL.revokeObjectURL(audioUrlRef.current);
       audioUrlRef.current = null;
     }
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-
-    utteranceRef.current = null;
     setSpeakingMessageId(null);
   }, []);
 
-  const speakMessage = useCallback(
-    async (messageId: string, rawContent: string) => {
-      if (voiceMode === "off") return;
+  const setVoiceStatus = useCallback((messageId: string, status: VoiceClipStatus) => {
+    setVoiceStatuses((previous) => {
+      if (previous[messageId] === status) {
+        return previous;
+      }
+      return {
+        ...previous,
+        [messageId]: status,
+      };
+    });
+  }, []);
+
+  const clearVoiceClips = useCallback(() => {
+    setVoiceStatuses({});
+    voiceClipByMessageRef.current = {};
+    voicePreparationByMessageRef.current = {};
+  }, []);
+
+  const prepareVoiceClip = useCallback(
+    async (messageId: string, rawContent: string): Promise<boolean> => {
+      if (voiceMode === "off") return false;
 
       const text = toSpeechText(rawContent);
-      if (!text) return;
-
-      if (speakingMessageId === messageId) {
-        stopVoicePlayback();
-        return;
+      if (!text) {
+        setVoiceStatus(messageId, "error");
+        return false;
       }
 
-      stopVoicePlayback();
-      const requestId = speechRequestRef.current;
       const language = voiceMode === "tr-TR" ? "tr-TR" : "en-US";
-      setSpeakingMessageId(messageId);
+      const existingClip = voiceClipByMessageRef.current[messageId];
+      if (existingClip && existingClip.text === text && existingClip.language === language) {
+        setVoiceStatus(messageId, "ready");
+        return true;
+      }
 
-      const finishIfActive = () => {
-        if (speechRequestRef.current === requestId) {
-          setSpeakingMessageId(null);
-        }
-      };
+      const preparationId = ++voicePreparationSeqRef.current;
+      voicePreparationByMessageRef.current[messageId] = preparationId;
+      setVoiceStatus(messageId, "preparing");
 
       try {
         const response = await fetch("/api/voice/speak", {
@@ -569,63 +590,123 @@ export default function ChatPage() {
         }
 
         const blob = await response.blob();
-        if (speechRequestRef.current !== requestId) return;
+        if (voicePreparationByMessageRef.current[messageId] !== preparationId) {
+          return false;
+        }
 
-        const audioUrl = URL.createObjectURL(blob);
-        audioUrlRef.current = audioUrl;
-        const audio = new Audio(audioUrl);
-        audioRef.current = audio;
-        audio.onended = () => {
-          if (audioUrlRef.current) {
-            URL.revokeObjectURL(audioUrlRef.current);
-            audioUrlRef.current = null;
-          }
-          audioRef.current = null;
-          finishIfActive();
+        voiceClipByMessageRef.current[messageId] = {
+          blob,
+          text,
+          language,
         };
-        audio.onerror = () => {
-          if (audioUrlRef.current) {
-            URL.revokeObjectURL(audioUrlRef.current);
-            audioUrlRef.current = null;
-          }
-          audioRef.current = null;
-          finishIfActive();
-        };
-        await audio.play();
-        return;
+        setVoiceStatus(messageId, "ready");
+        return true;
       } catch {
-        // Fall back to browser speech synthesis if model audio fails.
+        if (voicePreparationByMessageRef.current[messageId] !== preparationId) {
+          return false;
+        }
+        delete voiceClipByMessageRef.current[messageId];
+        setVoiceStatus(messageId, "error");
+        return false;
       }
+    },
+    [setVoiceStatus, voiceMode]
+  );
 
-      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-        finishIfActive();
+  const speakMessage = useCallback(
+    async (messageId: string, rawContent: string) => {
+      if (voiceMode === "off") return;
+
+      const text = toSpeechText(rawContent);
+      if (!text) {
+        setVoiceStatus(messageId, "error");
         return;
       }
 
-      const synthesis = window.speechSynthesis;
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = language;
-
-      const availableVoices = synthesis
-        .getVoices()
-        .filter((voice) => voice.lang.toLowerCase().startsWith(language.toLowerCase()));
-      if (availableVoices.length > 0) {
-        utterance.voice = availableVoices[0];
+      if (speakingMessageId === messageId) {
+        stopVoicePlayback();
+        return;
       }
 
-      utterance.onend = finishIfActive;
-      utterance.onerror = finishIfActive;
-      utteranceRef.current = utterance;
-      synthesis.speak(utterance);
+      const language = voiceMode === "tr-TR" ? "tr-TR" : "en-US";
+      const existingClip = voiceClipByMessageRef.current[messageId];
+      let clip = existingClip;
+
+      if (!clip || clip.text !== text || clip.language !== language) {
+        const prepared = await prepareVoiceClip(messageId, rawContent);
+        if (!prepared) return;
+        clip = voiceClipByMessageRef.current[messageId];
+      }
+      if (!clip) return;
+
+      stopVoicePlayback();
+      const requestId = speechRequestRef.current;
+      const audioUrl = URL.createObjectURL(clip.blob);
+      audioUrlRef.current = audioUrl;
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+      setSpeakingMessageId(messageId);
+
+      const finishIfActive = () => {
+        if (audioUrlRef.current) {
+          URL.revokeObjectURL(audioUrlRef.current);
+          audioUrlRef.current = null;
+        }
+        audioRef.current = null;
+        if (speechRequestRef.current === requestId) {
+          setSpeakingMessageId(null);
+        }
+      };
+
+      audio.onended = finishIfActive;
+      audio.onerror = () => {
+        setVoiceStatus(messageId, "error");
+        finishIfActive();
+      };
+
+      try {
+        await audio.play();
+      } catch {
+        setVoiceStatus(messageId, "error");
+        finishIfActive();
+      }
     },
-    [voiceMode, speakingMessageId, stopVoicePlayback]
+    [prepareVoiceClip, setVoiceStatus, speakingMessageId, stopVoicePlayback, voiceMode]
   );
+
+  useEffect(() => {
+    if (voiceMode === "off") {
+      stopVoicePlayback();
+      return;
+    }
+
+    for (const message of messages) {
+      if (message.role !== "assistant") continue;
+      const text = toSpeechText(message.content);
+      const language = voiceMode === "tr-TR" ? "tr-TR" : "en-US";
+      const existingClip = voiceClipByMessageRef.current[message.id];
+      const status = voiceStatuses[message.id] || "idle";
+      const isReusable =
+        !!existingClip && existingClip.text === text && existingClip.language === language;
+      if (isReusable || status === "preparing") {
+        continue;
+      }
+      void prepareVoiceClip(message.id, message.content);
+    }
+  }, [messages, prepareVoiceClip, stopVoicePlayback, voiceMode, voiceStatuses]);
+
+  useEffect(() => {
+    if (voiceMode === "off") {
+      clearVoiceClips();
+    }
+  }, [clearVoiceClips, voiceMode]);
 
   useEffect(() => {
     return () => {
       stopVoicePlayback();
+      clearVoiceClips();
     };
-  }, [stopVoicePlayback]);
+  }, [clearVoiceClips, stopVoicePlayback]);
 
   const handleSendMessage = useCallback(
     async (content: string) => {
@@ -811,9 +892,6 @@ export default function ChatPage() {
         };
 
         setMessages((previous) => [...previous, assistantMessage]);
-        if (voiceMode !== "off") {
-          void speakMessage(assistantMessage.id, assistantMessage.content);
-        }
 
         if (newCitations.length > 0) {
           setCitations((previous) => {
@@ -861,9 +939,6 @@ export default function ChatPage() {
         };
 
         setMessages((previous) => [...previous, errorMessage]);
-        if (voiceMode !== "off") {
-          void speakMessage(errorMessage.id, errorMessage.content);
-        }
         setTimelineEvents((previous) => [
           ...previous,
           {
@@ -900,8 +975,6 @@ export default function ChatPage() {
       explainRetrieval,
       demoScenario,
       stopVoicePlayback,
-      voiceMode,
-      speakMessage,
       emitReasoningEvent,
       markEvidenceRetrieval,
     ]
@@ -1101,6 +1174,7 @@ export default function ChatPage() {
             void speakMessage(messageId, content);
           }}
           speakingMessageId={speakingMessageId}
+          voiceStatuses={voiceStatuses}
           voiceEnabled={voiceMode !== "off"}
           onSendMessage={(message) => {
             void handleSendMessage(message);

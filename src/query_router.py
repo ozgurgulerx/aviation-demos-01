@@ -12,6 +12,8 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 load_dotenv()
 
+OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+
 
 def _client_tuning_kwargs() -> dict:
     try:
@@ -75,7 +77,7 @@ class QueryRouter:
             self.client = AzureOpenAI(
                 azure_endpoint=endpoint,
                 api_key=api_key,
-                api_version="2024-06-01",
+                api_version=OPENAI_API_VERSION,
                 **_client_tuning_kwargs(),
             )
         else:
@@ -86,7 +88,7 @@ class QueryRouter:
             self.client = AzureOpenAI(
                 azure_endpoint=endpoint,
                 azure_ad_token_provider=token_provider,
-                api_version="2024-06-01",
+                api_version=OPENAI_API_VERSION,
                 **_client_tuning_kwargs(),
             )
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
