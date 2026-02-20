@@ -13,6 +13,9 @@ class _DummyRetriever:
     def source_event_meta(self, source: str):
         return {"source": source, "endpoint_label": "test", "freshness": "test"}
 
+    def source_mode(self, source: str):
+        return "live"
+
     def query_nosql(self, query: str):
         if "one" in query:
             return [{"id": "n1", "value": 1}], []
@@ -41,6 +44,10 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertIn("call_2", result.source_results_by_call)
         self.assertEqual(rows[0].get("__call_id"), "call_1")
         self.assertEqual(rows[1].get("__call_id"), "call_2")
+        done_events = [e for e in result.source_traces if e.get("type") == "source_call_done"]
+        self.assertTrue(done_events)
+        self.assertEqual(done_events[0].get("contract_status"), "met")
+        self.assertEqual(done_events[0].get("execution_mode"), "live")
 
 
 if __name__ == "__main__":

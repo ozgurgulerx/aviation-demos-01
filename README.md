@@ -37,6 +37,12 @@ The project includes an end-to-end ASRS ingestion flow:
 - Token-mode options: `AZURE_OPENAI_TENANT_ID`, `AZURE_OPENAI_CLIENT_ID`, `AZURE_OPENAI_CLIENT_SECRET`, or managed identity (`AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID`)
 - `APPLICATIONINSIGHTS_CONNECTION_STRING` (recommended for runtime telemetry export)
 - DB settings when using postgres mode: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`
+- Optional SQL execution controls: `USE_POSTGRES`, `SQL_DIALECT`
+- Optional strict source policy controls:
+  `RETRIEVAL_STRICT_SOURCE_MODE`, `ALLOW_SQLITE_FALLBACK`,
+  `ALLOW_MOCK_KQL_FALLBACK`, `ALLOW_MOCK_GRAPH_FALLBACK`,
+  `ALLOW_MOCK_NOSQL_FALLBACK`
+- Optional schema controls: `SCHEMA_CACHE_TTL_SECONDS`, `KQL_SCHEMA_MODE`, `FABRIC_KQL_SCHEMA_JSON`
 
 #### Monthly run (recommended)
 
@@ -153,6 +159,14 @@ The chat API supports retrieval planning hints (all optional):
 - `requiredSources` (example: `["SQL","KQL","GRAPH","VECTOR_REG"]`)
 - `freshnessSlaMinutes` (for live-window queries)
 - `explainRetrieval` (`true` to include detailed planner reasoning)
+
+### Source Execution Policy
+
+Selected sources can be enforced with strict execution policy:
+
+- `RETRIEVAL_STRICT_SOURCE_MODE=true` makes unavailable sources fail explicitly instead of silently using mock/fallback data.
+- `ALLOW_SQLITE_FALLBACK`, `ALLOW_MOCK_KQL_FALLBACK`, `ALLOW_MOCK_GRAPH_FALLBACK`, `ALLOW_MOCK_NOSQL_FALLBACK` control fallback behavior per source.
+- `SQL_DIALECT` (`postgres` or `sqlite`) enables basic dialect validation before SQL execution.
 
 ## Fabric Service Principal Access
 

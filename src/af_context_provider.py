@@ -369,9 +369,13 @@ class AviationRagContextProvider:
                     {
                         "type": "source_call_start",
                         "source": step.source,
+                        "planned_source": step.source,
+                        "executed_source": step.source,
                         "reason": step.reason,
                         "priority": step.priority,
                         "source_meta": self.retriever.source_event_meta(step.source),
+                        "execution_mode": self.retriever.source_mode(step.source),
+                        "contract_status": "planned",
                         "timestamp": _utc_now(),
                     }
                 )
@@ -383,14 +387,29 @@ class AviationRagContextProvider:
                 try:
                     source, rows, row_citations, out_sql = future.result()
                     step_outputs[idx] = (source, rows, row_citations, out_sql)
+                    has_row_errors = any(
+                        isinstance(row, dict) and (row.get("error") or row.get("error_code"))
+                        for row in rows
+                    )
+                    execution_mode = self.retriever.source_mode(source)
+                    if has_row_errors:
+                        contract_status = "failed"
+                    elif execution_mode == "fallback":
+                        contract_status = "degraded"
+                    else:
+                        contract_status = "met"
                     columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
                     source_traces.append(
                         {
                             "type": "source_call_done",
                             "source": source,
+                            "planned_source": step.source,
+                            "executed_source": source,
                             "row_count": len(rows),
                             "citation_count": len(row_citations),
                             "source_meta": self.retriever.source_event_meta(source),
+                            "execution_mode": execution_mode,
+                            "contract_status": contract_status,
                             "timestamp": _utc_now(),
                             "columns": columns,
                             "rows_preview": rows_preview,
@@ -406,10 +425,14 @@ class AviationRagContextProvider:
                         {
                             "type": "source_call_done",
                             "source": step.source,
+                            "planned_source": step.source,
+                            "executed_source": step.source,
                             "row_count": 1,
                             "citation_count": 0,
                             "error": str(exc),
                             "source_meta": self.retriever.source_event_meta(step.source),
+                            "execution_mode": self.retriever.source_mode(step.source),
+                            "contract_status": "failed",
                             "timestamp": _utc_now(),
                             "columns": columns,
                             "rows_preview": rows_preview,

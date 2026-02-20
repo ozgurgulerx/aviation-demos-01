@@ -25,6 +25,7 @@ from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 
 from query_router import QueryRouter
+from query_writers import SQLWriter
 from sql_generator import SQLGenerator
 from pii_filter import PiiFilter, PiiCheckResult
 
@@ -77,6 +78,13 @@ def _client_tuning_kwargs() -> dict:
     except Exception:
         max_retries = 1
     return {"timeout": timeout_seconds, "max_retries": max_retries}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
 @dataclass
@@ -178,11 +186,24 @@ class UnifiedRetriever:
         else:
             print("Warning: Azure AI Search is not configured; semantic retrieval will be unavailable.")
 
-        # Database connection - SQLite or PostgreSQL
+        # Source execution policy and dialect controls.
+        self.strict_source_mode = _env_bool("RETRIEVAL_STRICT_SOURCE_MODE", False)
+        self.allow_sqlite_fallback = _env_bool("ALLOW_SQLITE_FALLBACK", not self.strict_source_mode)
+        self.allow_mock_kql_fallback = _env_bool("ALLOW_MOCK_KQL_FALLBACK", not self.strict_source_mode)
+        self.allow_mock_graph_fallback = _env_bool("ALLOW_MOCK_GRAPH_FALLBACK", not self.strict_source_mode)
+        self.allow_mock_nosql_fallback = _env_bool("ALLOW_MOCK_NOSQL_FALLBACK", not self.strict_source_mode)
+        self.allow_legacy_sql_fallback = _env_bool("ALLOW_LEGACY_SQL_FALLBACK", not self.strict_source_mode)
+
+        # Database connection - SQLite or PostgreSQL.
         self.use_postgres = USE_POSTGRES
+        self.db = None
+        self.sql_backend = "unavailable"
+        self.sql_available = False
+        self.sql_unavailable_reason = ""
         if self.use_postgres:
             try:
                 import psycopg2
+
                 self.db = psycopg2.connect(
                     host=os.getenv("PGHOST"),
                     port=int(os.getenv("PGPORT", 5432)),
@@ -193,20 +214,38 @@ class UnifiedRetriever:
                     connect_timeout=5,
                 )
                 self.db.autocommit = True
+                self.sql_backend = "postgres"
+                self.sql_available = True
                 print(f"Connected to PostgreSQL: {os.getenv('PGHOST')}/{os.getenv('PGDATABASE', 'aviationdb')}")
             except Exception as exc:
-                self.use_postgres = False
-                self.db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-                self.db.row_factory = sqlite3.Row
-                print(f"Warning: PostgreSQL unavailable ({exc}); falling back to SQLite: {DB_PATH}")
+                self.sql_unavailable_reason = str(exc)
+                if self.allow_sqlite_fallback:
+                    self.use_postgres = False
+                    self.db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+                    self.db.row_factory = sqlite3.Row
+                    self.sql_backend = "sqlite-fallback"
+                    self.sql_available = True
+                    print(f"Warning: PostgreSQL unavailable ({exc}); falling back to SQLite: {DB_PATH}")
+                else:
+                    self.db = None
+                    self.sql_backend = "unavailable"
+                    self.sql_available = False
+                    print(f"Warning: PostgreSQL unavailable and fallback disabled ({exc})")
         else:
             self.db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
             self.db.row_factory = sqlite3.Row
+            self.sql_backend = "sqlite"
+            self.sql_available = True
             print(f"Connected to SQLite: {DB_PATH}")
+
+        dialect_default = "postgres" if self.use_postgres else "sqlite"
+        self.sql_dialect = (os.getenv("SQL_DIALECT", dialect_default) or dialect_default).strip().lower()
 
         # Specialized components
         self.router = QueryRouter()
         self.sql_generator = SQLGenerator()
+        self.sql_writer = SQLWriter(model=os.getenv("AZURE_OPENAI_WORKER_DEPLOYMENT_NAME") or LLM_DEPLOYMENT)
+        self.use_legacy_sql_generator = _env_bool("USE_LEGACY_SQL_GENERATOR", False)
 
         # PII filter
         self.enable_pii_filter = enable_pii_filter
@@ -294,18 +333,49 @@ class UnifiedRetriever:
             return rows, None
         return [], "kusto_primary_result_not_found"
 
+    def _source_error_row(
+        self, source: str, code: str, detail: str, extra: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "error": detail,
+            "error_code": code,
+            "source": source,
+            "strict_mode": self.strict_source_mode,
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _source_unavailable_row(self, source: str, detail: str) -> Dict[str, Any]:
+        return self._source_error_row(
+            source=source,
+            code="source_unavailable",
+            detail=detail,
+            extra={"execution_mode": self.source_mode(source)},
+        )
+
     def source_mode(self, source: str) -> str:
         source_norm = (source or "").upper()
-        if source_norm == "KQL":
-            return "live" if FABRIC_KQL_ENDPOINT else "fallback"
-        if source_norm == "GRAPH":
-            return "live" if FABRIC_GRAPH_ENDPOINT else "fallback"
-        if source_norm == "NOSQL":
-            return "live" if FABRIC_NOSQL_ENDPOINT else "fallback"
         if source_norm == "SQL":
-            return "live" if self.use_postgres else "fallback"
+            if not self.sql_available:
+                return "blocked"
+            if self.sql_backend == "postgres":
+                return "live"
+            return "fallback"
+        if source_norm == "KQL":
+            if FABRIC_KQL_ENDPOINT:
+                return "live"
+            return "fallback" if self.allow_mock_kql_fallback else "blocked"
+        if source_norm == "GRAPH":
+            if FABRIC_GRAPH_ENDPOINT:
+                return "live"
+            return "fallback" if self.allow_mock_graph_fallback else "blocked"
+        if source_norm == "NOSQL":
+            if FABRIC_NOSQL_ENDPOINT:
+                return "live"
+            return "fallback" if self.allow_mock_nosql_fallback else "blocked"
         if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
-            return "live" if self.search_clients else "fallback"
+            return "live" if self.search_clients else "blocked"
         return "unknown"
 
     def source_event_meta(self, source: str) -> Dict[str, Any]:
@@ -332,6 +402,8 @@ class UnifiedRetriever:
             "store_type": store_type_map.get(source_norm, "unknown"),
             "endpoint_label": self.source_mode(source_norm),
             "freshness": freshness_map.get(source_norm, "unknown"),
+            "strict_source_mode": self.strict_source_mode,
+            "sql_backend": self.sql_backend if source_norm == "SQL" else "",
         }
 
     def _probe_endpoint(self, endpoint: str, timeout_seconds: int = 5) -> Dict[str, Any]:
@@ -367,6 +439,22 @@ class UnifiedRetriever:
                 "mode": "n/a",
             }
         )
+        checks.append(
+            {
+                "name": "strict_source_mode",
+                "status": "pass",
+                "detail": "enabled" if self.strict_source_mode else "disabled",
+                "mode": "policy",
+            }
+        )
+        checks.append(
+            {
+                "name": "kql_schema_mode",
+                "status": "pass",
+                "detail": os.getenv("KQL_SCHEMA_MODE", "static"),
+                "mode": "policy",
+            }
+        )
 
         endpoint_checks = [
             ("fabric_kql_endpoint", FABRIC_KQL_ENDPOINT or "", "KQL"),
@@ -390,6 +478,25 @@ class UnifiedRetriever:
                 }
             )
 
+        sql_mode = self.source_mode("SQL")
+        checks.append(
+            {
+                "name": "sql_connectivity",
+                "status": "pass" if self.sql_available else "fail",
+                "detail": self.sql_backend if self.sql_available else (self.sql_unavailable_reason or "sql_not_available"),
+                "mode": sql_mode,
+            }
+        )
+        sql_schema = self.current_sql_schema()
+        checks.append(
+            {
+                "name": "sql_schema_snapshot",
+                "status": "pass" if sql_schema.get("tables") else ("fail" if self.strict_source_mode else "warn"),
+                "detail": f"tables={len(sql_schema.get('tables', []))}",
+                "mode": sql_mode,
+            }
+        )
+
         fallback_ready = bool(
             self._latest_matching("data/e-opensky_recent/opensky_states_all_*.json")
             or self._latest_matching("data/a-metars.cache.csv.gz")
@@ -404,6 +511,17 @@ class UnifiedRetriever:
             }
         )
 
+        strict_blockers = [c["name"] for c in checks if c.get("mode") == "blocked"]
+        if self.strict_source_mode and strict_blockers:
+            checks.append(
+                {
+                    "name": "strict_mode_blockers",
+                    "status": "fail",
+                    "detail": ",".join(strict_blockers),
+                    "mode": "policy",
+                }
+            )
+
         if any(c["status"] == "fail" for c in checks):
             overall = "fail"
         elif any(c["status"] == "warn" for c in checks):
@@ -415,8 +533,145 @@ class UnifiedRetriever:
             "timestamp": self._now_iso(),
             "overall_status": overall,
             "live_path_available": live_configured,
+            "strict_source_mode": self.strict_source_mode,
             "checks": checks,
         }
+
+    def current_sql_schema(self) -> Dict[str, Any]:
+        if self.db is None:
+            return {
+                "source": "unavailable",
+                "collected_at": self._now_iso(),
+                "schema_version": "none",
+                "error": self.sql_unavailable_reason or "sql_connection_unavailable",
+                "tables": [],
+            }
+
+        tables: List[Dict[str, Any]] = []
+        try:
+            cur = self.db.cursor()
+            if self.use_postgres:
+                cur.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema='public'
+                    ORDER BY table_name
+                    """
+                )
+                table_names = [str(row[0]) for row in cur.fetchall()]
+                for table in table_names:
+                    cur.execute(
+                        """
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name=%s
+                        ORDER BY ordinal_position
+                        """,
+                        (table,),
+                    )
+                    cols = [{"name": str(r[0]), "type": str(r[1])} for r in cur.fetchall()]
+                    tables.append({"table": table, "columns": cols})
+            else:
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                table_names = [str(row[0]) for row in cur.fetchall()]
+                for table in table_names:
+                    cur.execute(f"PRAGMA table_info('{table}')")
+                    cols = [{"name": str(r[1]), "type": str(r[2])} for r in cur.fetchall()]
+                    tables.append({"table": table, "columns": cols})
+        except Exception as exc:
+            return {
+                "source": "live" if self.sql_backend == "postgres" else "fallback",
+                "collected_at": self._now_iso(),
+                "schema_version": "error",
+                "error": str(exc),
+                "tables": [],
+            }
+        return {
+            "source": "live" if self.sql_backend == "postgres" else "fallback",
+            "collected_at": self._now_iso(),
+            "schema_version": f"tables:{len(tables)}",
+            "tables": tables,
+        }
+
+    def _detect_sql_tables(self, sql_query: str) -> List[str]:
+        table_tokens = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.]*)", sql_query, flags=re.IGNORECASE)
+        cleaned: List[str] = []
+        for token in table_tokens:
+            table = token.strip().strip('"').strip("`")
+            table = table.split(".")[-1]
+            if table and table not in cleaned:
+                cleaned.append(table)
+        return cleaned
+
+    def _validate_sql_query(self, sql_query: str) -> Optional[Dict[str, Any]]:
+        sql = (sql_query or "").strip()
+        if not sql:
+            return {"code": "sql_validation_failed", "detail": "empty_sql_query"}
+        if not re.match(r"^\s*(SELECT|WITH)\b", sql, flags=re.IGNORECASE):
+            return {"code": "sql_validation_failed", "detail": "only_select_or_with_queries_are_allowed"}
+
+        dialect = (self.sql_dialect or "").lower()
+        if dialect == "sqlite" and re.search(r"\bILIKE\b", sql, flags=re.IGNORECASE):
+            return {"code": "sql_dialect_mismatch", "detail": "ILIKE is not supported by sqlite"}
+
+        schema = self.current_sql_schema()
+        available_tables = {str(t.get("table", "")).lower() for t in schema.get("tables", []) if isinstance(t, dict)}
+        referenced_tables = self._detect_sql_tables(sql)
+        missing_tables = [t for t in referenced_tables if t.lower() not in available_tables]
+        if missing_tables:
+            return {
+                "code": "sql_schema_missing",
+                "detail": f"missing tables in current schema: {', '.join(missing_tables)}",
+            }
+        return None
+
+    def execute_sql_query(self, sql_query: str) -> Tuple[List[Dict[str, Any]], List[Citation]]:
+        if not self.sql_available or self.db is None:
+            return [self._source_unavailable_row("SQL", self.sql_unavailable_reason or "sql_backend_not_available")], []
+
+        validation_error = self._validate_sql_query(sql_query)
+        if validation_error:
+            return [
+                self._source_error_row(
+                    source="SQL",
+                    code=str(validation_error.get("code")),
+                    detail=str(validation_error.get("detail")),
+                    extra={"sql": sql_query},
+                )
+            ], []
+
+        try:
+            cur = self.db.cursor()
+            cur.execute(sql_query)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+            dict_rows = [dict(zip(columns, row)) for row in rows]
+        except Exception as exc:
+            return [
+                self._source_error_row(
+                    source="SQL",
+                    code="sql_runtime_error",
+                    detail=str(exc),
+                    extra={"sql": sql_query},
+                )
+            ], []
+
+        citations: List[Citation] = []
+        for idx, row in enumerate(dict_rows[:10], start=1):
+            row_id = row.get("id") or row.get("asrs_report_id") or f"row_{idx}"
+            title = row.get("title") or row.get("facilityDesignator") or f"SQL row {idx}"
+            citations.append(
+                Citation(
+                    source_type="SQL",
+                    identifier=str(row_id),
+                    title=str(title),
+                    content_preview=str(row)[:120],
+                    score=0.9,
+                    dataset="aviation_db",
+                )
+            )
+        return dict_rows, citations
 
     # =========================================================================
     # Core Retrieval Methods
@@ -424,38 +679,39 @@ class UnifiedRetriever:
 
     def query_sql(self, query: str, sql_hint: str = None) -> Tuple[List[Dict], str, List[Citation]]:
         """Execute SQL query against the aviation database."""
+        if not self.sql_available:
+            row = self._source_unavailable_row("SQL", self.sql_unavailable_reason or "sql_backend_not_available")
+            return [row], "", []
+
         if sql_hint:
             enhanced_query = f"{query}\nHint: {sql_hint}"
         else:
             enhanced_query = query
 
-        sql = self.sql_generator.generate(enhanced_query)
-
-        # [TBD: Add PostgreSQL schema prefix if needed]
-
-        citations = []
         try:
-            cur = self.db.cursor()
-            cur.execute(sql)
-            rows = cur.fetchall()
-            columns = [desc[0] for desc in cur.description]
-            results = [dict(zip(columns, row)) for row in rows]
+            if self.use_legacy_sql_generator:
+                sql = self.sql_generator.generate(enhanced_query)
+            else:
+                schema = self.current_sql_schema()
+                sql = self.sql_writer.generate(
+                    user_query=enhanced_query,
+                    evidence_type="generic",
+                    sql_schema=schema,
+                    entities={"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []},
+                    time_window={"horizon_min": 120, "start_utc": None, "end_utc": None},
+                    constraints={"sql_hint": sql_hint or "", "dialect": self.sql_dialect},
+                )
+        except Exception as exc:
+            if not self.allow_legacy_sql_fallback:
+                row = self._source_error_row("SQL", "sql_generation_failed", str(exc))
+                return [row], "", []
+            sql = self.sql_generator.generate(enhanced_query)
 
-            for i, row in enumerate(results[:10]):
-                record_id = row.get("asrs_report_id", row.get("id", row.get("record_id", f"row_{i}")))
-                title = row.get("title", f"ASRS {record_id}")
-                citations.append(Citation(
-                    source_type="SQL",
-                    identifier=str(record_id),
-                    title=str(title),
-                    content_preview=str(row)[:100],
-                    dataset="aviation_db",
-                ))
+        if sql.strip().startswith("-- NEED_SCHEMA"):
+            return [self._source_error_row("SQL", "sql_schema_missing", sql, {"sql": sql})], sql, []
 
-            return results, sql, citations
-
-        except Exception as e:
-            return [{"error": str(e), "sql": sql}], sql, []
+        results, citations = self.execute_sql_query(sql)
+        return results, sql, citations
 
     def query_semantic(
         self,
@@ -469,7 +725,7 @@ class UnifiedRetriever:
         index_name = self.vector_source_to_index.get(source, SEARCH_INDEX_OPS)
         client = self.search_clients.get(index_name)
         if client is None:
-            return [{"error": f"search_index_unavailable:{index_name}"}], []
+            return [self._source_unavailable_row(source, f"search_index_unavailable:{index_name}")], []
 
         top = max(1, int(top))
         top_raw = max(top, _RERANK_RAW_CANDIDATES if _RERANK_ENABLED else top)
@@ -583,22 +839,81 @@ class UnifiedRetriever:
         merged_citations.sort(key=lambda c: c.score, reverse=True)
         return merged_rows, merged_citations
 
+    def _looks_like_kql_text(self, query: str) -> bool:
+        candidate = (query or "").strip()
+        if not candidate:
+            return False
+        if "|" in candidate:
+            return True
+        lowered = candidate.lower()
+        return lowered.startswith("let ") or lowered.startswith(".show")
+
+    def _validate_kql_query(self, csl: str) -> Optional[str]:
+        text = (csl or "").strip()
+        if not text:
+            return "empty_kql_query"
+        blocked_patterns = (
+            r"\bdrop\b",
+            r"\bdelete\b",
+            r"\bcreate\b",
+            r"\balter\b",
+            r"\bingest\b",
+        )
+        for pattern in blocked_patterns:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                return f"kql_contains_blocked_operation:{pattern}"
+        if ";" in text:
+            return "kql_multiple_statements_not_allowed"
+        return None
+
+    def _ensure_kql_window(self, csl: str, window_minutes: int) -> str:
+        text = (csl or "").strip()
+        if not text:
+            return text
+        if re.search(r"\bago\s*\(", text, flags=re.IGNORECASE):
+            return text
+        if re.search(r"\btimestamp\b", text, flags=re.IGNORECASE):
+            return f"{text}\n| where timestamp > ago({max(1, int(window_minutes))}m)"
+        return text
+
     def query_kql(self, query: str, window_minutes: int = 60) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve event-window signals from Eventhouse or local fallback."""
         if FABRIC_KQL_ENDPOINT:
             if self._is_kusto_endpoint(FABRIC_KQL_ENDPOINT):
-                tokens = self._query_tokens(query)
-                if tokens:
-                    values = ",".join(f"'{t}'" for t in tokens)
-                    csl = (
-                        "opensky_states "
-                        f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
-                        "| take 50"
-                    )
+                if self._looks_like_kql_text(query):
+                    csl = self._ensure_kql_window(query, window_minutes)
+                elif self.strict_source_mode:
+                    return [
+                        self._source_error_row(
+                            source="KQL",
+                            code="kql_validation_failed",
+                            detail="selected KQL source requires executable KQL/CSL query text",
+                        )
+                    ], []
                 else:
-                    csl = "opensky_states | take 50"
+                    tokens = self._query_tokens(query)
+                    if tokens:
+                        values = ",".join(f"'{t}'" for t in tokens)
+                        csl = (
+                            "opensky_states "
+                            f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                            "| take 50"
+                        )
+                    else:
+                        csl = "opensky_states | take 50"
 
-                rows, _error = self._kusto_rows(FABRIC_KQL_ENDPOINT, csl)
+                validation_error = self._validate_kql_query(csl)
+                if validation_error:
+                    return [
+                        self._source_error_row(
+                            source="KQL",
+                            code="kql_validation_failed",
+                            detail=validation_error,
+                            extra={"csl": csl},
+                        )
+                    ], []
+
+                rows, error = self._kusto_rows(FABRIC_KQL_ENDPOINT, csl)
                 if rows:
                     citation = Citation(
                         source_type="KQL",
@@ -609,6 +924,15 @@ class UnifiedRetriever:
                         dataset="fabric-eventhouse",
                     )
                     return rows, [citation]
+                if self.strict_source_mode:
+                    return [
+                        self._source_error_row(
+                            source="KQL",
+                            code="kql_runtime_error",
+                            detail=error or "kql_query_returned_no_rows",
+                            extra={"csl": csl},
+                        )
+                    ], []
             else:
                 payload = {"query": query, "window_minutes": window_minutes}
                 response = self._post_json(FABRIC_KQL_ENDPOINT, payload)
@@ -624,6 +948,12 @@ class UnifiedRetriever:
                             dataset="fabric-eventhouse",
                         )
                         return rows, [citation]
+                if self.strict_source_mode:
+                    detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
+                    return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
+
+        if not FABRIC_KQL_ENDPOINT and not self.allow_mock_kql_fallback:
+            return [self._source_unavailable_row("KQL", "FABRIC_KQL_ENDPOINT not configured and fallback disabled")], []
 
         # Local deterministic fallback for demo readiness.
         rows: List[Dict[str, Any]] = []
@@ -697,6 +1027,8 @@ class UnifiedRetriever:
                         dataset="fabric-graph",
                     )
                     return paths, [citation]
+                if self.strict_source_mode:
+                    return [self._source_error_row("GRAPH", "graph_runtime_error", _error or "graph_query_returned_no_rows", {"csl": csl})], []
             else:
                 payload = {"query": query, "hops": hops}
                 response = self._post_json(FABRIC_GRAPH_ENDPOINT, payload)
@@ -712,10 +1044,16 @@ class UnifiedRetriever:
                             dataset="fabric-graph",
                         )
                         return paths, [citation]
+                if self.strict_source_mode:
+                    detail = str(response.get("error")) if isinstance(response, dict) else "graph_endpoint_query_failed"
+                    return [self._source_error_row("GRAPH", "graph_runtime_error", detail)], []
+
+        if not FABRIC_GRAPH_ENDPOINT and not self.allow_mock_graph_fallback:
+            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and fallback disabled")], []
 
         graph_file = self._latest_matching("data/j-synthetic_ops_overlay/*/synthetic/ops_graph_edges.csv")
         if not graph_file:
-            return [{"error": "graph_edges_unavailable"}], []
+            return [self._source_unavailable_row("GRAPH", "graph_edges_unavailable")], []
 
         paths: List[Dict[str, Any]] = []
         tokens = {t.upper() for t in re.findall(r"[A-Za-z0-9]{3,6}", query)}
@@ -763,6 +1101,8 @@ class UnifiedRetriever:
                         dataset="nosql-live",
                     )
                     return docs, [citation]
+                if self.strict_source_mode:
+                    return [self._source_error_row("NOSQL", "nosql_runtime_error", _error or "nosql_query_returned_no_rows")], []
             else:
                 payload = {"query": query}
                 response = self._post_json(FABRIC_NOSQL_ENDPOINT, payload)
@@ -778,6 +1118,12 @@ class UnifiedRetriever:
                             dataset="nosql-live",
                         )
                         return docs, [citation]
+                if self.strict_source_mode:
+                    detail = str(response.get("error")) if isinstance(response, dict) else "nosql_endpoint_query_failed"
+                    return [self._source_error_row("NOSQL", "nosql_runtime_error", detail)], []
+
+        if not FABRIC_NOSQL_ENDPOINT and not self.allow_mock_nosql_fallback:
+            return [self._source_unavailable_row("NOSQL", "FABRIC_NOSQL_ENDPOINT not configured and fallback disabled")], []
 
         notam_file = self._latest_matching("data/h-notam_recent/*/search_location_istanbul.jsonl")
         docs: List[Dict[str, Any]] = []
@@ -897,6 +1243,10 @@ class UnifiedRetriever:
     ) -> Tuple[List[Dict[str, Any]], List[Citation], Optional[str]]:
         """Execute retrieval against one logical source."""
         cfg = params or {}
+        source_mode = self.source_mode(source)
+        if source_mode == "blocked":
+            row = self._source_unavailable_row(source, f"{source} is blocked by current source policy/configuration")
+            return [row], [], None
         if source == "SQL":
             rows, sql, citations = self.query_sql(query, cfg.get("sql_hint"))
             return rows, citations, sql

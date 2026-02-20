@@ -49,6 +49,14 @@ env:
   FLASK_ENV: ${{ vars.FLASK_ENV || 'production' }}
   LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
   USE_POSTGRES: ${{ vars.USE_POSTGRES || 'true' }}
+  SQL_DIALECT: ${{ vars.SQL_DIALECT || 'postgres' }}
+  RETRIEVAL_STRICT_SOURCE_MODE: ${{ vars.RETRIEVAL_STRICT_SOURCE_MODE || 'false' }}
+  ALLOW_SQLITE_FALLBACK: ${{ vars.ALLOW_SQLITE_FALLBACK || 'true' }}
+  ALLOW_MOCK_KQL_FALLBACK: ${{ vars.ALLOW_MOCK_KQL_FALLBACK || 'true' }}
+  ALLOW_MOCK_GRAPH_FALLBACK: ${{ vars.ALLOW_MOCK_GRAPH_FALLBACK || 'true' }}
+  ALLOW_MOCK_NOSQL_FALLBACK: ${{ vars.ALLOW_MOCK_NOSQL_FALLBACK || 'true' }}
+  SCHEMA_CACHE_TTL_SECONDS: ${{ vars.SCHEMA_CACHE_TTL_SECONDS || '300' }}
+  KQL_SCHEMA_MODE: ${{ vars.KQL_SCHEMA_MODE || 'static' }}
   OTEL_SERVICE_NAME: ${{ vars.OTEL_SERVICE_NAME || 'aviation-rag-backend' }}
   ENVIRONMENT: ${{ vars.ENVIRONMENT || 'production' }}
   AF_SESSION_TTL_SECONDS: ${{ vars.AF_SESSION_TTL_SECONDS || '3600' }}

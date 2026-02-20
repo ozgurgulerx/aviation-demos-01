@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Dict, List
 
 from unified_retriever import UnifiedRetriever
@@ -17,60 +18,97 @@ KQL_SCHEMA_JSON = os.getenv("FABRIC_KQL_SCHEMA_JSON", "").strip()
 class SchemaProvider:
     def __init__(self, retriever: UnifiedRetriever):
         self.retriever = retriever
+        try:
+            ttl = int(os.getenv("SCHEMA_CACHE_TTL_SECONDS", "300") or "300")
+        except Exception:
+            ttl = 300
+        self.cache_ttl_seconds = max(0, ttl)
+        self._cached_snapshot: Dict[str, Any] = {}
+        self._cache_expires_at: float = 0.0
 
     def snapshot(self) -> Dict[str, Any]:
-        return {
+        now = time.time()
+        if self._cached_snapshot and now < self._cache_expires_at:
+            return self._cached_snapshot
+
+        payload = {
             "sql_schema": self._sql_schema(),
             "kql_schema": self._kql_schema(),
             "graph_schema": self._graph_schema(),
         }
+        self._cached_snapshot = payload
+        self._cache_expires_at = now + self.cache_ttl_seconds
+        return payload
 
     def _sql_schema(self) -> Dict[str, Any]:
-        tables: List[Dict[str, Any]] = []
-        try:
-            cur = self.retriever.db.cursor()
-            if self.retriever.use_postgres:
-                cur.execute(
-                    """
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema='public'
-                    ORDER BY table_name
-                    """
-                )
-                table_names = [str(row[0]) for row in cur.fetchall()]
-                for table in table_names:
-                    cur.execute(
-                        """
-                        SELECT column_name, data_type
-                        FROM information_schema.columns
-                        WHERE table_schema='public' AND table_name=%s
-                        ORDER BY ordinal_position
-                        """,
-                        (table,),
-                    )
-                    cols = [{"name": str(r[0]), "type": str(r[1])} for r in cur.fetchall()]
-                    tables.append({"table": table, "columns": cols})
-            else:
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                table_names = [str(row[0]) for row in cur.fetchall()]
-                for table in table_names:
-                    cur.execute(f"PRAGMA table_info('{table}')")
-                    cols = [{"name": str(r[1]), "type": str(r[2])} for r in cur.fetchall()]
-                    tables.append({"table": table, "columns": cols})
-        except Exception as exc:
-            return {"error": str(exc), "tables": []}
+        return self.retriever.current_sql_schema()
+
+    def _parse_kql_show_schema(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not rows:
+            return {"tables": []}
+
+        table_map: Dict[str, List[Dict[str, str]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            table = str(row.get("TableName") or row.get("table_name") or row.get("Name") or "").strip()
+            column = str(row.get("ColumnName") or row.get("column_name") or "").strip()
+            column_type = str(row.get("ColumnType") or row.get("column_type") or row.get("Type") or "string").strip()
+            if not table or not column:
+                continue
+            table_map.setdefault(table, [])
+            if not any(c["name"] == column for c in table_map[table]):
+                table_map[table].append({"name": column, "type": column_type})
+
+        tables = [{"table": t, "columns": cols} for t, cols in sorted(table_map.items(), key=lambda x: x[0])]
         return {"tables": tables}
 
     def _kql_schema(self) -> Dict[str, Any]:
+        kql_schema_mode = os.getenv("KQL_SCHEMA_MODE", "static").strip().lower()
+        endpoint = os.getenv("FABRIC_KQL_ENDPOINT", "").strip()
+        database = os.getenv("FABRIC_KQL_DATABASE", "aviation_ops")
+
+        if kql_schema_mode == "live" and endpoint:
+            if self.retriever._is_kusto_endpoint(endpoint):
+                rows, error = self.retriever._kusto_rows(endpoint, ".show database schema")
+                if rows:
+                    parsed = self._parse_kql_show_schema(rows)
+                    parsed.update(
+                        {
+                            "database": database,
+                            "source": "live",
+                            "collected_at": self.retriever._now_iso(),
+                            "schema_version": f"tables:{len(parsed.get('tables', []))}",
+                        }
+                    )
+                    return parsed
+                return {
+                    "database": database,
+                    "source": "live-error",
+                    "collected_at": self.retriever._now_iso(),
+                    "schema_version": "error",
+                    "error": error or "unable_to_fetch_kql_schema",
+                    "tables": [],
+                }
+
         if KQL_SCHEMA_JSON:
             try:
-                return json.loads(KQL_SCHEMA_JSON)
+                parsed = json.loads(KQL_SCHEMA_JSON)
+                if isinstance(parsed, dict):
+                    parsed.setdefault("database", database)
+                    parsed.setdefault("source", "static-json")
+                    parsed.setdefault("collected_at", self.retriever._now_iso())
+                    parsed.setdefault("schema_version", "static-json")
+                    parsed.setdefault("tables", [])
+                    return parsed
             except Exception:
                 pass
         # Compact default schema for prompt guidance.
         return {
-            "database": os.getenv("FABRIC_KQL_DATABASE", "aviation_ops"),
+            "database": database,
+            "source": "static-default",
+            "collected_at": self.retriever._now_iso(),
+            "schema_version": "static-default-v1",
             "tables": [
                 {
                     "table": "weather_obs",
@@ -89,7 +127,9 @@ class SchemaProvider:
 
     def _graph_schema(self) -> Dict[str, Any]:
         return {
+            "source": "builtin-default",
+            "collected_at": self.retriever._now_iso(),
+            "schema_version": "graph-default-v1",
             "node_types": ["Intent", "EvidenceType", "Tool", "Airport", "Runway", "Station", "Alternate"],
             "edge_types": ["REQUIRES", "AUTHORITATIVE_IN", "EXPANDS_TO", "HAS_RUNWAY", "HAS_STATION", "HAS_ALTERNATE"],
         }
-

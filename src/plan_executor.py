@@ -90,9 +90,13 @@ class PlanExecutor:
                         {
                             "type": "source_call_start",
                             "source": source,
+                            "planned_source": source,
+                            "executed_source": source,
                             "reason": call.operation,
                             "priority": 0,
                             "source_meta": self.retriever.source_event_meta(source),
+                            "execution_mode": self.retriever.source_mode(source),
+                            "contract_status": "planned",
                             "event_id": call.id,
                             "timestamp": started_at,
                         }
@@ -106,6 +110,7 @@ class PlanExecutor:
                     try:
                         rows, citations, sql_query = future.result()
                         rows = self._annotate_rows(rows, source, call.id, call.operation, call.params, completed_at)
+                        has_row_errors = self._rows_have_errors(rows)
                         columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
                         result.source_results_by_call[call.id] = CallResult(
                             call_id=call.id,
@@ -121,13 +126,24 @@ class PlanExecutor:
                         )
                         if sql_query:
                             result.sql_queries[call.id] = sql_query
+                        execution_mode = self.retriever.source_mode(source)
+                        if has_row_errors:
+                            contract_status = "failed"
+                        elif execution_mode == "fallback":
+                            contract_status = "degraded"
+                        else:
+                            contract_status = "met"
                         result.source_traces.append(
                             {
                                 "type": "source_call_done",
                                 "source": source,
+                                "planned_source": source,
+                                "executed_source": source,
                                 "row_count": len(rows),
                                 "citation_count": len(citations),
                                 "source_meta": self.retriever.source_event_meta(source),
+                                "execution_mode": execution_mode,
+                                "contract_status": contract_status,
                                 "event_id": call.id,
                                 "timestamp": completed_at,
                                 "columns": columns,
@@ -161,10 +177,14 @@ class PlanExecutor:
                             {
                                 "type": "source_call_done",
                                 "source": source,
+                                "planned_source": source,
+                                "executed_source": source,
                                 "row_count": 1,
                                 "citation_count": 0,
                                 "error": str(exc),
                                 "source_meta": self.retriever.source_event_meta(source),
+                                "execution_mode": self.retriever.source_mode(source),
+                                "contract_status": "failed",
                                 "event_id": call.id,
                                 "timestamp": completed_at,
                                 "columns": columns,
@@ -218,6 +238,8 @@ class PlanExecutor:
                     time_window=time_window,
                     constraints=call.params,
                 )
+            if kql_query.strip().startswith("// NEED_SCHEMA"):
+                return [{"error": kql_query, "error_code": "kql_schema_missing"}], [], kql_query
             window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
             rows, citations = self.retriever.query_kql(kql_query, window_minutes=window)
             return rows, citations, kql_query
@@ -243,27 +265,7 @@ class PlanExecutor:
         return [{"error": f"unknown_tool:{source}"}], [], None
 
     def _execute_sql_raw(self, sql_query: str) -> Tuple[List[Dict[str, Any]], List[Citation]]:
-        cur = self.retriever.db.cursor()
-        cur.execute(sql_query)
-        rows = cur.fetchall()
-        columns = [desc[0] for desc in cur.description] if cur.description else []
-        dict_rows = [dict(zip(columns, row)) for row in rows]
-
-        citations: List[Citation] = []
-        for idx, row in enumerate(dict_rows[:10], start=1):
-            row_id = row.get("id") or row.get("asrs_report_id") or f"row_{idx}"
-            title = row.get("title") or row.get("facilityDesignator") or f"SQL row {idx}"
-            citations.append(
-                Citation(
-                    source_type="SQL",
-                    identifier=str(row_id),
-                    title=str(title),
-                    content_preview=str(row)[:120],
-                    score=0.9,
-                    dataset="aviation_db",
-                )
-            )
-        return dict_rows, citations
+        return self.retriever.execute_sql_query(sql_query)
 
     def _canon_tool(self, raw: str) -> str:
         value = (raw or "").strip().upper()
@@ -282,7 +284,8 @@ class PlanExecutor:
 
     def _looks_like_kql(self, text: str) -> bool:
         stripped = text.strip()
-        return "|" in stripped or stripped.lower().startswith("let ")
+        lowered = stripped.lower()
+        return "|" in stripped or lowered.startswith("let ") or lowered.startswith(".show")
 
     def _get_sql_writer(self) -> SQLWriter:
         if self.sql_writer is None:
@@ -381,6 +384,14 @@ class PlanExecutor:
                 preview.append(item)
 
         return columns, preview, len(rows) > len(preview)
+
+    def _rows_have_errors(self, rows: List[Dict[str, Any]]) -> bool:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("error") or row.get("error_code"):
+                return True
+        return False
 
     def _safe_preview_value(self, value: Any, max_chars: int = 180) -> Any:
         if value is None or isinstance(value, (int, float, bool)):

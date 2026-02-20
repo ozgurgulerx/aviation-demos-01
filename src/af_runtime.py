@@ -720,14 +720,14 @@ class AgentFrameworkRuntime:
         source_meta = trace.get("source_meta") or {}
         mode = (source_meta.get("endpoint_label") or "").strip().lower()
         source = trace.get("source")
-        if trace.get("type") == "source_call_start" and mode in {"live", "fallback"} and source:
+        if trace.get("type") == "source_call_start" and mode in {"live", "fallback", "blocked"} and source:
             yield {
                 "type": "fallback_mode_changed",
                 "stage": "source_mode",
                 "source": source,
                 "mode": mode,
                 "message": f"{source} is running in {mode} mode",
-                "status": "info" if mode == "live" else "running",
+                "status": "info" if mode == "live" else ("error" if mode == "blocked" else "running"),
             }
 
     def _apply_demo_scenario(self, query: str, demo_scenario: str) -> str:
