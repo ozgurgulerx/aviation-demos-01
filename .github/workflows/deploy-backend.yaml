@@ -23,6 +23,7 @@ env:
   AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'avrag705508acr' }}
   AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'avrag705508acr.azurecr.io' }}
   IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
+  IMAGE_TAG: ${{ github.sha }}
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
   AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || 'rg-aviation-rag' }}
   K8S_NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
@@ -222,18 +223,12 @@ jobs:
             --type='merge' \
             -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"rollouts.codex.dev/config-hash\":\"${CONFIG_HASH}\",\"rollouts.codex.dev/secret-hash\":\"${SECRET_HASH}\"}}}}}"
 
-      - name: Update deployment image
-        run: |
-          kubectl set image deployment/aviation-rag-backend \
-            backend="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-            --namespace="${{ env.K8S_NAMESPACE }}"
-
       - name: Wait for rollout
         run: |
           timeout_seconds=900
           poll_interval=15
           deadline=$(( $(date +%s) + timeout_seconds ))
-          expected_image="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          expected_image="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
 
           echo "Waiting for deployment to converge (image=${expected_image}, generation=${tracked_generation})"

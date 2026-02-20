@@ -34,7 +34,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: backend
-        image: ${AZURE_CONTAINER_REGISTRY}/${IMAGE_NAME}:latest
+        image: ${AZURE_CONTAINER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
         command: ["/bin/sh", "-c"]
         args:
         - >
