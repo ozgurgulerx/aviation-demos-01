@@ -230,6 +230,8 @@ jobs:
           deadline=$(( $(date +%s) + timeout_seconds ))
           expected_image="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
+          drift_reapply_attempts=0
+          max_drift_reapply_attempts=3
 
           echo "Waiting for deployment to converge (image=${expected_image}, generation=${tracked_generation})"
           while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -249,9 +251,23 @@ jobs:
             unavailable="${unavailable:-0}"
 
             if [ "$template_image" != "$expected_image" ]; then
-              echo "::error::Deployment template image changed unexpectedly during rollout."
-              echo "::error::Expected '$expected_image' but found '$template_image'."
-              exit 1
+              drift_reapply_attempts=$((drift_reapply_attempts + 1))
+              echo "::warning::Deployment template image drift detected during rollout."
+              echo "::warning::Expected '$expected_image' but found '$template_image'. Re-applying expected image (attempt ${drift_reapply_attempts}/${max_drift_reapply_attempts})."
+
+              kubectl set image deployment/aviation-rag-backend \
+                backend="$expected_image" \
+                --namespace="${{ env.K8S_NAMESPACE }}"
+
+              tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "$tracked_generation")"
+
+              if [ "$drift_reapply_attempts" -ge "$max_drift_reapply_attempts" ]; then
+                echo "::error::Deployment image drift persisted after ${max_drift_reapply_attempts} re-apply attempts."
+                exit 1
+              fi
+
+              sleep "$poll_interval"
+              continue
             fi
 
             if [ "$current_generation" != "$tracked_generation" ]; then
