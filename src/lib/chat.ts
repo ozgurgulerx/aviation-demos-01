@@ -269,7 +269,7 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         id: fallbackId,
         type: event.type,
         stage: event.stage || "preflight",
-        message: event.message || "Fabric preflight completed",
+        message: event.message || "Data path health check completed",
         status: event.mode === "fallback" ? "running" : "completed",
         timestamp,
       };

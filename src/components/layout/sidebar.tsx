@@ -110,7 +110,7 @@ export function Sidebar({
                 </Badge>
               </div>
               <p className="text-muted-foreground">
-                Agent telemetry and evidence tracing are active for this pilot demo.
+                Intent mapping and evidence checks are active for this flight-brief demo.
               </p>
             </div>
           </motion.div>

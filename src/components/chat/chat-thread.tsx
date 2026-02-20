@@ -203,7 +203,7 @@ export function ChatThread({
                   <Loader2 className="h-4 w-4 animate-spin text-primary" />
                 </div>
                 <div className="max-w-[88%] flex-1 rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
-                  Waiting for telemetry and synthesis updates...
+                  Analyzing intent, retrieval path, and evidence...
                 </div>
               </motion.div>
             )}
@@ -237,9 +237,9 @@ function TimelinePanel({
     <section className="surface-panel rounded-2xl p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div>
-          <p className="font-display text-sm font-semibold">Retrieval Orchestration Timeline</p>
+          <p className="font-display text-sm font-semibold">Briefing Pipeline Timeline</p>
           <p className="text-xs text-muted-foreground">
-            Live SSE telemetry from agent runtime, tools, and source calls.
+            Live stage updates for intent mapping, retrieval, synthesis, and evidence checks.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -349,7 +349,7 @@ function TimelinePanel({
       <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
         {latestEvents.length === 0 ? (
           <p className="text-xs text-muted-foreground">
-            No events yet. Submit a prompt to watch retrieval planning and source execution.
+            No stages yet. Submit a request to watch intent mapping and evidence retrieval.
           </p>
         ) : (
           <AnimatePresence initial={false}>
@@ -473,7 +473,7 @@ function LiveOpsPulse({ sourceHealth }: { sourceHealth: SourceHealthStatus[] }) 
   return (
     <div className="mb-3 grid gap-2 rounded-xl border border-border bg-card p-3 text-xs md:grid-cols-4">
       <div>
-        <p className="text-muted-foreground">Live telemetry pulse</p>
+        <p className="text-muted-foreground">Live operations pulse</p>
         <p className="font-semibold text-foreground">{kql?.rowCount ?? 0} KQL rows</p>
       </div>
       <div>
