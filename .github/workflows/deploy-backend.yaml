@@ -28,7 +28,7 @@ env:
   K8S_NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
 
   AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
-  AZURE_OPENAI_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'gpt-5-nano' }}
+  AZURE_OPENAI_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'aviation-chat-gpt5-mini' }}
   AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME: ${{ vars.AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME || 'text-embedding-3-small' }}
   AZURE_SEARCH_ENDPOINT: ${{ vars.AZURE_SEARCH_ENDPOINT }}
   PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
@@ -72,6 +72,25 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Resolve ACR name
+        run: |
+          TARGET="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+          FALLBACK="avrag705508acr"
+
+          if az acr show --name "$TARGET" >/dev/null 2>&1; then
+            echo "Using ACR target: $TARGET"
+            exit 0
+          fi
+
+          if [ "$TARGET" != "$FALLBACK" ] && az acr show --name "$FALLBACK" >/dev/null 2>&1; then
+            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Falling back to '$FALLBACK'."
+            echo "AZURE_CONTAINER_REGISTRY_NAME=$FALLBACK" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "::error::ACR '$TARGET' not found and fallback '$FALLBACK' unavailable."
+          exit 1
+
       - name: Login to Azure Container Registry
         run: az acr login --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
 
@@ -108,6 +127,25 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve ACR name
+        run: |
+          TARGET="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+          FALLBACK="avrag705508acr"
+
+          if az acr show --name "$TARGET" >/dev/null 2>&1; then
+            echo "Using ACR target: $TARGET"
+            exit 0
+          fi
+
+          if [ "$TARGET" != "$FALLBACK" ] && az acr show --name "$FALLBACK" >/dev/null 2>&1; then
+            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Falling back to '$FALLBACK'."
+            echo "AZURE_CONTAINER_REGISTRY_NAME=$FALLBACK" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "::error::ACR '$TARGET' not found and fallback '$FALLBACK' unavailable."
+          exit 1
 
       - name: Validate required runtime variables
         run: |

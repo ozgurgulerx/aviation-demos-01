@@ -21,11 +21,38 @@ const RequestSchema = z.object({
 
 const PYTHON_API_URL =
   process.env.BACKEND_URL || process.env.PYTHON_API_URL || "http://localhost:5001";
+const BACKEND_REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_REQUEST_TIMEOUT_MS || "45000");
+const CHAT_STREAM_TIMEOUT_MS = Number(process.env.CHAT_STREAM_TIMEOUT_MS || "180000");
 
 const encoder = new TextEncoder();
+const TERMINAL_EVENT_TYPES = new Set(["agent_done", "done", "agent_error", "error"]);
 
 function createSSEMessage(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+function parseTerminalEvents(buffer: string): { sawTerminal: boolean; remainder: string } {
+  const frames = buffer.split(/\r?\n\r?\n/);
+  const remainder = frames.pop() ?? "";
+  let sawTerminal = false;
+
+  for (const frame of frames) {
+    const lines = frame.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trimStart();
+      if (!trimmed.startsWith("data:")) continue;
+      try {
+        const parsed = JSON.parse(trimmed.slice(5).trimStart()) as { type?: string };
+        if (typeof parsed.type === "string" && TERMINAL_EVENT_TYPES.has(parsed.type)) {
+          sawTerminal = true;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return { sawTerminal, remainder };
 }
 
 async function fetchWithRetry(
@@ -87,22 +114,31 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const backendResponse = await fetchWithRetry(`${PYTHON_API_URL}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: lastUserMessage.content,
-        retrieval_mode: retrievalMode,
-        conversation_id: conversationId,
-        query_profile: queryProfile,
-        required_sources: requiredSources,
-        freshness_sla_minutes: freshnessSlaMinutes,
-        explain_retrieval: explainRetrieval,
-        risk_mode: riskMode,
-        ask_recommendation: askRecommendation,
-        demo_scenario: demoScenario,
-      }),
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), BACKEND_REQUEST_TIMEOUT_MS);
+
+    let backendResponse: Response;
+    try {
+      backendResponse = await fetchWithRetry(`${PYTHON_API_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          message: lastUserMessage.content,
+          retrieval_mode: retrievalMode,
+          conversation_id: conversationId,
+          query_profile: queryProfile,
+          required_sources: requiredSources,
+          freshness_sla_minutes: freshnessSlaMinutes,
+          explain_retrieval: explainRetrieval,
+          risk_mode: riskMode,
+          ask_recommendation: askRecommendation,
+          demo_scenario: demoScenario,
+        }),
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!backendResponse.ok || !backendResponse.body) {
       const errText = await backendResponse.text().catch(() => "");
@@ -113,6 +149,15 @@ export async function POST(request: NextRequest) {
               createSSEMessage({
                 type: "agent_error",
                 message: errText || `Backend error (${backendResponse.status})`,
+              })
+            )
+          );
+          controller.enqueue(
+            encoder.encode(
+              createSSEMessage({
+                type: "done",
+                route: "PROXY_ERROR",
+                isVerified: false,
               })
             )
           );
@@ -133,15 +178,79 @@ export async function POST(request: NextRequest) {
     // Pass-through AF-native SSE stream from backend.
     const stream = new ReadableStream({
       async start(controller) {
+        let closed = false;
+        let timedOut = false;
+        let sawTerminal = false;
+        let sseBuffer = "";
+        const chunkDecoder = new TextDecoder();
+        let streamTimeout: ReturnType<typeof setTimeout> | null = null;
+
+        const safeClose = () => {
+          if (closed) return;
+          closed = true;
+          controller.close();
+        };
+
         try {
           const reader = backendResponse.body!.getReader();
+          streamTimeout = setTimeout(() => {
+            timedOut = true;
+            if (closed) return;
+            controller.enqueue(
+              encoder.encode(
+                createSSEMessage({
+                  type: "agent_error",
+                  message: `Chat stream timed out after ${CHAT_STREAM_TIMEOUT_MS}ms`,
+                })
+              )
+            );
+            controller.enqueue(
+              encoder.encode(
+                createSSEMessage({
+                  type: "done",
+                  route: "PROXY_TIMEOUT",
+                  isVerified: false,
+                })
+              )
+            );
+            void reader.cancel("stream timeout");
+            safeClose();
+          }, CHAT_STREAM_TIMEOUT_MS);
+
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            const decoded = chunkDecoder.decode(value, { stream: true });
+            const parsed = parseTerminalEvents(sseBuffer + decoded);
+            sawTerminal = sawTerminal || parsed.sawTerminal;
+            sseBuffer = parsed.remainder;
             controller.enqueue(value);
           }
-          controller.close();
+          if (streamTimeout) {
+            clearTimeout(streamTimeout);
+            streamTimeout = null;
+          }
+
+          const finalParsed = parseTerminalEvents(`${sseBuffer}\n\n`);
+          sawTerminal = sawTerminal || finalParsed.sawTerminal;
+          if (!sawTerminal && !timedOut) {
+            controller.enqueue(
+              encoder.encode(
+                createSSEMessage({
+                  type: "done",
+                  route: "PROXY_EOF",
+                  isVerified: false,
+                })
+              )
+            );
+          }
+          safeClose();
         } catch (error) {
+          if (streamTimeout) {
+            clearTimeout(streamTimeout);
+            streamTimeout = null;
+          }
+          if (timedOut) return;
           controller.enqueue(
             encoder.encode(
               createSSEMessage({
@@ -153,7 +262,16 @@ export async function POST(request: NextRequest) {
               })
             )
           );
-          controller.close();
+          controller.enqueue(
+            encoder.encode(
+              createSSEMessage({
+                type: "done",
+                route: "PROXY_STREAM_ERROR",
+                isVerified: false,
+              })
+            )
+          );
+          safeClose();
         }
       },
     });

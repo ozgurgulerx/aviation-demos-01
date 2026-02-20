@@ -6,7 +6,7 @@ K8S_DIR="${K8S_DIR:-${SCRIPT_DIR}/../k8s}"
 OUT_DIR="${1:-/tmp/k8s-rendered}"
 
 # Defaults for non-secret values.
-: "${AZURE_OPENAI_DEPLOYMENT_NAME:=gpt-5-nano}"
+: "${AZURE_OPENAI_DEPLOYMENT_NAME:=aviation-chat-gpt5-mini}"
 : "${AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME:=text-embedding-3-small}"
 : "${K8S_NAMESPACE:=aviation-rag}"
 : "${PGPORT:=5432}"
