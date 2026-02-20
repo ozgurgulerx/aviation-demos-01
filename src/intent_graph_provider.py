@@ -21,7 +21,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT", "").strip()
-FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+def _get_fabric_bearer_token() -> str:
+    """Re-read bearer token from env on each call so rotated tokens take effect."""
+    return os.getenv("FABRIC_BEARER_TOKEN", "").strip()
 INTENT_GRAPH_JSON_PATH = os.getenv("INTENT_GRAPH_JSON_PATH", "").strip()
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,8 +152,9 @@ class IntentGraphProvider:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(FABRIC_GRAPH_ENDPOINT, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
-        if FABRIC_BEARER_TOKEN:
-            req.add_header("Authorization", f"Bearer {FABRIC_BEARER_TOKEN}")
+        token = _get_fabric_bearer_token()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
 
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:

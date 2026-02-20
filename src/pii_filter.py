@@ -16,8 +16,8 @@ load_dotenv()
 # PII Container endpoint (same as frontend uses)
 PII_ENDPOINT = os.getenv("PII_ENDPOINT", os.getenv("PII_CONTAINER_ENDPOINT", "http://localhost:5000"))
 
-# Banking-relevant PII categories (matching frontend)
-BANKING_PII_CATEGORIES = [
+# PII categories to detect (matching frontend configuration).
+PII_CATEGORIES = [
     "Person",
     "PersonType",
     "PhoneNumber",
@@ -141,7 +141,7 @@ class PiiFilter:
                 )
                 for e in raw_entities
                 if e["confidenceScore"] >= self.confidence_threshold
-                and e["category"] in BANKING_PII_CATEGORIES
+                and e["category"] in PII_CATEGORIES
             ]
 
             return PiiCheckResult(

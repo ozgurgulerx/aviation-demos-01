@@ -207,6 +207,8 @@ class PlanExecutor:
         schemas: Dict[str, Any],
     ) -> Tuple[List[Dict[str, Any]], List[Citation], Optional[str]]:
         source = self._canon_tool(call.tool)
+        if not source:
+            return [{"error": f"unknown_tool:{call.tool}"}], [], None
         evidence_type = str(call.params.get("evidence_type", "")).strip()
         time_window = plan.time_window.to_dict()
         entities = plan.entities
@@ -340,17 +342,21 @@ class PlanExecutor:
 
         return [{"error": sql_query, "error_code": "sql_schema_missing"}], [], sql_query
 
+    _KNOWN_TOOLS = {"KQL", "SQL", "GRAPH", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT", "NOSQL"}
+    _TOOL_ALIASES = {
+        "EVENTHOUSEKQL": "KQL",
+        "WAREHOUSESQL": "SQL",
+        "FABRICGRAPH": "GRAPH",
+        "GRAPHTRAVERSAL": "GRAPH",
+        "FOUNDRYIQ": "VECTOR_REG",
+        "AZUREAISEARCH": "VECTOR_REG",
+        "LAKEHOUSEDELTA": "KQL",
+    }
+
     def _canon_tool(self, raw: str) -> str:
         value = (raw or "").strip().upper()
-        mapping = {
-            "EVENTHOUSEKQL": "KQL",
-            "WAREHOUSESQL": "SQL",
-            "FABRICGRAPH": "GRAPH",
-            "GRAPHTRAVERSAL": "GRAPH",
-            "FOUNDRYIQ": "VECTOR_REG",
-            "AZUREAISEARCH": "VECTOR_REG",
-        }
-        return mapping.get(value, value)
+        mapped = self._TOOL_ALIASES.get(value, value)
+        return mapped if mapped in self._KNOWN_TOOLS else ""
 
     def _looks_like_sql(self, text: str) -> bool:
         return bool(re.match(r"^\s*(SELECT|WITH)\b", text, re.IGNORECASE))

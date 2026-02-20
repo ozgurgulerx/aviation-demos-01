@@ -475,9 +475,17 @@ class AgentFrameworkRuntime:
         if ctx.citations:
             yield {"type": "citations", "citations": self._format_citations(ctx.citations)}
 
+        # Use actual evidence coverage to determine verification status.
+        required_total = ctx.coverage_summary.get("required_total", 0) if ctx.coverage_summary else 0
+        required_filled = ctx.coverage_summary.get("required_filled", 0) if ctx.coverage_summary else 0
+        if required_total > 0:
+            is_verified = required_filled == required_total
+        else:
+            is_verified = len(ctx.citations) > 0
+
         yield {
             "type": "agent_done",
-            "isVerified": len(ctx.citations) > 0,
+            "isVerified": is_verified,
             "route": ctx.route,
             "reasoning": ctx.reasoning,
             "sessionId": session_id,
@@ -599,9 +607,17 @@ class AgentFrameworkRuntime:
             ]
             yield {"type": "citations", "citations": self._format_citations(citations)}
 
+        # Use actual evidence coverage to determine verification status.
+        local_required_total = coverage_summary.get("required_total", 0) if coverage_summary else 0
+        local_required_filled = coverage_summary.get("required_filled", 0) if coverage_summary else 0
+        if local_required_total > 0:
+            local_is_verified = local_required_filled == local_required_total
+        else:
+            local_is_verified = len(citations_payload) > 0
+
         yield {
             "type": "agent_done",
-            "isVerified": len(citations_payload) > 0,
+            "isVerified": local_is_verified,
             "route": route,
             "reasoning": reasoning,
             "sessionId": session_id,
@@ -704,16 +720,25 @@ class AgentFrameworkRuntime:
 
         return str(value)
 
-    def _emit_text_chunks(self, text: str, chunk_words: int = 8) -> Generator[Dict[str, Any], None, None]:
-        words = text.split()
-        if not words:
+    def _emit_text_chunks(self, text: str, chunk_size: int = 80) -> Generator[Dict[str, Any], None, None]:
+        if not text:
             return
 
-        for idx in range(0, len(words), chunk_words):
-            chunk = " ".join(words[idx : idx + chunk_words])
-            if idx + chunk_words < len(words):
-                chunk += " "
-            yield {"type": "agent_update", "content": chunk}
+        # Split into chunks at word boundaries while preserving all whitespace
+        # (newlines, tabs, multiple spaces) so markdown formatting survives.
+        pos = 0
+        length = len(text)
+        while pos < length:
+            end = min(pos + chunk_size, length)
+            if end < length:
+                # Try to break at a space boundary to avoid splitting words.
+                space_idx = text.rfind(" ", pos, end)
+                newline_idx = text.rfind("\n", pos, end)
+                break_at = max(space_idx, newline_idx)
+                if break_at > pos:
+                    end = break_at + 1
+            yield {"type": "agent_update", "content": text[pos:end]}
+            pos = end
 
     def _emit_source_trace_events(self, trace: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
         yield trace

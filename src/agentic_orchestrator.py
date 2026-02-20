@@ -18,6 +18,21 @@ from intent_graph_provider import IntentGraphSnapshot
 
 load_dotenv()
 
+# Common 4-letter English words that should not be treated as ICAO airport codes.
+_ENGLISH_4LETTER_BLOCKLIST: set[str] = {
+    "WHAT", "WITH", "FROM", "YOUR", "SHOW", "THIS", "THAT", "WHEN",
+    "WILL", "HAVE", "DOES", "BEEN", "WERE", "THEY", "THEM", "THEN",
+    "THAN", "EACH", "MADE", "FIND", "HERE", "MANY", "SOME", "LIKE",
+    "LONG", "MAKE", "JUST", "OVER", "SUCH", "TAKE", "YEAR", "ALSO",
+    "INTO", "MOST", "ONLY", "COME", "VERY", "WELL", "BACK", "MUCH",
+    "GIVE", "EVEN", "WANT", "GOOD", "LOOK", "LAST", "TELL", "NEED",
+    "NEAR", "AREA", "BOTH", "KEEP", "HELP", "LINE", "TURN", "MOVE",
+    "LIVE", "REAL", "LEFT", "SAME", "ABLE", "OPEN", "SEEM", "SURE",
+    "HIGH", "RISK", "EVER", "NEXT", "TYPE", "LIST", "DATA", "USED",
+    "BEST", "DONE", "FULL", "MUST", "KNOW", "TIME", "WENT", "GATE",
+    "TAXI", "LAND", "HOLD", "TAKE", "CALL", "NOTE",
+}
+
 OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 
@@ -267,7 +282,7 @@ class AgenticOrchestrator:
         lower = text.lower()
         airports: List[str] = []
         for code in re.findall(r"\b[A-Z]{4}\b", upper):
-            if code not in airports:
+            if code not in airports and code not in _ENGLISH_4LETTER_BLOCKLIST:
                 airports.append(code)
         city_map = {
             "new york": ["KJFK", "KLGA", "KEWR"],

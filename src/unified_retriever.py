@@ -8,9 +8,11 @@ import csv
 import gzip
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
+import threading
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -29,6 +31,8 @@ from query_router import QueryRouter
 from query_writers import SQLWriter
 from sql_generator import SQLGenerator
 from pii_filter import PiiFilter, PiiCheckResult
+
+logger = logging.getLogger(__name__)
 
 # Load .env file
 load_dotenv()
@@ -53,8 +57,12 @@ _RERANK_ENABLED = os.getenv("CONTEXT_RERANK_ENABLED", "true").strip().lower() in
 FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
-FABRIC_BEARER_TOKEN = os.getenv("FABRIC_BEARER_TOKEN", "")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
+
+
+def _get_fabric_bearer_token() -> str:
+    """Re-read bearer token from env on each call so rotated tokens take effect."""
+    return os.getenv("FABRIC_BEARER_TOKEN", "")
 
 
 def _resolve_project_root() -> Path:
@@ -90,6 +98,21 @@ IATA_TO_ICAO_MAP: Dict[str, str] = {
     "EWR": "KEWR",
     "IST": "LTFM",
     "SAW": "LTFJ",
+}
+
+# Common 4-letter English words that should not be treated as ICAO airport codes.
+_ENGLISH_4LETTER_BLOCKLIST: set[str] = {
+    "WHAT", "WITH", "FROM", "YOUR", "SHOW", "THIS", "THAT", "WHEN",
+    "WILL", "HAVE", "DOES", "BEEN", "WERE", "THEY", "THEM", "THEN",
+    "THAN", "EACH", "MADE", "FIND", "HERE", "MANY", "SOME", "LIKE",
+    "LONG", "MAKE", "JUST", "OVER", "SUCH", "TAKE", "YEAR", "ALSO",
+    "INTO", "MOST", "ONLY", "COME", "VERY", "WELL", "BACK", "MUCH",
+    "GIVE", "EVEN", "WANT", "GOOD", "LOOK", "LAST", "TELL", "NEED",
+    "NEAR", "AREA", "BOTH", "KEEP", "HELP", "LINE", "TURN", "MOVE",
+    "LIVE", "REAL", "LEFT", "SAME", "ABLE", "OPEN", "SEEM", "SURE",
+    "HIGH", "RISK", "EVER", "NEXT", "TYPE", "LIST", "DATA", "USED",
+    "BEST", "DONE", "FULL", "MUST", "KNOW", "TIME", "WENT", "GATE",
+    "TAXI", "LAND", "HOLD", "TAKE", "CALL", "NOTE",
 }
 
 
@@ -219,7 +242,9 @@ class UnifiedRetriever:
 
         # Database connection - SQLite or PostgreSQL.
         self.use_postgres = USE_POSTGRES
-        self.db = None
+        self.db = None  # SQLite connection (only used for SQLite mode)
+        self._pg_pool = None  # PostgreSQL connection pool (thread-safe)
+        self._pg_pool_lock = threading.Lock()
         self.sql_backend = "unavailable"
         self.sql_available = False
         self.sql_unavailable_reason = ""
@@ -227,6 +252,7 @@ class UnifiedRetriever:
         if self.use_postgres:
             try:
                 import psycopg2
+                import psycopg2.pool
                 connect_kwargs: Dict[str, Any] = {
                     "host": os.getenv("PGHOST"),
                     "port": int(os.getenv("PGPORT", 5432)),
@@ -235,23 +261,43 @@ class UnifiedRetriever:
                     "password": os.getenv("PGPASSWORD"),
                     "sslmode": "require",
                     "connect_timeout": 5,
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 5,
                 }
                 if self.sql_visible_schemas:
-                    connect_kwargs["options"] = f"-c search_path={','.join(self.sql_visible_schemas)}"
+                    schemas_param = ",".join(self.sql_visible_schemas)
+                    connect_kwargs["options"] = f"-c search_path={schemas_param}"
 
-                self.db = psycopg2.connect(**connect_kwargs)
-                self.db.autocommit = True
-                if self.sql_visible_schemas:
-                    with self.db.cursor() as cur:
-                        cur.execute(f"SET search_path TO {','.join(self.sql_visible_schemas)}")
+                self._pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=5,
+                    **connect_kwargs,
+                )
+                # Verify pool is usable with a test connection.
+                test_conn = self._pg_pool.getconn()
+                try:
+                    test_conn.autocommit = True
+                    if self.sql_visible_schemas:
+                        with test_conn.cursor() as cur:
+                            cur.execute(
+                                "SET search_path TO " + ", ".join(
+                                    "%s" for _ in self.sql_visible_schemas
+                                ),
+                                self.sql_visible_schemas,
+                            )
+                finally:
+                    self._pg_pool.putconn(test_conn)
                 self.sql_backend = "postgres"
                 self.sql_available = True
                 print(
-                    f"Connected to PostgreSQL: {os.getenv('PGHOST')}/{os.getenv('PGDATABASE', 'aviationdb')} "
+                    f"Connected to PostgreSQL pool: {os.getenv('PGHOST')}/{os.getenv('PGDATABASE', 'aviationdb')} "
                     f"(search_path={','.join(self.sql_visible_schemas) or 'default'})"
                 )
             except Exception as exc:
                 self.sql_unavailable_reason = str(exc)
+                self._pg_pool = None
                 if self.allow_sqlite_fallback:
                     self.use_postgres = False
                     self.db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
@@ -328,8 +374,9 @@ class UnifiedRetriever:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
-        if FABRIC_BEARER_TOKEN:
-            req.add_header("Authorization", f"Bearer {FABRIC_BEARER_TOKEN}")
+        token = _get_fabric_bearer_token()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
@@ -363,7 +410,7 @@ class UnifiedRetriever:
 
         # ICAO codes in free text (case-sensitive to avoid matching regular words).
         for match in re.findall(r"\b[A-Z]{4}\b", text):
-            if match not in out:
+            if match not in out and match not in _ENGLISH_4LETTER_BLOCKLIST:
                 out.append(match)
 
         # Common IATA references used by users in natural language.
@@ -688,8 +735,9 @@ class UnifiedRetriever:
             return {"status": "warn", "detail": "not_configured"}
 
         req = urllib.request.Request(endpoint, method="GET")
-        if FABRIC_BEARER_TOKEN:
-            req.add_header("Authorization", f"Bearer {FABRIC_BEARER_TOKEN}")
+        token = _get_fabric_bearer_token()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 return {
@@ -707,12 +755,13 @@ class UnifiedRetriever:
     def fabric_preflight(self) -> Dict[str, Any]:
         checks: List[Dict[str, Any]] = []
 
-        token_status = "pass" if FABRIC_BEARER_TOKEN else "warn"
+        fabric_token = _get_fabric_bearer_token()
+        token_status = "pass" if fabric_token else "warn"
         checks.append(
             {
                 "name": "fabric_bearer_token",
                 "status": token_status,
-                "detail": "present" if FABRIC_BEARER_TOKEN else "missing_optional_or_not_configured",
+                "detail": "present" if fabric_token else "missing_optional_or_not_configured",
                 "mode": "n/a",
             }
         )
@@ -814,8 +863,27 @@ class UnifiedRetriever:
             "checks": checks,
         }
 
+    def _get_pg_connection(self) -> Any:
+        """Acquire a connection from the PostgreSQL pool."""
+        if self._pg_pool is None:
+            return None
+        try:
+            conn = self._pg_pool.getconn()
+            conn.autocommit = True
+            return conn
+        except Exception:
+            return None
+
+    def _put_pg_connection(self, conn: Any) -> None:
+        """Return a connection to the PostgreSQL pool."""
+        if self._pg_pool is not None and conn is not None:
+            try:
+                self._pg_pool.putconn(conn)
+            except Exception:
+                pass
+
     def current_sql_schema(self) -> Dict[str, Any]:
-        if self.db is None:
+        if not self.sql_available:
             return {
                 "source": "unavailable",
                 "collected_at": self._now_iso(),
@@ -825,9 +893,18 @@ class UnifiedRetriever:
             }
 
         tables: List[Dict[str, Any]] = []
-        try:
-            cur = self.db.cursor()
-            if self.use_postgres:
+        if self.use_postgres:
+            conn = self._get_pg_connection()
+            if conn is None:
+                return {
+                    "source": "unavailable",
+                    "collected_at": self._now_iso(),
+                    "schema_version": "none",
+                    "error": "pg_pool_connection_unavailable",
+                    "tables": [],
+                }
+            try:
+                cur = conn.cursor()
                 visible_schemas = self.sql_visible_schemas or ["public"]
                 cur.execute(
                     """
@@ -852,21 +929,45 @@ class UnifiedRetriever:
                     )
                     cols = [{"name": str(r[0]), "type": str(r[1])} for r in cur.fetchall()]
                     tables.append({"schema": schema_name, "table": table, "columns": cols})
-            else:
+                cur.close()
+            except Exception as exc:
+                return {
+                    "source": "live",
+                    "collected_at": self._now_iso(),
+                    "schema_version": "error",
+                    "error": str(exc),
+                    "tables": [],
+                }
+            finally:
+                self._put_pg_connection(conn)
+        else:
+            if self.db is None:
+                return {
+                    "source": "unavailable",
+                    "collected_at": self._now_iso(),
+                    "schema_version": "none",
+                    "error": "sqlite_connection_unavailable",
+                    "tables": [],
+                }
+            try:
+                cur = self.db.cursor()
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 table_names = [str(row[0]) for row in cur.fetchall()]
                 for table in table_names:
-                    cur.execute(f"PRAGMA table_info('{table}')")
+                    # PRAGMA does not support parameterized queries in SQLite.
+                    # Table names come from sqlite_master so are trusted; use double-quoted identifier.
+                    safe_name = table.replace('"', '""')
+                    cur.execute(f'PRAGMA table_info("{safe_name}")')
                     cols = [{"name": str(r[1]), "type": str(r[2])} for r in cur.fetchall()]
                     tables.append({"table": table, "columns": cols})
-        except Exception as exc:
-            return {
-                "source": "live" if self.sql_backend == "postgres" else "fallback",
-                "collected_at": self._now_iso(),
-                "schema_version": "error",
-                "error": str(exc),
-                "tables": [],
-            }
+            except Exception as exc:
+                return {
+                    "source": "fallback",
+                    "collected_at": self._now_iso(),
+                    "schema_version": "error",
+                    "error": str(exc),
+                    "tables": [],
+                }
         return {
             "source": "live" if self.sql_backend == "postgres" else "fallback",
             "collected_at": self._now_iso(),
@@ -927,7 +1028,7 @@ class UnifiedRetriever:
         return None
 
     def execute_sql_query(self, sql_query: str) -> Tuple[List[Dict[str, Any]], List[Citation]]:
-        if not self.sql_available or self.db is None:
+        if not self.sql_available:
             return [self._source_unavailable_row("SQL", self.sql_unavailable_reason or "sql_backend_not_available")], []
 
         validation_error = self._validate_sql_query(sql_query)
@@ -948,21 +1049,46 @@ class UnifiedRetriever:
                 )
             ], []
 
-        try:
-            cur = self.db.cursor()
-            cur.execute(sql_query)
-            rows = cur.fetchall()
-            columns = [desc[0] for desc in cur.description] if cur.description else []
-            dict_rows = [dict(zip(columns, row)) for row in rows]
-        except Exception as exc:
-            return [
-                self._source_error_row(
-                    source="SQL",
-                    code="sql_runtime_error",
-                    detail=str(exc),
-                    extra={"sql": sql_query},
-                )
-            ], []
+        if self.use_postgres:
+            conn = self._get_pg_connection()
+            if conn is None:
+                return [self._source_unavailable_row("SQL", "pg_pool_connection_unavailable")], []
+            try:
+                cur = conn.cursor()
+                cur.execute(sql_query)
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                dict_rows = [dict(zip(columns, row)) for row in rows]
+                cur.close()
+            except Exception as exc:
+                return [
+                    self._source_error_row(
+                        source="SQL",
+                        code="sql_runtime_error",
+                        detail=str(exc),
+                        extra={"sql": sql_query},
+                    )
+                ], []
+            finally:
+                self._put_pg_connection(conn)
+        else:
+            if self.db is None:
+                return [self._source_unavailable_row("SQL", "sqlite_connection_unavailable")], []
+            try:
+                cur = self.db.cursor()
+                cur.execute(sql_query)
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                dict_rows = [dict(zip(columns, row)) for row in rows]
+            except Exception as exc:
+                return [
+                    self._source_error_row(
+                        source="SQL",
+                        code="sql_runtime_error",
+                        detail=str(exc),
+                        extra={"sql": sql_query},
+                    )
+                ], []
 
         citations: List[Citation] = []
         for idx, row in enumerate(dict_rows[:10], start=1):
@@ -1265,7 +1391,10 @@ class UnifiedRetriever:
         for pattern in blocked_patterns:
             if re.search(pattern, text, flags=re.IGNORECASE):
                 return f"kql_contains_blocked_operation:{pattern}"
-        if ";" in text:
+        # Check for semicolons outside of string literals to prevent multi-statement injection.
+        stripped = re.sub(r'"[^"]*"', '', text)
+        stripped = re.sub(r"'[^']*'", '', stripped)
+        if ";" in stripped:
             return "kql_multiple_statements_not_allowed"
         return None
 
@@ -1273,9 +1402,16 @@ class UnifiedRetriever:
         text = (csl or "").strip()
         if not text:
             return text
+        # Already has an explicit time window — don't double-filter.
         if re.search(r"\bago\s*\(", text, flags=re.IGNORECASE):
             return text
-        if re.search(r"\btimestamp\b", text, flags=re.IGNORECASE):
+        if re.search(r"\bbetween\b.*\bdatetime\b", text, flags=re.IGNORECASE):
+            return text
+        # Only append a time filter when "timestamp" appears as a column reference
+        # in a pipe expression (not inside a string literal).
+        stripped = re.sub(r'"[^"]*"', '', text)
+        stripped = re.sub(r"'[^']*'", '', stripped)
+        if re.search(r"\btimestamp\b", stripped, flags=re.IGNORECASE):
             return f"{text}\n| where timestamp > ago({max(1, int(window_minutes))}m)"
         return text
 
@@ -1784,17 +1920,26 @@ Retrieved Data:
             )
             return response.choices[0].message.content
         except Exception as exc:
-            return f"Unable to synthesize with model right now ({exc}). Retrieved context: {str(context)[:1200]}"
+            logger.error("LLM synthesis failed: %s", exc)
+            return "I'm unable to generate a response right now due to a temporary service issue. Please try again shortly."
 
 
 # =============================================================================
 # Convenience Functions
 # =============================================================================
 
+_singleton_retriever: Optional[UnifiedRetriever] = None
+_singleton_lock = threading.Lock()
+
+
 def answer_question(query: str, use_llm_routing: bool = True) -> dict:
     """Simple function to get an answer with citations."""
-    retriever = UnifiedRetriever()
-    result = retriever.answer(query, use_llm_routing)
+    global _singleton_retriever
+    if _singleton_retriever is None:
+        with _singleton_lock:
+            if _singleton_retriever is None:
+                _singleton_retriever = UnifiedRetriever()
+    result = _singleton_retriever.answer(query, use_llm_routing)
     return result.to_dict()
 
 

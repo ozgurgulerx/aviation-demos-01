@@ -27,8 +27,8 @@ const AzurePiiResponseSchema = z.object({
   }),
 });
 
-// PII categories to check for (banking-relevant)
-export const BANKING_PII_CATEGORIES = [
+// PII categories to detect (matching backend configuration)
+export const PII_CATEGORIES = [
   "Person",
   "PersonType",
   "PhoneNumber",
@@ -45,16 +45,16 @@ export const BANKING_PII_CATEGORIES = [
   "IPAddress",
 ] as const;
 
-export type BankingPiiCategory = (typeof BANKING_PII_CATEGORIES)[number];
+export type PiiCategory = (typeof PII_CATEGORIES)[number];
 
 interface CheckPiiOptions {
   text: string;
-  categories?: BankingPiiCategory[];
+  categories?: PiiCategory[];
   confidenceThreshold?: number;
 }
 
 interface FallbackPattern {
-  category: BankingPiiCategory;
+  category: PiiCategory;
   regex: RegExp;
   validate?: (value: string) => boolean;
 }
@@ -134,7 +134,7 @@ function applyFallbackRedaction(text: string, entities: PiiEntity[]): string {
   return redacted;
 }
 
-function runFallbackPiiDetection(text: string, categories: BankingPiiCategory[]): PiiCheckResult {
+function runFallbackPiiDetection(text: string, categories: PiiCategory[]): PiiCheckResult {
   const detected: PiiEntity[] = [];
   const seen = new Set<string>();
 
@@ -206,7 +206,7 @@ async function getAzureAccessToken(): Promise<string | null> {
  */
 export async function checkPii({
   text,
-  categories = [...BANKING_PII_CATEGORIES],
+  categories = [...PII_CATEGORIES],
   confidenceThreshold = 0.8,
 }: CheckPiiOptions): Promise<PiiCheckResult> {
   const containerEndpoint = process.env.PII_CONTAINER_ENDPOINT;
@@ -294,7 +294,7 @@ export async function checkPii({
     const filteredEntities: PiiEntity[] = document.entities
       .filter((e) =>
         e.confidenceScore >= confidenceThreshold &&
-        categories.includes(e.category as BankingPiiCategory)
+        categories.includes(e.category as PiiCategory)
       )
       .map((e) => ({
         text: e.text,
