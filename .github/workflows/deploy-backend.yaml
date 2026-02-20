@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 env:
-  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'avrag705508acr' }}
-  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'avrag705508acr.azurecr.io' }}
+  AZURE_CONTAINER_REGISTRY_NAME: avrag705508acr
+  AZURE_CONTAINER_REGISTRY: avrag705508acr.azurecr.io
   IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
   IMAGE_TAG: ${{ github.sha }}
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
@@ -176,7 +176,30 @@ jobs:
 
       - name: Validate AKS can pull from ACR
         run: |
-          if az aks check-acr --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
+          check_acr_access() {
+            local acr_name="$1"
+            local output
+            local status
+
+            set +e
+            output="$(az aks check-acr --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --acr "${acr_name}" 2>&1)"
+            status=$?
+            set -e
+
+            echo "$output"
+
+            if [ "$status" -ne 0 ]; then
+              return 1
+            fi
+
+            if echo "$output" | grep -Eiq 'rejected token exchange|401|unauthorized|forbidden'; then
+              return 1
+            fi
+
+            return 0
+          }
+
+          if check_acr_access "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
             exit 0
           fi
 
@@ -184,9 +207,9 @@ jobs:
           az aks update --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --attach-acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
 
           echo "Re-checking AKS to ACR image pull permissions..."
-          if ! az aks check-acr --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
+          if ! check_acr_access "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
             echo "::error::AKS kubelet identity still cannot pull from ACR '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'."
-            echo "::error::Verify ACR tenant/subscription alignment and AcrPull role assignments."
+            echo "::error::Verify AcrPull role assignment for the AKS kubelet identity and ensure ACR tenant/subscription alignment."
             exit 1
           fi
 
