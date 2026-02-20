@@ -59,6 +59,29 @@ class ContextReconcilerTests(unittest.TestCase):
         self.assertGreaterEqual(conflicts["count"], 1)
         self.assertIn(conflicts["severity"], {"medium", "high"})
 
+    def test_reconcile_does_not_mark_authoritative_fallback_as_filled(self):
+        source_results = {
+            "KQL": [{"id": "k1", "metric": "wind_alert", "value": 1}],
+        }
+        required = [{"name": "METAR", "optional": False}]
+        authoritative = {"METAR": ["KQL"]}
+
+        out = reconcile_context(
+            source_results=source_results,
+            required_evidence=required,
+            authoritative_map=authoritative,
+            enable_evidence_slotting=True,
+            enable_conflict_detection=False,
+        )
+
+        coverage = out["coverage_summary"]
+        self.assertEqual(coverage["required_total"], 1)
+        self.assertEqual(coverage["required_filled"], 0)
+        self.assertEqual(coverage["missing_required"], ["METAR"])
+        slots = coverage["slots"]
+        self.assertEqual(slots[0]["status"], "missing")
+        self.assertTrue(slots[0]["authoritative_candidates"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -260,9 +260,14 @@ export default function ChatPage() {
 
         if (newCitations.length > 0) {
           setCitations((previous) => {
-            const existingRowIds = new Set(previous.map((citation) => citation.rowId));
+            const existingCitationKeys = new Set(
+              previous.map((citation) => `${citation.provider}::${citation.dataset}::${citation.rowId}`)
+            );
             const uniqueNew = newCitations
-              .filter((citation) => !existingRowIds.has(citation.rowId))
+              .filter(
+                (citation) =>
+                  !existingCitationKeys.has(`${citation.provider}::${citation.dataset}::${citation.rowId}`)
+              )
               .map((citation, index) => ({
                 ...citation,
                 id: previous.length + index + 1,

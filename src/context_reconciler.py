@@ -194,12 +194,22 @@ def build_evidence_slots(
         optional = bool(req.get("optional", False))
         required_total += 0 if optional else 1
         candidates = [it for it in items if str(it.get("evidence_type", "")).strip() == name]
+        authoritative_candidates: List[Dict[str, Any]] = []
         if not candidates:
             for source in authoritative_map.get(name, []):
-                source_candidates = [it for it in items if it.get("source") == source]
-                if source_candidates:
-                    candidates = source_candidates[:1]
-                    break
+                authoritative_candidates.extend([it for it in items if it.get("source") == source][:2])
+            # Keep candidates deterministic and compact for UI/telemetry use.
+            dedup_seen: set[tuple[str, str]] = set()
+            deduped_authoritative: List[Dict[str, Any]] = []
+            for candidate in authoritative_candidates:
+                key = (str(candidate.get("source", "")), str(candidate.get("identifier", "")))
+                if key in dedup_seen:
+                    continue
+                dedup_seen.add(key)
+                deduped_authoritative.append(candidate)
+            authoritative_candidates = deduped_authoritative[:3]
+
+        # Only explicit evidence-type matches count as filled coverage.
         status = "filled" if candidates else "missing"
         if status == "filled" and optional:
             optional_filled += 1
@@ -219,6 +229,14 @@ def build_evidence_slots(
                         "fusion_score": c.get("fusion_score"),
                     }
                     for c in candidates[:3]
+                ],
+                "authoritative_candidates": [
+                    {
+                        "source": c.get("source"),
+                        "identifier": c.get("identifier"),
+                        "fusion_score": c.get("fusion_score"),
+                    }
+                    for c in authoritative_candidates
                 ],
             }
         )

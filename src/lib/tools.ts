@@ -1,5 +1,4 @@
 import { z } from "zod";
-import type { Citation } from "@/types";
 
 // Tool parameter schemas - [TBD: Define aviation-specific tool parameters]
 export const LookupDataParamsSchema = z.object({
@@ -20,6 +19,7 @@ export type LookupDataParams = z.infer<typeof LookupDataParamsSchema>;
 export async function lookupData(
   params: LookupDataParams
 ): Promise<null> {
+  void params;
   // [TBD: Implement aviation data lookup]
   await new Promise((resolve) => setTimeout(resolve, 500));
   return null;

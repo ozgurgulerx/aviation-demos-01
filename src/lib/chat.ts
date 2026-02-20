@@ -81,6 +81,7 @@ export interface StreamEvent {
   reasoning?: string;
   event_id?: string;
   parent_event_id?: string;
+  timestamp?: string;
   started_at?: string;
   finished_at?: string;
   duration_ms?: number;
@@ -127,7 +128,7 @@ export function parseSSEFrames(buffer: string): {
 }
 
 export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
-  const timestamp = new Date().toISOString();
+  const timestamp = resolveEventTimestamp(event);
   const fallbackId = generateId();
 
   switch (event.type) {
@@ -314,6 +315,7 @@ export function updateSourceHealth(
       ? event.source_meta?.endpoint_label
       : undefined);
   const freshness = event.source_meta?.freshness;
+  const eventTimestamp = resolveEventTimestamp(event);
 
   if (!existing) {
     next.push({
@@ -325,7 +327,7 @@ export function updateSourceHealth(
             ? "ready"
             : "idle",
       rowCount: event.row_count || 0,
-      updatedAt: new Date().toISOString(),
+      updatedAt: eventTimestamp,
       mode: mode || "unknown",
       freshness,
     });
@@ -346,12 +348,23 @@ export function updateSourceHealth(
             event.type === "source_call_done"
               ? event.row_count || item.rowCount
               : item.rowCount,
-          updatedAt: new Date().toISOString(),
+          updatedAt: eventTimestamp,
           mode: (mode as SourceHealthStatus["mode"]) || item.mode,
           freshness: freshness || item.freshness,
         }
       : item
   );
+}
+
+function resolveEventTimestamp(event: StreamEvent): string {
+  const candidate = event.finished_at || event.started_at || event.timestamp;
+  if (candidate) {
+    const parsed = new Date(candidate);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  return new Date().toISOString();
 }
 
 function normalizeSourceName(source?: string): string {
