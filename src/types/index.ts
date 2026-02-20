@@ -86,7 +86,11 @@ export interface TelemetryEvent {
     | "agent_done"
     | "agent_error"
     | "text"
-    | "progress";
+    | "progress"
+    | "scenario_loaded"
+    | "freshness_guardrail"
+    | "fallback_mode_changed"
+    | "fabric_preflight";
   stage: string;
   message: string;
   status: TelemetryEventStatus;
@@ -105,6 +109,7 @@ export interface TelemetryEvent {
     freshness?: string;
   };
   evidenceRefs?: number[];
+  mode?: "live" | "fallback" | "unknown";
 }
 
 export interface EvidenceManifestItem {
@@ -122,6 +127,24 @@ export interface SourceHealthStatus {
   status: "idle" | "querying" | "ready" | "error";
   rowCount: number;
   updatedAt?: string;
+  mode?: "live" | "fallback" | "unknown";
+  freshness?: string;
+}
+
+export interface FabricPreflightCheck {
+  name: string;
+  status: "pass" | "warn" | "fail";
+  detail: string;
+  mode?: string;
+  endpoint?: string;
+}
+
+export interface FabricPreflightStatus {
+  timestamp?: string;
+  overall_status: "pass" | "warn" | "fail";
+  live_path_available?: boolean;
+  checks?: FabricPreflightCheck[];
+  error?: string;
 }
 
 // API Response Types
@@ -136,4 +159,6 @@ export const SourceHealthSchema = z.object({
   status: z.enum(["idle", "querying", "ready", "error"]),
   rowCount: z.number(),
   updatedAt: z.string().optional(),
+  mode: z.enum(["live", "fallback", "unknown"]).optional(),
+  freshness: z.string().optional(),
 });

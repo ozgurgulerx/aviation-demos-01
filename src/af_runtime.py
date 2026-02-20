@@ -295,6 +295,7 @@ class AgentFrameworkRuntime:
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
+        demo_scenario: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         sid = session_id or str(uuid.uuid4())
 
@@ -305,6 +306,26 @@ class AgentFrameworkRuntime:
             "sessionId": sid,
             "framework": self._framework_label,
         }
+
+        if demo_scenario:
+            query = self._apply_demo_scenario(query, demo_scenario)
+            yield {
+                "type": "scenario_loaded",
+                "stage": "scenario",
+                "scenario": demo_scenario,
+                "message": f"Demo scenario loaded: {demo_scenario}",
+                "status": "completed",
+                "sessionId": sid,
+            }
+
+        if freshness_sla_minutes:
+            yield {
+                "type": "freshness_guardrail",
+                "stage": "freshness",
+                "message": f"Freshness SLA set to {freshness_sla_minutes} minutes",
+                "status": "info",
+                "sessionId": sid,
+            }
 
         pii_result = self.retriever.check_pii(query)
         if pii_result.has_pii:
@@ -333,6 +354,7 @@ class AgentFrameworkRuntime:
                     explain_retrieval=explain_retrieval,
                     risk_mode=risk_mode,
                     ask_recommendation=ask_recommendation,
+                    demo_scenario=demo_scenario,
                 )
                 return
             except Exception as exc:
@@ -354,6 +376,7 @@ class AgentFrameworkRuntime:
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
+            demo_scenario=demo_scenario,
         )
 
     def _run_with_agent_framework(
@@ -367,6 +390,7 @@ class AgentFrameworkRuntime:
         explain_retrieval: bool,
         risk_mode: str,
         ask_recommendation: bool,
+        demo_scenario: Optional[str],
     ) -> Generator[Dict[str, Any], None, None]:
         session = self._get_or_create_session(session_id)
         call_id = str(uuid.uuid4())
@@ -384,6 +408,7 @@ class AgentFrameworkRuntime:
                 "explain_retrieval": explain_retrieval,
                 "risk_mode": risk_mode,
                 "ask_recommendation": ask_recommendation,
+                "demo_scenario": demo_scenario,
             },
         }
 
@@ -400,7 +425,8 @@ class AgentFrameworkRuntime:
         if ctx.retrieval_plan:
             yield {"type": "retrieval_plan", "plan": ctx.retrieval_plan}
         for trace in ctx.source_traces:
-            yield trace
+            for item in self._emit_source_trace_events(trace):
+                yield item
         yield {
             "type": "tool_result",
             "id": call_id,
@@ -455,6 +481,7 @@ class AgentFrameworkRuntime:
         explain_retrieval: bool,
         risk_mode: str,
         ask_recommendation: bool,
+        demo_scenario: Optional[str],
     ) -> Generator[Dict[str, Any], None, None]:
         call_id = str(uuid.uuid4())
         yield {
@@ -470,6 +497,7 @@ class AgentFrameworkRuntime:
                 "explain_retrieval": explain_retrieval,
                 "risk_mode": risk_mode,
                 "ask_recommendation": ask_recommendation,
+                "demo_scenario": demo_scenario,
             },
         }
 
@@ -491,7 +519,8 @@ class AgentFrameworkRuntime:
         if tool_result.get("retrieval_plan"):
             yield {"type": "retrieval_plan", "plan": tool_result.get("retrieval_plan")}
         for trace in tool_result.get("source_traces", []):
-            yield trace
+            for item in self._emit_source_trace_events(trace):
+                yield item
 
         yield {
             "type": "tool_result",
@@ -654,6 +683,32 @@ class AgentFrameworkRuntime:
                 chunk += " "
             yield {"type": "agent_update", "content": chunk}
 
+    def _emit_source_trace_events(self, trace: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+        yield trace
+        source_meta = trace.get("source_meta") or {}
+        mode = (source_meta.get("endpoint_label") or "").strip().lower()
+        source = trace.get("source")
+        if trace.get("type") == "source_call_start" and mode in {"live", "fallback"} and source:
+            yield {
+                "type": "fallback_mode_changed",
+                "stage": "source_mode",
+                "source": source,
+                "mode": mode,
+                "message": f"{source} is running in {mode} mode",
+                "status": "info" if mode == "live" else "running",
+            }
+
+    def _apply_demo_scenario(self, query: str, demo_scenario: str) -> str:
+        scenario_prompts = {
+            "weather-spike": "Scenario context: severe weather spike around departure bank. Prioritize KQL hazard window and downstream impacts.",
+            "runway-notam": "Scenario context: runway NOTAM closure impacts airport throughput. Prioritize NOTAM evidence and dependency graph.",
+            "ground-bottleneck": "Scenario context: ground handling bottleneck at major hub. Prioritize turnaround telemetry, gate utilization, and mitigation recommendation.",
+        }
+        prefix = scenario_prompts.get((demo_scenario or "").strip().lower())
+        if not prefix:
+            return query
+        return f"{prefix}\n\nUser query: {query}"
+
     def _format_citations(self, citations: List[Citation]) -> List[Dict[str, Any]]:
         now = datetime.now(timezone.utc).isoformat()
         dataset_by_provider = {
@@ -694,6 +749,7 @@ class AgentFrameworkRuntime:
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
+        demo_scenario: Optional[str] = None,
     ) -> Dict[str, Any]:
         answer_parts: List[str] = []
         citations: List[Dict[str, Any]] = []
@@ -710,6 +766,7 @@ class AgentFrameworkRuntime:
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
+            demo_scenario=demo_scenario,
         ):
             if event.get("type") == "agent_update" and event.get("content"):
                 answer_parts.append(str(event["content"]))

@@ -1,6 +1,6 @@
 "use client";
 
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import Image from "next/image";
 import {
   ChevronLeft,
@@ -13,6 +13,7 @@ import {
   RefreshCw,
   AlertTriangle,
   Gauge,
+  Lock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -21,6 +22,7 @@ import { Separator } from "@/components/ui/separator";
 import { cn, formatDateTime } from "@/lib/utils";
 import { PAIR_TRUST_NOTES } from "@/data/seed";
 import { getDatastoreVisual } from "@/lib/datastore";
+import { motionTokens } from "@/lib/motion";
 import type { Citation, SourceHealthStatus } from "@/types";
 
 interface SourcesPanelProps {
@@ -46,11 +48,13 @@ export function SourcesPanel({
   isLoading,
   confidenceLabel,
 }: SourcesPanelProps) {
+  const reducedMotion = useReducedMotion();
+
   return (
     <motion.aside
       initial={false}
       animate={{ width: isCollapsed ? 64 : 360 }}
-      transition={{ duration: 0.2, ease: "easeInOut" }}
+      transition={{ duration: reducedMotion ? 0 : motionTokens.panel, ease: motionTokens.easeInOut }}
       className="relative flex h-full flex-col border-l border-border bg-surface-1/80"
     >
       <Button
@@ -66,7 +70,13 @@ export function SourcesPanel({
       <div className="border-b border-border p-4">
         <AnimatePresence mode="wait">
           {!isCollapsed ? (
-            <motion.div key="expanded" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+            <motion.div
+              key="expanded"
+              initial={reducedMotion ? false : { opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={reducedMotion ? { opacity: 1 } : { opacity: 0 }}
+              transition={{ duration: reducedMotion ? 0 : motionTokens.state }}
+            >
               <div className="mb-3 flex items-center justify-between gap-2">
                 <h2 className="font-display text-sm font-semibold">Evidence Ledger</h2>
                 <Badge variant="gold">{citations.length} refs</Badge>
@@ -82,13 +92,28 @@ export function SourcesPanel({
                   <p className="font-semibold text-foreground">{confidenceLabel}</p>
                 </div>
               </div>
+
+              <AnimatePresence>
+                {!isLoading && citations.length > 0 && (
+                  <motion.div
+                    initial={reducedMotion ? false : { opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
+                    transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
+                    className="mt-3 flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-[11px] text-emerald-700 dark:text-emerald-300"
+                  >
+                    <Lock className="h-3.5 w-3.5" />
+                    Evidence manifest locked for this answer.
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </motion.div>
           ) : (
             <motion.div
               key="collapsed"
-              initial={{ opacity: 0 }}
+              initial={reducedMotion ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              exit={reducedMotion ? { opacity: 1 } : { opacity: 0 }}
               className="flex justify-center"
             >
               <Database className="h-4 w-4 text-muted-foreground" />
@@ -101,9 +126,10 @@ export function SourcesPanel({
         <AnimatePresence>
           {!isCollapsed && (
             <motion.div
-              initial={{ opacity: 0 }}
+              initial={reducedMotion ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              exit={reducedMotion ? { opacity: 1 } : { opacity: 0 }}
+              transition={{ duration: reducedMotion ? 0 : motionTokens.state }}
               className="space-y-4 p-4"
             >
               <section className="space-y-2">
@@ -115,55 +141,104 @@ export function SourcesPanel({
                     Source status appears after query execution starts.
                   </div>
                 ) : (
-                  sourceHealth.map((source) => {
-                    const visual = getDatastoreVisual(source.source);
-                    return (
-                      <div key={source.source} className="rounded-lg border border-border bg-card px-3 py-2 text-xs">
-                        <div className="mb-1 flex items-center justify-between gap-2">
-                          <div className="flex min-w-0 items-center gap-2">
-                            <div className="h-7 w-7 shrink-0 overflow-hidden rounded-md border border-border bg-white/80 p-0.5">
-                              <Image
-                                src={visual.iconSrc}
-                                alt={visual.shortLabel}
-                                width={28}
-                                height={28}
-                                className="h-full w-full object-contain"
-                              />
+                  <AnimatePresence initial={false}>
+                    {sourceHealth.map((source) => {
+                      const visual = getDatastoreVisual(source.source);
+
+                      return (
+                        <motion.div
+                          key={source.source}
+                          layout
+                          animate={{ opacity: 1, y: 0 }}
+                          initial={
+                            reducedMotion
+                              ? false
+                              : {
+                                  opacity: 0,
+                                  y: 6,
+                                }
+                          }
+                          transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
+                          className={cn(
+                            "relative rounded-lg border bg-card px-3 py-2 text-xs",
+                            source.status === "querying" && "border-primary/40",
+                            source.status === "ready" && "border-emerald-500/30"
+                          )}
+                        >
+                          {source.status === "querying" && !reducedMotion && (
+                            <motion.span
+                              className="pointer-events-none absolute inset-0 rounded-lg border border-primary/45"
+                              animate={{ opacity: [0.65, 0.2, 0.65] }}
+                              transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+                            />
+                          )}
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <motion.div
+                                animate={
+                                  source.status === "querying" && !reducedMotion
+                                    ? { scale: [1, 1.04, 1] }
+                                    : { scale: 1 }
+                                }
+                                transition={{ duration: 1.2, repeat: source.status === "querying" ? Infinity : 0 }}
+                                className="h-7 w-7 shrink-0 overflow-hidden rounded-md border border-border bg-white/80 p-0.5"
+                              >
+                                <Image
+                                  src={visual.iconSrc}
+                                  alt={visual.shortLabel}
+                                  width={28}
+                                  height={28}
+                                  className="h-full w-full object-contain"
+                                />
+                              </motion.div>
+                              <div className="min-w-0">
+                                <span className="block truncate font-medium text-foreground">{visual.longLabel}</span>
+                                {visual.isFabric && (
+                                  <span className="text-[10px] font-semibold uppercase tracking-[0.09em] text-primary">
+                                    Fabric datastore
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                            <div className="min-w-0">
-                              <span className="block truncate font-medium text-foreground">
-                                {visual.longLabel}
-                              </span>
-                              {visual.isFabric && (
-                                <span className="text-[10px] font-semibold uppercase tracking-[0.09em] text-primary">
-                                  Fabric datastore
-                                </span>
-                              )}
-                            </div>
+                            <Badge
+                              variant={
+                                source.status === "ready"
+                                  ? "success"
+                                  : source.status === "querying"
+                                    ? "warning"
+                                    : source.status === "error"
+                                      ? "destructive"
+                                      : "outline"
+                              }
+                            >
+                              {source.status}
+                            </Badge>
                           </div>
-                          <Badge
-                            variant={
-                              source.status === "ready"
-                                ? "success"
-                                : source.status === "querying"
-                                  ? "warning"
-                                  : source.status === "error"
-                                    ? "destructive"
-                                    : "outline"
-                            }
-                          >
-                            {source.status}
-                          </Badge>
-                        </div>
-                        <div className="flex items-center justify-between text-muted-foreground">
-                          <span>{source.rowCount} rows</span>
-                          <span className="font-mono text-[10px]">
-                            {source.updatedAt ? formatDateTime(source.updatedAt) : "-"}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })
+                          <div className="flex items-center justify-between text-muted-foreground">
+                            <AnimatePresence mode="popLayout" initial={false}>
+                              <motion.span
+                                key={`${source.source}-${source.rowCount}`}
+                                initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
+                                transition={{ duration: reducedMotion ? 0 : motionTokens.micro }}
+                              >
+                                {source.rowCount} rows
+                              </motion.span>
+                            </AnimatePresence>
+                            <span className="font-mono text-[10px]">
+                              {source.updatedAt ? formatDateTime(source.updatedAt) : "-"}
+                            </span>
+                          </div>
+                          {source.mode && (
+                            <div className="mt-1 text-[10px] text-muted-foreground">
+                              Retrieval mode: <span className="font-semibold text-foreground">{source.mode}</span>
+                            </div>
+                          )}
+                        </motion.div>
+                      );
+                    })}
+                  </AnimatePresence>
                 )}
               </section>
 
@@ -263,9 +338,14 @@ function CitationCard({
   isActive: boolean;
   onClick: () => void;
 }) {
+  const reducedMotion = useReducedMotion();
+
   return (
-    <button
+    <motion.button
       onClick={onClick}
+      initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
       className={cn(
         "w-full rounded-lg border p-3 text-left transition-all",
         isActive
@@ -303,12 +383,10 @@ function CitationCard({
         {citation.excerpt && (
           <>
             <Separator className="my-2" />
-            <p className="line-clamp-3 text-xs italic text-muted-foreground">
-              &ldquo;{citation.excerpt}&rdquo;
-            </p>
+            <p className="line-clamp-3 text-xs italic text-muted-foreground">&ldquo;{citation.excerpt}&rdquo;</p>
           </>
         )}
       </div>
-    </button>
+    </motion.button>
   );
 }

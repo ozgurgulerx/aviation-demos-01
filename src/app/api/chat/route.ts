@@ -16,6 +16,7 @@ const RequestSchema = z.object({
   explainRetrieval: z.boolean().optional().default(false),
   riskMode: z.enum(["standard", "strict"]).optional().default("standard"),
   askRecommendation: z.boolean().optional().default(false),
+  demoScenario: z.string().optional(),
 });
 
 const PYTHON_API_URL =
@@ -76,6 +77,7 @@ export async function POST(request: NextRequest) {
       explainRetrieval,
       riskMode,
       askRecommendation,
+      demoScenario,
     } = parsed.data;
     const lastUserMessage = messages.filter((m) => m.role === "user").pop();
     if (!lastUserMessage) {
@@ -98,6 +100,7 @@ export async function POST(request: NextRequest) {
         explain_retrieval: explainRetrieval,
         risk_mode: riskMode,
         ask_recommendation: askRecommendation,
+        demo_scenario: demoScenario,
       }),
     });
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SourcesPanel } from "@/components/layout/sources-panel";
 import { ChatThread } from "@/components/chat/chat-thread";
@@ -30,16 +30,19 @@ import type {
   Citation,
   TelemetryEvent,
   SourceHealthStatus,
+  FabricPreflightStatus,
 } from "@/types";
 
 type RetrievalMode = "code-rag" | "foundry-iq";
 type QueryProfile = "pilot-brief" | "ops-live" | "compliance";
+type DemoScenario = "none" | "weather-spike" | "runway-notam" | "ground-bottleneck";
 
 function createInitialSourceHealth(): SourceHealthStatus[] {
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
     source: source.id,
     status: "idle",
     rowCount: 0,
+    mode: "unknown",
   }));
 }
 
@@ -50,6 +53,8 @@ export default function ChatPage() {
   const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>("code-rag");
   const [queryProfile, setQueryProfile] = useState<QueryProfile>("pilot-brief");
   const [explainRetrieval, setExplainRetrieval] = useState(true);
+  const [freshnessSlaMinutes, setFreshnessSlaMinutes] = useState<number>(60);
+  const [demoScenario, setDemoScenario] = useState<DemoScenario>("none");
 
   const [requiredSources, setRequiredSources] = useState<string[]>([]);
 
@@ -77,6 +82,8 @@ export default function ChatPage() {
   const [showFollowUps, setShowFollowUps] = useState(true);
   const [routeLabel, setRouteLabel] = useState<string>("Pending");
   const [confidenceLabel, setConfidenceLabel] = useState<string>("Awaiting run");
+  const [fabricPreflight, setFabricPreflight] = useState<FabricPreflightStatus | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
 
   const handleNewChat = useCallback(() => {
     setActiveConversationId(null);
@@ -118,6 +125,26 @@ export default function ChatPage() {
     );
   }, []);
 
+  const fetchFabricPreflight = useCallback(async () => {
+    setPreflightLoading(true);
+    try {
+      const response = await fetch("/api/fabric/preflight", { method: "GET" });
+      const payload = (await response.json()) as FabricPreflightStatus;
+      setFabricPreflight(payload);
+    } catch (error) {
+      setFabricPreflight({
+        overall_status: "fail",
+        error: error instanceof Error ? error.message : "Unable to fetch preflight",
+      });
+    } finally {
+      setPreflightLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchFabricPreflight();
+  }, [fetchFabricPreflight]);
+
   const handleSendMessage = useCallback(
     async (content: string) => {
       const conversationId = activeConversationId ?? generateId();
@@ -154,7 +181,9 @@ export default function ChatPage() {
             conversationId,
             queryProfile,
             requiredSources,
+            freshnessSlaMinutes,
             explainRetrieval,
+            demoScenario: demoScenario === "none" ? undefined : demoScenario,
           }),
         });
 
@@ -290,7 +319,9 @@ export default function ChatPage() {
       retrievalMode,
       queryProfile,
       requiredSources,
+      freshnessSlaMinutes,
       explainRetrieval,
+      demoScenario,
     ]
   );
 
@@ -308,6 +339,24 @@ export default function ChatPage() {
     },
     [handleSendMessage]
   );
+
+  const handleRetryLast = useCallback(() => {
+    if (isLoading) return;
+    const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
+    if (!lastUserMessage?.content) return;
+    void handleSendMessage(lastUserMessage.content);
+  }, [isLoading, messages, handleSendMessage]);
+
+  const preflightStatus = fabricPreflight?.overall_status || "warn";
+  const preflightVariant =
+    preflightStatus === "pass"
+      ? "success"
+      : preflightStatus === "warn"
+        ? "warning"
+        : "destructive";
+  const preflightText = preflightLoading
+    ? "Fabric preflight: checking"
+    : `Fabric preflight: ${preflightStatus.toUpperCase()}`;
 
   return (
     <div className="flex h-full bg-transparent">
@@ -331,6 +380,19 @@ export default function ChatPage() {
               <Badge variant={isLoading ? "warning" : "success"}>
                 {isLoading ? "Telemetry streaming" : "Idle"}
               </Badge>
+              <Badge variant={preflightVariant}>{preflightText}</Badge>
+              <Badge variant={fabricPreflight?.live_path_available ? "success" : "outline"}>
+                {fabricPreflight?.live_path_available ? "Live Fabric path ready" : "Fallback path available"}
+              </Badge>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => void fetchFabricPreflight()}
+                disabled={preflightLoading}
+                className="h-7 px-2 text-[11px]"
+              >
+                {preflightLoading ? "Checking..." : "Refresh preflight"}
+              </Button>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -350,6 +412,27 @@ export default function ChatPage() {
                   { value: "pilot-brief", label: "Pilot Brief" },
                   { value: "ops-live", label: "Ops Live" },
                   { value: "compliance", label: "Compliance" },
+                ]}
+              />
+
+              <ToggleGroup
+                value={String(freshnessSlaMinutes)}
+                onValueChange={(value) => setFreshnessSlaMinutes(Number(value))}
+                options={[
+                  { value: "15", label: "SLA 15m" },
+                  { value: "60", label: "SLA 60m" },
+                  { value: "180", label: "SLA 180m" },
+                ]}
+              />
+
+              <ToggleGroup
+                value={demoScenario}
+                onValueChange={(value) => setDemoScenario(value as DemoScenario)}
+                options={[
+                  { value: "none", label: "Scenario Off" },
+                  { value: "weather-spike", label: "Weather Spike" },
+                  { value: "runway-notam", label: "Runway NOTAM" },
+                  { value: "ground-bottleneck", label: "Ground Bottleneck" },
                 ]}
               />
 
@@ -396,6 +479,13 @@ export default function ChatPage() {
               );
             })}
           </div>
+          {fabricPreflight && (
+            <div className="mx-auto mt-2 max-w-5xl text-xs text-muted-foreground">
+              Preflight timestamp: {fabricPreflight.timestamp || "n/a"} · checks:{" "}
+              {fabricPreflight.checks?.length || 0}
+              {fabricPreflight.error ? ` · error: ${fabricPreflight.error}` : ""}
+            </div>
+          )}
         </div>
 
         <ChatThread
@@ -406,6 +496,7 @@ export default function ChatPage() {
           sourceHealth={sourceHealth}
           onCitationClick={handleCitationClick}
           activeCitationId={activeCitationId}
+          onRetryLast={handleRetryLast}
           onSendMessage={(message) => {
             void handleSendMessage(message);
           }}

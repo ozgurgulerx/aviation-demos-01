@@ -230,6 +230,130 @@ class UnifiedRetriever:
         except Exception as exc:
             return {"error": str(exc)}
 
+    def source_mode(self, source: str) -> str:
+        source_norm = (source or "").upper()
+        if source_norm == "KQL":
+            return "live" if FABRIC_KQL_ENDPOINT else "fallback"
+        if source_norm == "GRAPH":
+            return "live" if FABRIC_GRAPH_ENDPOINT else "fallback"
+        if source_norm == "NOSQL":
+            return "live" if FABRIC_NOSQL_ENDPOINT else "fallback"
+        if source_norm == "SQL":
+            return "live" if self.use_postgres else "fallback"
+        if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
+            return "live" if self.search_clients else "fallback"
+        return "unknown"
+
+    def source_event_meta(self, source: str) -> Dict[str, Any]:
+        source_norm = (source or "").upper()
+        store_type_map = {
+            "KQL": "fabric-eventhouse",
+            "GRAPH": "fabric-graph",
+            "NOSQL": "fabric-nosql",
+            "SQL": "warehouse-sql",
+            "VECTOR_OPS": "vector-ops",
+            "VECTOR_REG": "vector-regulatory",
+            "VECTOR_AIRPORT": "vector-airport",
+        }
+        freshness_map = {
+            "KQL": "near-real-time",
+            "GRAPH": "dependency-snapshot",
+            "NOSQL": "ops-doc-snapshot",
+            "SQL": "warehouse-snapshot",
+            "VECTOR_OPS": "indexed-context",
+            "VECTOR_REG": "indexed-context",
+            "VECTOR_AIRPORT": "indexed-context",
+        }
+        return {
+            "store_type": store_type_map.get(source_norm, "unknown"),
+            "endpoint_label": self.source_mode(source_norm),
+            "freshness": freshness_map.get(source_norm, "unknown"),
+        }
+
+    def _probe_endpoint(self, endpoint: str, timeout_seconds: int = 5) -> Dict[str, Any]:
+        if not endpoint:
+            return {"status": "warn", "detail": "not_configured"}
+
+        req = urllib.request.Request(endpoint, method="GET")
+        if FABRIC_BEARER_TOKEN:
+            req.add_header("Authorization", f"Bearer {FABRIC_BEARER_TOKEN}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                return {
+                    "status": "pass",
+                    "detail": f"reachable_http_{resp.status}",
+                }
+        except urllib.error.HTTPError as exc:
+            # Treat auth and method errors as reachable endpoint.
+            if exc.code in (400, 401, 403, 404, 405):
+                return {"status": "warn", "detail": f"reachable_http_{exc.code}"}
+            return {"status": "fail", "detail": f"http_{exc.code}"}
+        except Exception as exc:
+            return {"status": "fail", "detail": str(exc)}
+
+    def fabric_preflight(self) -> Dict[str, Any]:
+        checks: List[Dict[str, Any]] = []
+
+        token_status = "pass" if FABRIC_BEARER_TOKEN else "warn"
+        checks.append(
+            {
+                "name": "fabric_bearer_token",
+                "status": token_status,
+                "detail": "present" if FABRIC_BEARER_TOKEN else "missing_optional_or_not_configured",
+                "mode": "n/a",
+            }
+        )
+
+        endpoint_checks = [
+            ("fabric_kql_endpoint", FABRIC_KQL_ENDPOINT or "", "KQL"),
+            ("fabric_graph_endpoint", FABRIC_GRAPH_ENDPOINT or "", "GRAPH"),
+            ("fabric_nosql_endpoint", FABRIC_NOSQL_ENDPOINT or "", "NOSQL"),
+        ]
+
+        live_configured = False
+        for check_name, endpoint, source in endpoint_checks:
+            mode = self.source_mode(source)
+            if endpoint:
+                live_configured = True
+            probe = self._probe_endpoint(endpoint)
+            checks.append(
+                {
+                    "name": check_name,
+                    "status": probe["status"],
+                    "detail": probe["detail"],
+                    "mode": mode,
+                    "endpoint": endpoint if endpoint else "",
+                }
+            )
+
+        fallback_ready = bool(
+            self._latest_matching("data/e-opensky_recent/opensky_states_all_*.json")
+            or self._latest_matching("data/a-metars.cache.csv.gz")
+            or self._latest_matching("data/j-synthetic_ops_overlay/*/synthetic/ops_graph_edges.csv")
+        )
+        checks.append(
+            {
+                "name": "local_fallback_datasets",
+                "status": "pass" if fallback_ready else "warn",
+                "detail": "ready" if fallback_ready else "not_found",
+                "mode": "fallback",
+            }
+        )
+
+        if any(c["status"] == "fail" for c in checks):
+            overall = "fail"
+        elif any(c["status"] == "warn" for c in checks):
+            overall = "warn"
+        else:
+            overall = "pass"
+
+        return {
+            "timestamp": self._now_iso(),
+            "overall_status": overall,
+            "live_path_available": live_configured,
+            "checks": checks,
+        }
+
     # =========================================================================
     # Core Retrieval Methods
     # =========================================================================

@@ -45,6 +45,10 @@ export interface StreamEvent {
     | "agent_error"
     | "text"
     | "progress"
+    | "scenario_loaded"
+    | "freshness_guardrail"
+    | "fallback_mode_changed"
+    | "fabric_preflight"
     | "done"
     | "error";
   id?: string;
@@ -87,6 +91,8 @@ export interface StreamEvent {
   };
   retrieval_reason?: string;
   evidence_refs?: number[];
+  mode?: "live" | "fallback" | "unknown";
+  scenario?: string;
 }
 
 export function parseSSELine(line: string): StreamEvent | null {
@@ -208,6 +214,51 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         durationMs: event.duration_ms,
         eventId: event.event_id,
         parentEventId: event.parent_event_id,
+        sourceMeta: event.source_meta
+          ? {
+              storeType: event.source_meta.store_type,
+              endpointLabel: event.source_meta.endpoint_label,
+              freshness: event.source_meta.freshness,
+            }
+          : undefined,
+      };
+    case "scenario_loaded":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: event.stage || "scenario",
+        message: event.message || `Scenario loaded: ${event.scenario || "custom"}`,
+        status: "completed",
+        timestamp,
+      };
+    case "freshness_guardrail":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: event.stage || "freshness",
+        message: event.message || "Freshness guardrail applied",
+        status: "info",
+        timestamp,
+      };
+    case "fallback_mode_changed":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: event.stage || "source_mode",
+        message: event.message || "Source mode changed",
+        status: "info",
+        timestamp,
+        source: normalizeSourceName(event.source),
+        mode: event.mode || "unknown",
+      };
+    case "fabric_preflight":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: event.stage || "preflight",
+        message: event.message || "Fabric preflight completed",
+        status: event.mode === "fallback" ? "running" : "completed",
+        timestamp,
       };
     case "agent_done":
       return {
@@ -246,20 +297,37 @@ export function updateSourceHealth(
   current: SourceHealthStatus[],
   event: StreamEvent
 ): SourceHealthStatus[] {
-  if (event.type !== "source_call_start" && event.type !== "source_call_done") {
+  if (
+    event.type !== "source_call_start" &&
+    event.type !== "source_call_done" &&
+    event.type !== "fallback_mode_changed"
+  ) {
     return current;
   }
 
   const source = normalizeSourceName(event.source);
   const existing = current.find((item) => item.source === source);
   const next = [...current];
+  const mode =
+    event.mode ||
+    (event.source_meta?.endpoint_label === "live" || event.source_meta?.endpoint_label === "fallback"
+      ? event.source_meta?.endpoint_label
+      : undefined);
+  const freshness = event.source_meta?.freshness;
 
   if (!existing) {
     next.push({
       source,
-      status: event.type === "source_call_start" ? "querying" : "ready",
+      status:
+        event.type === "source_call_start"
+          ? "querying"
+          : event.type === "source_call_done"
+            ? "ready"
+            : "idle",
       rowCount: event.row_count || 0,
       updatedAt: new Date().toISOString(),
+      mode: mode || "unknown",
+      freshness,
     });
     return next;
   }
@@ -268,12 +336,19 @@ export function updateSourceHealth(
     item.source === source
       ? {
           ...item,
-          status: event.type === "source_call_start" ? "querying" : "ready",
+          status:
+            event.type === "source_call_start"
+              ? "querying"
+              : event.type === "source_call_done"
+                ? "ready"
+                : item.status,
           rowCount:
             event.type === "source_call_done"
               ? event.row_count || item.rowCount
               : item.rowCount,
           updatedAt: new Date().toISOString(),
+          mode: (mode as SourceHealthStatus["mode"]) || item.mode,
+          freshness: freshness || item.freshness,
         }
       : item
   );

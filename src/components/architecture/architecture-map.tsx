@@ -1,27 +1,52 @@
 "use client";
 
-import { motion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 import Image from "next/image";
 import { DATA_SOURCE_BLUEPRINT } from "@/data/seed";
 import type { SourceHealthStatus } from "@/types";
 import { cn } from "@/lib/utils";
 import { getDatastoreVisual } from "@/lib/datastore";
+import { motionTokens } from "@/lib/motion";
 
 interface ArchitectureMapProps {
   sourceHealth: SourceHealthStatus[];
 }
 
 export function ArchitectureMap({ sourceHealth }: ArchitectureMapProps) {
+  const reducedMotion = useReducedMotion();
+
   const getSourceState = (id: string) => {
     return sourceHealth.find((entry) => entry.source === id)?.status || "idle";
   };
 
+  const completedCount = sourceHealth.filter((source) => source.status === "ready").length;
+  const progress = Math.max(
+    4,
+    Math.min(
+      100,
+      (completedCount / Math.max(1, DATA_SOURCE_BLUEPRINT.length)) * 100
+    )
+  );
+
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground">
-        This map reveals which data stores are activated by the retrieval planner and how
-        context is assembled before answer synthesis.
+        This map reveals which data stores are activated by the retrieval planner and how context is assembled before answer synthesis.
       </p>
+
+      <div className="rounded-xl border border-border bg-card p-3">
+        <div className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+          Context assembly progress
+        </div>
+        <div className="relative h-2 rounded-full bg-muted">
+          <motion.div
+            className="absolute left-0 top-0 h-full rounded-full bg-primary"
+            initial={false}
+            animate={{ width: `${progress}%` }}
+            transition={{ duration: reducedMotion ? 0 : motionTokens.panel, ease: motionTokens.easeInOut }}
+          />
+        </div>
+      </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
         {DATA_SOURCE_BLUEPRINT.map((node, index) => {
@@ -31,9 +56,21 @@ export function ArchitectureMap({ sourceHealth }: ArchitectureMapProps) {
           return (
             <motion.div
               key={node.id}
-              initial={{ opacity: 0, y: 10 }}
+              layout
+              initial={
+                reducedMotion
+                  ? false
+                  : {
+                      opacity: 0,
+                      y: 10,
+                    }
+              }
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: index * 0.05, duration: 0.25 }}
+              transition={{
+                duration: reducedMotion ? 0 : motionTokens.state,
+                ease: motionTokens.easeOut,
+                delay: reducedMotion ? 0 : index * 0.04,
+              }}
               className={cn(
                 "relative rounded-xl border bg-card p-4",
                 status === "querying" && "border-primary/60 bg-primary/5",
@@ -42,6 +79,13 @@ export function ArchitectureMap({ sourceHealth }: ArchitectureMapProps) {
                 status === "idle" && "border-border"
               )}
             >
+              {status === "querying" && !reducedMotion && (
+                <motion.span
+                  className="pointer-events-none absolute inset-0 rounded-xl border border-primary/50"
+                  animate={{ opacity: [0.65, 0.15, 0.65] }}
+                  transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+                />
+              )}
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
                   <div className="h-9 w-9 shrink-0 overflow-hidden rounded-md border border-border bg-white/80 p-1">
@@ -78,8 +122,7 @@ export function ArchitectureMap({ sourceHealth }: ArchitectureMapProps) {
       </div>
 
       <div className="rounded-lg border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
-        Context path: Planner -&gt; Source arbitration -&gt; Retrieval execution -&gt;
-        Evidence assembly -&gt; Response synthesis.
+        Context path: Planner -&gt; Source arbitration -&gt; Retrieval execution -&gt; Evidence assembly -&gt; Response synthesis.
       </div>
     </div>
   );

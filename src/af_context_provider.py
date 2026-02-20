@@ -301,6 +301,7 @@ class AviationRagContextProvider:
                         "source": step.source,
                         "reason": step.reason,
                         "priority": step.priority,
+                        "source_meta": self.retriever.source_event_meta(step.source),
                         "timestamp": _utc_now(),
                     }
                 )
@@ -321,6 +322,7 @@ class AviationRagContextProvider:
                             "source": source,
                             "row_count": len(rows),
                             "citation_count": len(row_citations),
+                            "source_meta": self.retriever.source_event_meta(source),
                             "timestamp": _utc_now(),
                         }
                     )
@@ -333,6 +335,7 @@ class AviationRagContextProvider:
                             "row_count": 1,
                             "citation_count": 0,
                             "error": str(exc),
+                            "source_meta": self.retriever.source_event_meta(step.source),
                             "timestamp": _utc_now(),
                         }
                     )

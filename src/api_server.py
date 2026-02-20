@@ -41,6 +41,7 @@ def chat():
     explain_retrieval = bool(data.get("explain_retrieval", False))
     risk_mode = data.get("risk_mode", "standard")
     ask_recommendation = bool(data.get("ask_recommendation", False))
+    demo_scenario = data.get("demo_scenario")
 
     if not message:
         return jsonify({"error": "Missing 'message' field"}), 400
@@ -59,6 +60,7 @@ def chat():
                 explain_retrieval=explain_retrieval,
                 risk_mode=risk_mode,
                 ask_recommendation=ask_recommendation,
+                demo_scenario=demo_scenario,
             ):
                 yield to_sse(event)
         except Exception as exc:
@@ -100,6 +102,7 @@ def query():
         explain_retrieval = bool(data.get("explain_retrieval", False))
         risk_mode = data.get("risk_mode", "standard")
         ask_recommendation = bool(data.get("ask_recommendation", False))
+        demo_scenario = data.get("demo_scenario")
         af_runtime = get_runtime()
         result = af_runtime.run_once(
             query=message,
@@ -111,11 +114,23 @@ def query():
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
+            demo_scenario=demo_scenario,
         )
         return jsonify(result)
     except Exception as exc:
         print(f"Error in query endpoint: {exc}")
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route('/api/fabric/preflight', methods=['GET'])
+def fabric_preflight():
+    """Fabric integration preflight checks for live demo readiness."""
+    try:
+        af_runtime = get_runtime()
+        payload = af_runtime.retriever.fabric_preflight()
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"overall_status": "fail", "error": str(exc)}), 500
 
 
 if __name__ == '__main__':
@@ -126,6 +141,7 @@ if __name__ == '__main__':
     print("  GET  /health     - Health check")
     print("  POST /api/chat   - Chat with aviation RAG")
     print("  POST /api/query  - Direct query")
+    print("  GET  /api/fabric/preflight - Fabric live-path readiness")
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=5001, debug=True)

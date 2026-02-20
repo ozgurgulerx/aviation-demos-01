@@ -73,6 +73,7 @@ class PlanExecutor:
                             "source": source,
                             "reason": call.operation,
                             "priority": 0,
+                            "source_meta": self.retriever.source_event_meta(source),
                             "event_id": call.id,
                             "timestamp": _utc_now(),
                         }
@@ -94,6 +95,7 @@ class PlanExecutor:
                                 "source": source,
                                 "row_count": len(rows),
                                 "citation_count": len(citations),
+                                "source_meta": self.retriever.source_event_meta(source),
                                 "event_id": call.id,
                                 "timestamp": _utc_now(),
                             }
@@ -107,6 +109,7 @@ class PlanExecutor:
                                 "row_count": 1,
                                 "citation_count": 0,
                                 "error": str(exc),
+                                "source_meta": self.retriever.source_event_meta(source),
                                 "event_id": call.id,
                                 "timestamp": _utc_now(),
                             }
