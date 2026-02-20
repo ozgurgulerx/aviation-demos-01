@@ -23,6 +23,7 @@ def _utc_now() -> str:
 @dataclass
 class PlanExecutionResult:
     source_results: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    source_results_by_call: Dict[str, "CallResult"] = field(default_factory=dict)
     source_traces: List[Dict[str, Any]] = field(default_factory=list)
     citations: List[Citation] = field(default_factory=list)
     sql_queries: Dict[str, str] = field(default_factory=dict)
@@ -30,11 +31,25 @@ class PlanExecutionResult:
     warnings: List[str] = field(default_factory=list)
 
 
+@dataclass
+class CallResult:
+    call_id: str
+    source: str
+    operation: str
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+    citations: List[Citation] = field(default_factory=list)
+    sql_query: Optional[str] = None
+    error: Optional[str] = None
+    started_at: str = ""
+    completed_at: str = ""
+    params: Dict[str, Any] = field(default_factory=dict)
+
+
 class PlanExecutor:
     def __init__(self, retriever: UnifiedRetriever):
         self.retriever = retriever
-        self.sql_writer = SQLWriter()
-        self.kql_writer = KQLWriter()
+        self.sql_writer: Optional[SQLWriter] = None
+        self.kql_writer: Optional[KQLWriter] = None
 
     def execute(
         self,
@@ -63,10 +78,13 @@ class PlanExecutor:
                 ready = [next(iter(pending.values()))]
                 result.warnings.append("Dependency cycle detected; executing remaining calls without full dependency order.")
 
+            started_at_map: Dict[str, str] = {}
             with ThreadPoolExecutor(max_workers=max(1, min(4, len(ready)))) as pool:
                 future_map = {}
                 for call in ready:
                     source = self._canon_tool(call.tool)
+                    started_at = _utc_now()
+                    started_at_map[call.id] = started_at
                     result.source_traces.append(
                         {
                             "type": "source_call_start",
@@ -75,7 +93,7 @@ class PlanExecutor:
                             "priority": 0,
                             "source_meta": self.retriever.source_event_meta(source),
                             "event_id": call.id,
-                            "timestamp": _utc_now(),
+                            "timestamp": started_at,
                         }
                     )
                     future_map[pool.submit(self._run_call, call, user_query, plan, schemas)] = call
@@ -83,10 +101,22 @@ class PlanExecutor:
                 for future in as_completed(future_map):
                     call = future_map[future]
                     source = self._canon_tool(call.tool)
+                    completed_at = _utc_now()
                     try:
                         rows, citations, sql_query = future.result()
-                        result.source_results[source] = rows
-                        result.citations.extend(citations)
+                        rows = self._annotate_rows(rows, source, call.id, call.operation, call.params, completed_at)
+                        result.source_results_by_call[call.id] = CallResult(
+                            call_id=call.id,
+                            source=source,
+                            operation=call.operation,
+                            rows=rows,
+                            citations=citations,
+                            sql_query=sql_query,
+                            error=None,
+                            started_at=started_at_map.get(call.id, ""),
+                            completed_at=completed_at,
+                            params=dict(call.params or {}),
+                        )
                         if sql_query:
                             result.sql_queries[call.id] = sql_query
                         result.source_traces.append(
@@ -97,11 +127,30 @@ class PlanExecutor:
                                 "citation_count": len(citations),
                                 "source_meta": self.retriever.source_event_meta(source),
                                 "event_id": call.id,
-                                "timestamp": _utc_now(),
+                                "timestamp": completed_at,
                             }
                         )
                     except Exception as exc:
-                        result.source_results[source] = [{"error": str(exc)}]
+                        error_rows = self._annotate_rows(
+                            [{"error": str(exc)}],
+                            source,
+                            call.id,
+                            call.operation,
+                            call.params,
+                            completed_at,
+                        )
+                        result.source_results_by_call[call.id] = CallResult(
+                            call_id=call.id,
+                            source=source,
+                            operation=call.operation,
+                            rows=error_rows,
+                            citations=[],
+                            sql_query=None,
+                            error=str(exc),
+                            started_at=started_at_map.get(call.id, ""),
+                            completed_at=completed_at,
+                            params=dict(call.params or {}),
+                        )
                         result.source_traces.append(
                             {
                                 "type": "source_call_done",
@@ -111,12 +160,14 @@ class PlanExecutor:
                                 "error": str(exc),
                                 "source_meta": self.retriever.source_event_meta(source),
                                 "event_id": call.id,
-                                "timestamp": _utc_now(),
+                                "timestamp": completed_at,
                             }
                         )
                     done_ids.add(call.id)
                     pending.pop(call.id, None)
 
+        result.source_results = self._flatten_source_results(result.source_results_by_call, plan.tool_calls)
+        result.citations = self._flatten_citations(result.source_results_by_call, plan.tool_calls)
         return result
 
     def _run_call(
@@ -134,7 +185,7 @@ class PlanExecutor:
         if source == "SQL":
             sql_query = call.query
             if not sql_query or not self._looks_like_sql(sql_query):
-                sql_query = self.sql_writer.generate(
+                sql_query = self._get_sql_writer().generate(
                     user_query=user_query,
                     evidence_type=evidence_type or "generic",
                     sql_schema=schemas.get("sql_schema", {}),
@@ -150,7 +201,7 @@ class PlanExecutor:
         if source == "KQL":
             kql_query = call.query
             if not kql_query or not self._looks_like_kql(kql_query):
-                kql_query = self.kql_writer.generate(
+                kql_query = self._get_kql_writer().generate(
                     user_query=user_query,
                     evidence_type=evidence_type or "generic",
                     kql_schema=schemas.get("kql_schema", {}),
@@ -223,3 +274,63 @@ class PlanExecutor:
     def _looks_like_kql(self, text: str) -> bool:
         stripped = text.strip()
         return "|" in stripped or stripped.lower().startswith("let ")
+
+    def _get_sql_writer(self) -> SQLWriter:
+        if self.sql_writer is None:
+            self.sql_writer = SQLWriter()
+        return self.sql_writer
+
+    def _get_kql_writer(self) -> KQLWriter:
+        if self.kql_writer is None:
+            self.kql_writer = KQLWriter()
+        return self.kql_writer
+
+    def _annotate_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        source: str,
+        call_id: str,
+        operation: str,
+        params: Dict[str, Any],
+        completed_at: str,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        evidence_type = str((params or {}).get("evidence_type", "")).strip()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            enriched = dict(row)
+            enriched["__source"] = source
+            enriched["__call_id"] = call_id
+            enriched["__operation"] = operation
+            enriched["__fetched_at"] = completed_at
+            if evidence_type:
+                enriched["__evidence_type"] = evidence_type
+            out.append(enriched)
+        return out
+
+    def _flatten_source_results(
+        self,
+        by_call: Dict[str, CallResult],
+        plan_calls: List[ToolCall],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        flattened: Dict[str, List[Dict[str, Any]]] = {}
+        for call in plan_calls:
+            call_result = by_call.get(call.id)
+            if call_result is None:
+                continue
+            flattened.setdefault(call_result.source, []).extend(call_result.rows)
+        return flattened
+
+    def _flatten_citations(
+        self,
+        by_call: Dict[str, CallResult],
+        plan_calls: List[ToolCall],
+    ) -> List[Citation]:
+        out: List[Citation] = []
+        for call in plan_calls:
+            call_result = by_call.get(call.id)
+            if call_result is None:
+                continue
+            out.extend(call_result.citations)
+        return out

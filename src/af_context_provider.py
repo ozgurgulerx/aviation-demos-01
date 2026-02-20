@@ -11,9 +11,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
+import os
 from typing import Any, Dict, List, Optional
 
 from agentic_orchestrator import AgenticOrchestrator
+from context_reconciler import SOURCE_PRIORITY_DEFAULT, reconcile_context
 from evidence_verifier import EvidenceVerifier
 from intent_graph_provider import IntentGraphProvider
 from plan_executor import PlanExecutor
@@ -24,6 +27,23 @@ from unified_retriever import Citation, UnifiedRetriever
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
 
 
 @dataclass
@@ -38,6 +58,9 @@ class AviationRagContext:
     sql_results: List[Dict[str, Any]] = field(default_factory=list)
     semantic_results: List[Dict[str, Any]] = field(default_factory=list)
     source_results: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    reconciled_items: List[Dict[str, Any]] = field(default_factory=list)
+    coverage_summary: Dict[str, Any] = field(default_factory=dict)
+    conflict_summary: Dict[str, Any] = field(default_factory=dict)
     retrieval_plan: Dict[str, Any] = field(default_factory=dict)
     source_traces: List[Dict[str, Any]] = field(default_factory=list)
     reasoning: str = ""
@@ -53,6 +76,9 @@ class AviationRagContext:
             "semantic_result_count": len(self.semantic_results),
             "citation_count": len(self.citations),
             "source_result_counts": {k: len(v) for k, v in self.source_results.items()},
+            "reconciled_item_count": len(self.reconciled_items),
+            "coverage_summary": self.coverage_summary,
+            "conflict_summary": self.conflict_summary,
             "retrieval_plan": self.retrieval_plan,
         }
 
@@ -78,6 +104,20 @@ class AviationRagContextProvider:
         except Exception:
             self.orchestrator = None
             self._agentic_enabled = False
+        self.reconciliation_enabled = _env_bool("CONTEXT_RECONCILIATION_ENABLED", True)
+        self.evidence_slotting_enabled = _env_bool("CONTEXT_EVIDENCE_SLOTTING_ENABLED", True)
+        self.conflict_detection_enabled = _env_bool("CONTEXT_CONFLICT_DETECTION_ENABLED", True)
+        self.source_priority = list(SOURCE_PRIORITY_DEFAULT)
+        self.per_source_limits = {
+            "SQL": _env_int("CONTEXT_LIMIT_SQL", 12),
+            "KQL": _env_int("CONTEXT_LIMIT_KQL", 8),
+            "GRAPH": _env_int("CONTEXT_LIMIT_GRAPH", 8),
+            "NOSQL": _env_int("CONTEXT_LIMIT_NOSQL", 8),
+            "VECTOR_REG": _env_int("CONTEXT_LIMIT_VECTOR_REG", 6),
+            "VECTOR_OPS": _env_int("CONTEXT_LIMIT_VECTOR_OPS", 6),
+            "VECTOR_AIRPORT": _env_int("CONTEXT_LIMIT_VECTOR_AIRPORT", 6),
+        }
+        self.fusion_weights = self._load_fusion_weights()
 
     def build_context(
         self,
@@ -148,6 +188,12 @@ class AviationRagContextProvider:
             sql_hint=sql_hint,
         )
 
+        reconciled = self._apply_reconciliation(source_results)
+        source_results = reconciled.get("source_results", source_results)
+        coverage_summary = reconciled.get("coverage_summary", {})
+        conflict_summary = reconciled.get("conflict_summary", {})
+        reconciled_items = reconciled.get("reconciled_items", [])
+
         sql_results = source_results.get("SQL", [])
         semantic_results: List[Dict[str, Any]] = []
         for source in ("VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):
@@ -159,6 +205,8 @@ class AviationRagContextProvider:
             retrieval_plan=retrieval_plan,
             sql_query=sql_query,
             source_results=source_results,
+            coverage_summary=coverage_summary,
+            conflict_summary=conflict_summary,
         )
 
         return AviationRagContext(
@@ -170,6 +218,9 @@ class AviationRagContextProvider:
             sql_results=sql_results,
             semantic_results=semantic_results[:20],
             source_results=source_results,
+            reconciled_items=reconciled_items[:80],
+            coverage_summary=coverage_summary,
+            conflict_summary=conflict_summary,
             retrieval_plan=retrieval_plan.to_event_payload(),
             source_traces=source_traces,
             reasoning=f"{retrieval_plan.reasoning}; {additional_reasoning}",
@@ -218,6 +269,17 @@ class AviationRagContextProvider:
             evidence_tool_map=execution.evidence_tool_map,
             ask_recommendation=ask_recommendation,
         )
+        required_evidence = [item.to_dict() for item in plan.required_evidence]
+        authoritative_map = self._build_authoritative_map(intent_graph.data, required_evidence)
+        reconciled = self._apply_reconciliation(
+            execution.source_results,
+            required_evidence=required_evidence,
+            authoritative_map=authoritative_map,
+        )
+        source_results = reconciled.get("source_results", execution.source_results)
+        coverage_summary = reconciled.get("coverage_summary", {})
+        conflict_summary = reconciled.get("conflict_summary", {})
+        reconciled_items = reconciled.get("reconciled_items", [])
 
         warnings = [*plan.warnings, *execution.warnings, *verification.warnings]
         route = "AGENTIC"
@@ -227,9 +289,9 @@ class AviationRagContextProvider:
 
         semantic_results: List[Dict[str, Any]] = []
         for src in ("VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):
-            semantic_results.extend(execution.source_results.get(src, []))
+            semantic_results.extend(source_results.get(src, []))
 
-        sql_results = execution.source_results.get("SQL", [])
+        sql_results = source_results.get("SQL", [])
         sql_query = next(iter(execution.sql_queries.values()), None)
         retrieval_plan = {
             "route": route,
@@ -246,15 +308,19 @@ class AviationRagContextProvider:
                 for idx, call in enumerate(plan.tool_calls)
             ],
             "coverage": verification.coverage,
+            "coverage_summary": coverage_summary,
+            "conflict_summary": conflict_summary,
             "warnings": warnings,
             "is_verified": verification.is_verified,
         }
         context_text = self._compose_agentic_context_text(
             query=query,
             plan=plan.to_dict(),
-            source_results=execution.source_results,
+            source_results=source_results,
             sql_queries=execution.sql_queries,
             warnings=warnings,
+            coverage_summary=coverage_summary,
+            conflict_summary=conflict_summary,
         )
         return AviationRagContext(
             query=query,
@@ -264,7 +330,10 @@ class AviationRagContextProvider:
             sql_query=sql_query,
             sql_results=sql_results,
             semantic_results=semantic_results[:20],
-            source_results=execution.source_results,
+            source_results=source_results,
+            reconciled_items=reconciled_items[:80],
+            coverage_summary=coverage_summary,
+            conflict_summary=conflict_summary,
             retrieval_plan=retrieval_plan,
             source_traces=execution.source_traces,
             reasoning=reasoning,
@@ -282,6 +351,7 @@ class AviationRagContextProvider:
         source_traces: List[Dict[str, Any]] = []
         citations: List[Citation] = []
         sql_query: Optional[str] = None
+        step_outputs: Dict[int, tuple[str, List[Dict[str, Any]], List[Citation], Optional[str]]] = {}
 
         def _run(step: SourcePlan) -> tuple[str, List[Dict[str, Any]], List[Citation], Optional[str]]:
             params = dict(step.params)
@@ -294,7 +364,7 @@ class AviationRagContextProvider:
 
         with ThreadPoolExecutor(max_workers=max(1, min(6, len(steps)))) as executor:
             future_map = {}
-            for step in steps:
+            for idx, step in enumerate(steps):
                 source_traces.append(
                     {
                         "type": "source_call_start",
@@ -306,16 +376,13 @@ class AviationRagContextProvider:
                     }
                 )
                 future = executor.submit(_run, step)
-                future_map[future] = step
+                future_map[future] = (idx, step)
 
             for future in as_completed(future_map):
-                step = future_map[future]
+                idx, step = future_map[future]
                 try:
                     source, rows, row_citations, out_sql = future.result()
-                    source_results[source] = rows
-                    citations.extend(row_citations)
-                    if source == "SQL" and out_sql:
-                        sql_query = out_sql
+                    step_outputs[idx] = (source, rows, row_citations, out_sql)
                     source_traces.append(
                         {
                             "type": "source_call_done",
@@ -327,7 +394,7 @@ class AviationRagContextProvider:
                         }
                     )
                 except Exception as exc:
-                    source_results[step.source] = [{"error": str(exc)}]
+                    step_outputs[idx] = (step.source, [{"error": str(exc)}], [], None)
                     source_traces.append(
                         {
                             "type": "source_call_done",
@@ -340,7 +407,85 @@ class AviationRagContextProvider:
                         }
                     )
 
+        for idx in range(len(steps)):
+            if idx not in step_outputs:
+                continue
+            source, rows, row_citations, out_sql = step_outputs[idx]
+            enriched_rows: List[Dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                payload = dict(row)
+                payload["__source"] = source
+                payload["__call_id"] = f"legacy_{idx}"
+                payload["__fetched_at"] = _utc_now()
+                enriched_rows.append(payload)
+            source_results.setdefault(source, []).extend(enriched_rows)
+            citations.extend(row_citations)
+            if source == "SQL" and out_sql and sql_query is None:
+                sql_query = out_sql
+
         return source_results, source_traces, citations, sql_query
+
+    def _load_fusion_weights(self) -> Dict[str, float]:
+        raw = os.getenv("CONTEXT_FUSION_WEIGHTS", "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): float(v) for k, v in parsed.items()}
+        except Exception:
+            return {}
+        return {}
+
+    def _build_authoritative_map(self, intent_graph_data: Dict[str, Any], required_evidence: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        rows = intent_graph_data.get("authoritative_in") or []
+        wanted = {str(r.get("name", "")).strip() for r in required_evidence}
+        out: Dict[str, List[str]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            evidence = str(row.get("evidence", "")).strip()
+            tool = str(row.get("tool", "")).strip().upper()
+            if not evidence or not tool:
+                continue
+            if wanted and evidence not in wanted:
+                continue
+            out.setdefault(evidence, [])
+            if tool not in out[evidence]:
+                out[evidence].append(tool)
+        return out
+
+    def _apply_reconciliation(
+        self,
+        source_results: Dict[str, List[Dict[str, Any]]],
+        required_evidence: Optional[List[Dict[str, Any]]] = None,
+        authoritative_map: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, Any]:
+        if not self.reconciliation_enabled:
+            return {
+                "source_results": source_results,
+                "reconciled_items": [],
+                "coverage_summary": {
+                    "required_total": 0,
+                    "required_filled": 0,
+                    "optional_filled": 0,
+                    "missing_required": [],
+                    "slots": [],
+                },
+                "conflict_summary": {"count": 0, "items": [], "severity": "none"},
+            }
+        return reconcile_context(
+            source_results=source_results,
+            required_evidence=required_evidence or [],
+            authoritative_map=authoritative_map or {},
+            source_priority=self.source_priority,
+            per_source_limits=self.per_source_limits,
+            weights=self.fusion_weights,
+            enable_evidence_slotting=self.evidence_slotting_enabled,
+            enable_conflict_detection=self.conflict_detection_enabled,
+        )
 
     def _resolve_route(
         self, query: str, retrieval_mode: str, forced_route: Optional[str]
@@ -365,6 +510,8 @@ class AviationRagContextProvider:
         retrieval_plan: RetrievalPlan,
         sql_query: Optional[str],
         source_results: Dict[str, List[Dict[str, Any]]],
+        coverage_summary: Dict[str, Any],
+        conflict_summary: Dict[str, Any],
     ) -> str:
         sections: List[str] = [f"User query: {query}", f"Selected route: {route}"]
         sections.append(f"Retrieval profile: {retrieval_plan.profile}")
@@ -381,6 +528,18 @@ class AviationRagContextProvider:
             if not rows:
                 continue
             sections.append(f"{source} results:\n{self._format_rows(rows, source)}")
+        if coverage_summary and coverage_summary.get("required_total", 0) > 0:
+            sections.append(
+                "Coverage summary:\n"
+                f"required_filled={coverage_summary.get('required_filled', 0)}/"
+                f"{coverage_summary.get('required_total', 0)}, "
+                f"missing_required={coverage_summary.get('missing_required', [])}"
+            )
+        if conflict_summary and conflict_summary.get("count", 0) > 0:
+            sections.append(
+                "Conflict summary:\n"
+                f"count={conflict_summary.get('count', 0)}, severity={conflict_summary.get('severity', 'none')}"
+            )
 
         return "\n\n".join(sections)
 
@@ -391,6 +550,8 @@ class AviationRagContextProvider:
         source_results: Dict[str, List[Dict[str, Any]]],
         sql_queries: Dict[str, str],
         warnings: List[str],
+        coverage_summary: Dict[str, Any],
+        conflict_summary: Dict[str, Any],
     ) -> str:
         sections: List[str] = [
             f"User query: {query}",
@@ -404,6 +565,18 @@ class AviationRagContextProvider:
             if not rows:
                 continue
             sections.append(f"{source} results:\n{self._format_rows(rows, source)}")
+        if coverage_summary:
+            sections.append(
+                "Coverage summary:\n"
+                f"required_filled={coverage_summary.get('required_filled', 0)}/"
+                f"{coverage_summary.get('required_total', 0)}, "
+                f"missing_required={coverage_summary.get('missing_required', [])}"
+            )
+        if conflict_summary:
+            sections.append(
+                "Conflict summary:\n"
+                f"count={conflict_summary.get('count', 0)}, severity={conflict_summary.get('severity', 'none')}"
+            )
         if warnings:
             sections.append("Warnings:\n" + "\n".join(f"- {w}" for w in warnings))
         return "\n\n".join(sections)

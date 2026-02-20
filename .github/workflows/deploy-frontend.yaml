@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 env:
-  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'aviation-rag-frontend' }}
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'aviation-rag-frontend-705508' }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-aviation-rag' }}
   NODE_VERSION: ${{ vars.NODE_VERSION || '20.x' }}
   BACKEND_URL: ${{ vars.BACKEND_URL }}
@@ -108,12 +108,36 @@ jobs:
 
       - name: Deploy to Azure App Service
         run: |
-          az webapp deploy \
-            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --src-path /tmp/app.zip \
-            --type zip \
-            --restart true
+          ATTEMPT=1
+          MAX_ATTEMPTS=5
+
+          while true; do
+            set +e
+            DEPLOY_OUTPUT=$(az webapp deploy \
+              --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+              --name "${{ env.AZURE_WEBAPP_NAME }}" \
+              --src-path /tmp/app.zip \
+              --type zip \
+              --restart true 2>&1)
+            DEPLOY_STATUS=$?
+            set -e
+
+            echo "$DEPLOY_OUTPUT"
+
+            if [ "$DEPLOY_STATUS" -eq 0 ]; then
+              break
+            fi
+
+            if echo "$DEPLOY_OUTPUT" | grep -q "Another deployment is in progress" && [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              echo "Deployment lock detected on App Service. Retrying in 30s (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+              ATTEMPT=$((ATTEMPT + 1))
+              sleep 30
+              continue
+            fi
+
+            echo "::error::App Service deployment failed."
+            exit "$DEPLOY_STATUS"
+          done
 
       - name: Verify deployment
         run: |

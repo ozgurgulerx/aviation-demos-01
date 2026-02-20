@@ -51,6 +51,12 @@ SEARCH_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY")
 SEARCH_INDEX_OPS = os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "idx_ops_narratives")
 SEARCH_INDEX_REGULATORY = os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "idx_regulatory")
 SEARCH_INDEX_AIRPORT = os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "idx_airport_ops_docs")
+SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG_NAME", "aviation-semantic-config")
+try:
+    _RERANK_RAW_CANDIDATES = max(1, int(os.getenv("CONTEXT_VECTOR_RAW_CANDIDATES", "20") or "20"))
+except Exception:
+    _RERANK_RAW_CANDIDATES = 20
+_RERANK_ENABLED = os.getenv("CONTEXT_RERANK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
@@ -407,12 +413,15 @@ class UnifiedRetriever:
         if client is None:
             return [{"error": f"search_index_unavailable:{index_name}"}], []
 
+        top = max(1, int(top))
+        top_raw = max(top, _RERANK_RAW_CANDIDATES if _RERANK_ENABLED else top)
+
         if embedding is None:
             embedding = self.get_embedding(query)
 
         vector_query = VectorizedQuery(
             vector=embedding,
-            k_nearest_neighbors=top,
+            k_nearest_neighbors=top_raw,
             fields="content_vector",
         )
 
@@ -430,16 +439,30 @@ class UnifiedRetriever:
             "source_file",
         ]
 
+        search_kwargs: Dict[str, Any] = {
+            "search_text": query,
+            "vector_queries": [vector_query],
+            "top": top_raw,
+            "filter": filter_expression,
+            "select": select_fields,
+        }
+
+        if _RERANK_ENABLED:
+            search_kwargs["query_type"] = "semantic"
+            search_kwargs["semantic_configuration_name"] = SEARCH_SEMANTIC_CONFIG
+
         try:
-            results = client.search(
-                search_text=query,
-                vector_queries=[vector_query],
-                top=top,
-                filter=filter_expression,
-                select=select_fields,
-            )
+            results = client.search(**search_kwargs)
         except Exception as exc:
-            return [{"error": str(exc), "index": index_name}], []
+            if _RERANK_ENABLED:
+                search_kwargs.pop("query_type", None)
+                search_kwargs.pop("semantic_configuration_name", None)
+                try:
+                    results = client.search(**search_kwargs)
+                except Exception as fallback_exc:
+                    return [{"error": str(fallback_exc), "index": index_name}], []
+            else:
+                return [{"error": str(exc), "index": index_name}], []
 
         results_list: List[Dict[str, Any]] = []
         citations: List[Citation] = []
@@ -448,6 +471,12 @@ class UnifiedRetriever:
             result_dict = dict(r)
             result_dict["vector_source"] = source
             result_dict["vector_index"] = index_name
+            score_raw = float(r.get("@search.score", 0.0) or 0.0)
+            score_rerank = float(r.get("@search.reranker_score", 0.0) or 0.0)
+            score_final = score_rerank if score_rerank > 0 else score_raw
+            result_dict["__vector_score_raw"] = score_raw
+            result_dict["__vector_score_rerank"] = score_rerank
+            result_dict["__vector_score_final"] = score_final
             results_list.append(result_dict)
 
             report_id = r.get("asrs_report_id") or r.get("id", "")
@@ -458,12 +487,14 @@ class UnifiedRetriever:
                     identifier=str(report_id),
                     title=str(citation_title),
                     content_preview=str(r.get("content", ""))[:120],
-                    score=float(r.get("@search.score", 0.0) or 0.0),
+                    score=score_final,
                     dataset=index_name,
                 )
             )
 
-        return results_list, citations
+        results_list.sort(key=lambda row: float(row.get("__vector_score_final", 0.0) or 0.0), reverse=True)
+        citations.sort(key=lambda c: c.score, reverse=True)
+        return results_list[:top], citations[:top]
 
     def query_semantic_multi(
         self,
@@ -490,7 +521,7 @@ class UnifiedRetriever:
             merged_rows.extend(rows)
             merged_citations.extend(cites)
 
-        merged_rows.sort(key=lambda r: float(r.get("@search.score", 0.0) or 0.0), reverse=True)
+        merged_rows.sort(key=lambda r: float(r.get("__vector_score_final", r.get("@search.score", 0.0)) or 0.0), reverse=True)
         merged_citations.sort(key=lambda c: c.score, reverse=True)
         return merged_rows, merged_citations
 

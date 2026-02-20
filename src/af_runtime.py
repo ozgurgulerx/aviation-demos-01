@@ -443,14 +443,25 @@ class AgentFrameworkRuntime:
 
         answer = self._invoke_agent(prompt=prompt, session=session, session_id=session_id)
         if not answer.strip():
+            vector_rows = (
+                list(ctx.source_results.get("VECTOR_REG", []))
+                + list(ctx.source_results.get("VECTOR_OPS", []))
+                + list(ctx.source_results.get("VECTOR_AIRPORT", []))
+            )
             answer = self.retriever._synthesize_answer(
                 query,
                 {
                     "sql_results": ctx.sql_results[:12],
-                    "semantic_context": [
+                    "kql_results": ctx.source_results.get("KQL", [])[:8],
+                    "graph_results": ctx.source_results.get("GRAPH", [])[:8],
+                    "nosql_results": ctx.source_results.get("NOSQL", [])[:8],
+                    "vector_results": [
                         {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
-                        for row in ctx.semantic_results[:8]
+                        for row in vector_rows[:12]
                     ],
+                    "reconciled_items": ctx.reconciled_items[:40],
+                    "coverage_summary": ctx.coverage_summary,
+                    "conflict_summary": ctx.conflict_summary,
                 },
                 ctx.route,
             )
@@ -515,6 +526,10 @@ class AgentFrameworkRuntime:
         reasoning = tool_result.get("reasoning", "Fallback retrieval path")
         sql_results = tool_result.get("sql_results", [])
         semantic_results = tool_result.get("semantic_results", [])
+        source_results = tool_result.get("source_results", {}) or {}
+        reconciled_items = tool_result.get("reconciled_items", []) or []
+        coverage_summary = tool_result.get("coverage_summary", {}) or {}
+        conflict_summary = tool_result.get("conflict_summary", {}) or {}
         citations_payload = tool_result.get("citations", [])
         if tool_result.get("retrieval_plan"):
             yield {"type": "retrieval_plan", "plan": tool_result.get("retrieval_plan")}
@@ -534,19 +549,33 @@ class AgentFrameworkRuntime:
                 "citation_count": len(citations_payload),
                 "source_result_counts": {
                     src: len(rows)
-                    for src, rows in (tool_result.get("source_results", {}) or {}).items()
+                    for src, rows in source_results.items()
                 },
+                "reconciled_item_count": len(reconciled_items),
+                "coverage_summary": coverage_summary,
+                "conflict_summary": conflict_summary,
             },
         }
 
+        vector_rows = (
+            list(source_results.get("VECTOR_REG", []))
+            + list(source_results.get("VECTOR_OPS", []))
+            + list(source_results.get("VECTOR_AIRPORT", []))
+        )
         answer = self.retriever._synthesize_answer(
             query,
             {
                 "sql_results": sql_results[:12],
-                "semantic_context": [
+                "kql_results": source_results.get("KQL", [])[:8],
+                "graph_results": source_results.get("GRAPH", [])[:8],
+                "nosql_results": source_results.get("NOSQL", [])[:8],
+                "vector_results": [
                     {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
-                    for row in semantic_results[:8]
+                    for row in vector_rows[:12]
                 ],
+                "reconciled_items": reconciled_items[:40],
+                "coverage_summary": coverage_summary,
+                "conflict_summary": conflict_summary,
             },
             route,
         )
@@ -734,6 +763,8 @@ class AgentFrameworkRuntime:
                     "timestamp": now,
                     "confidence": citation.score or 0.9,
                     "excerpt": citation.content_preview,
+                    "authority": self.retriever.source_event_meta(provider).get("store_type"),
+                    "freshness": self.retriever.source_event_meta(provider).get("freshness"),
                 }
             )
         return formatted
