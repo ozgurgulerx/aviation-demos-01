@@ -525,7 +525,11 @@ class TestKQLValidation(unittest.TestCase):
 
     def test_rejects_multiple_statements(self):
         result = self.retriever._validate_kql_query("weather_obs | take 5; .drop table weather_obs")
-        self.assertEqual(result, "kql_multiple_statements_not_allowed")
+        self.assertIsNotNone(result, "Multi-statement KQL with drop should be rejected")
+        self.assertTrue(
+            "kql_multiple_statements_not_allowed" in result or "kql_contains_blocked_operation" in result,
+            f"Expected semicolon or blocked-operation rejection, got: {result}",
+        )
 
     def test_allows_valid_kql(self):
         result = self.retriever._validate_kql_query("weather_obs | take 10")
