@@ -307,20 +307,19 @@ jobs:
         run: |
           if [ "${USE_IMAGE_PULL_SECRET:-false}" = "true" ]; then
             echo "::warning::Configuring acr-secret fallback image pull credentials."
-            ACR_USERNAME="$(az acr credential show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query username -o tsv)"
-            ACR_PASSWORD="$(az acr credential show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query 'passwords[0].value' -o tsv)"
+            ACR_ACCESS_TOKEN="$(az acr login --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --expose-token --query accessToken -o tsv)"
 
-            if [ -z "$ACR_USERNAME" ] || [ -z "$ACR_PASSWORD" ]; then
-              echo "::error::Unable to retrieve ACR credentials for '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'."
-              echo "::error::Enable ACR admin user or grant the workflow identity permission to list ACR credentials."
+            if [ -z "$ACR_ACCESS_TOKEN" ]; then
+              echo "::error::Unable to obtain ACR access token for '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'."
+              echo "::error::Grant this workflow identity AcrPull/AcrPush on the registry or enable managed identity pull auth."
               exit 1
             fi
 
             kubectl create secret docker-registry acr-secret \
               --namespace="${{ env.K8S_NAMESPACE }}" \
               --docker-server="${{ env.AZURE_CONTAINER_REGISTRY }}" \
-              --docker-username="$ACR_USERNAME" \
-              --docker-password="$ACR_PASSWORD" \
+              --docker-username=00000000-0000-0000-0000-000000000000 \
+              --docker-password="$ACR_ACCESS_TOKEN" \
               --dry-run=client -o yaml | kubectl apply -f -
 
             kubectl patch deployment aviation-rag-backend \
