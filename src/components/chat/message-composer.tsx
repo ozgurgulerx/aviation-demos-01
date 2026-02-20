@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, KeyboardEvent } from "react";
+import { useState, useRef, useEffect, KeyboardEvent, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Send,
@@ -21,6 +21,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { PiiGuidanceDialog } from "./pii-guidance-dialog";
+import { ReasoningStrip } from "./reasoning-strip";
+import { startMockReasoningStream } from "@/lib/reasoning-stream";
+import type { ReasoningSseEvent } from "@/types";
 
 type PiiStatus = "idle" | "checking" | "passed" | "blocked";
 
@@ -35,12 +38,14 @@ const formatCategory = (category: string): string => {
 interface MessageComposerProps {
   onSubmit: (message: string) => void;
   isLoading: boolean;
+  reasoningEvents?: ReasoningSseEvent[];
   disabled?: boolean;
 }
 
 export function MessageComposer({
   onSubmit,
   isLoading,
+  reasoningEvents,
   disabled,
 }: MessageComposerProps) {
   const [input, setInput] = useState("");
@@ -49,6 +54,8 @@ export function MessageComposer({
   const [detectedCategories, setDetectedCategories] = useState<string[]>([]);
   const [showPassedBanner, setShowPassedBanner] = useState(false);
   const [blockedMessage, setBlockedMessage] = useState<string | null>(null); // Store blocked message for restore
+  const [mockReasoningEvents, setMockReasoningEvents] = useState<ReasoningSseEvent[]>([]);
+  const [lastSubmittedPrompt, setLastSubmittedPrompt] = useState("");
   // Track hydration to prevent SSR/client mismatch with Framer Motion animations
   const [isHydrated, setIsHydrated] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -82,6 +89,50 @@ export function MessageComposer({
       }
     };
   }, []);
+
+  useEffect(() => {
+    const hasLiveReasoning = (reasoningEvents?.length || 0) > 0;
+
+    if (!isLoading) {
+      setMockReasoningEvents((previous) => {
+        if (!previous.length) {
+          return previous;
+        }
+        const completed = previous.some((event) => event.stage === "evidence_check_complete");
+        if (completed) {
+          return previous;
+        }
+        return [
+          ...previous,
+          {
+            type: "reasoning_stage",
+            stage: "evidence_check_complete",
+            ts: new Date().toISOString(),
+            payload: {
+              verification: "Partial",
+              failOpen: true,
+            },
+          },
+        ];
+      });
+      return;
+    }
+
+    if (hasLiveReasoning) {
+      return;
+    }
+
+    setMockReasoningEvents([]);
+    const stopMock = startMockReasoningStream({
+      prompt: lastSubmittedPrompt || "Pilot brief request",
+      onEvent: (event) => {
+        setMockReasoningEvents((previous) => [...previous, event]);
+      },
+    });
+
+    // TODO(unit): replace mock stream with backend-driven SSE reasoning events.
+    return stopMock;
+  }, [isLoading, lastSubmittedPrompt, reasoningEvents]);
 
   // Focus trap and accessibility announcement when blocked
   useEffect(() => {
@@ -182,6 +233,8 @@ export function MessageComposer({
     const isClean = await checkForPii(trimmedInput);
     if (!isClean) return;
 
+    setLastSubmittedPrompt(trimmedInput);
+    setMockReasoningEvents([]);
     onSubmit(trimmedInput);
     setInput("");
     setPiiError(null);
@@ -213,6 +266,21 @@ export function MessageComposer({
 
   const isSubmitDisabled =
     !input.trim() || isLoading || piiStatus === "checking" || disabled;
+
+  const handleOpenAuditQueries = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.dispatchEvent(
+      new CustomEvent("pilotbrief:audit-open", {
+        detail: { tab: "queries" },
+      })
+    );
+    // TODO(unit): verify AuditDrawer opens the Queries tab on this event.
+  }, []);
+
+  const displayedReasoningEvents =
+    (reasoningEvents?.length || 0) > 0 ? reasoningEvents || [] : mockReasoningEvents;
 
   return (
     <div className="border-t border-border bg-surface-1 p-4 relative overflow-hidden">
@@ -657,6 +725,12 @@ export function MessageComposer({
           </motion.div>
         )}
       </div>
+
+      <ReasoningStrip
+        events={displayedReasoningEvents}
+        isLoading={isLoading}
+        onOpenQueries={handleOpenAuditQueries}
+      />
 
       {/* Helper text with PII guidance link */}
       <div className="flex items-center justify-between mt-3">

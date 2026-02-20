@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { AlertTriangle, X } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
@@ -39,6 +39,7 @@ import type {
 type RetrievalMode = "code-rag" | "foundry-iq";
 type QueryProfile = "pilot-brief" | "ops-live" | "compliance";
 type DemoScenario = "none" | "weather-spike" | "runway-notam" | "ground-bottleneck";
+type VoiceMode = "off" | "tr-TR" | "en-US";
 
 function createInitialSourceHealth(): SourceHealthStatus[] {
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
@@ -47,6 +48,16 @@ function createInitialSourceHealth(): SourceHealthStatus[] {
     rowCount: 0,
     mode: "unknown",
   }));
+}
+
+function toSpeechText(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[(\d+)\]/g, " ")
+    .replace(/[#>*_~|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export default function ChatPage() {
@@ -88,6 +99,13 @@ export default function ChatPage() {
   const [fabricPreflight, setFabricPreflight] = useState<FabricPreflightStatus | null>(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
   const [operationalAlert, setOperationalAlert] = useState<OperationalAlert | null>(null);
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>("tr-TR");
+  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+
+  const speechRequestRef = useRef(0);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   const handleNewChat = useCallback(() => {
     setActiveConversationId(null);
@@ -150,6 +168,117 @@ export default function ChatPage() {
     void fetchFabricPreflight();
   }, [fetchFabricPreflight]);
 
+  const stopVoicePlayback = useCallback(() => {
+    speechRequestRef.current += 1;
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    utteranceRef.current = null;
+    setSpeakingMessageId(null);
+  }, []);
+
+  const speakMessage = useCallback(
+    async (messageId: string, rawContent: string) => {
+      if (voiceMode === "off") return;
+
+      const text = toSpeechText(rawContent);
+      if (!text) return;
+
+      if (speakingMessageId === messageId) {
+        stopVoicePlayback();
+        return;
+      }
+
+      stopVoicePlayback();
+      const requestId = speechRequestRef.current;
+      const language = voiceMode === "tr-TR" ? "tr-TR" : "en-US";
+      setSpeakingMessageId(messageId);
+
+      const finishIfActive = () => {
+        if (speechRequestRef.current === requestId) {
+          setSpeakingMessageId(null);
+        }
+      };
+
+      try {
+        const response = await fetch("/api/voice/speak", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, language }),
+        });
+        if (!response.ok) {
+          throw new Error("Voice model request failed");
+        }
+
+        const blob = await response.blob();
+        if (speechRequestRef.current !== requestId) return;
+
+        const audioUrl = URL.createObjectURL(blob);
+        audioUrlRef.current = audioUrl;
+        const audio = new Audio(audioUrl);
+        audioRef.current = audio;
+        audio.onended = () => {
+          if (audioUrlRef.current) {
+            URL.revokeObjectURL(audioUrlRef.current);
+            audioUrlRef.current = null;
+          }
+          audioRef.current = null;
+          finishIfActive();
+        };
+        audio.onerror = () => {
+          if (audioUrlRef.current) {
+            URL.revokeObjectURL(audioUrlRef.current);
+            audioUrlRef.current = null;
+          }
+          audioRef.current = null;
+          finishIfActive();
+        };
+        await audio.play();
+        return;
+      } catch (_error) {
+        // Fall back to browser speech synthesis if model audio fails.
+      }
+
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+        finishIfActive();
+        return;
+      }
+
+      const synthesis = window.speechSynthesis;
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = language;
+
+      const availableVoices = synthesis
+        .getVoices()
+        .filter((voice) => voice.lang.toLowerCase().startsWith(language.toLowerCase()));
+      if (availableVoices.length > 0) {
+        utterance.voice = availableVoices[0];
+      }
+
+      utterance.onend = finishIfActive;
+      utterance.onerror = finishIfActive;
+      utteranceRef.current = utterance;
+      synthesis.speak(utterance);
+    },
+    [voiceMode, speakingMessageId, stopVoicePlayback]
+  );
+
+  useEffect(() => {
+    return () => {
+      stopVoicePlayback();
+    };
+  }, [stopVoicePlayback]);
+
   const handleSendMessage = useCallback(
     async (content: string) => {
       const conversationId = activeConversationId ?? generateId();
@@ -173,6 +302,7 @@ export default function ChatPage() {
       setRouteLabel("Running");
       setConfidenceLabel("Calculating");
       setOperationalAlert(null);
+      stopVoicePlayback();
 
       try {
         const response = await fetch("/api/chat", {
@@ -268,6 +398,9 @@ export default function ChatPage() {
         };
 
         setMessages((previous) => [...previous, assistantMessage]);
+        if (voiceMode !== "off") {
+          void speakMessage(assistantMessage.id, assistantMessage.content);
+        }
 
         if (newCitations.length > 0) {
           setCitations((previous) => {
@@ -311,6 +444,9 @@ export default function ChatPage() {
         };
 
         setMessages((previous) => [...previous, errorMessage]);
+        if (voiceMode !== "off") {
+          void speakMessage(errorMessage.id, errorMessage.content);
+        }
         setTimelineEvents((previous) => [
           ...previous,
           {
@@ -345,6 +481,9 @@ export default function ChatPage() {
       freshnessSlaMinutes,
       explainRetrieval,
       demoScenario,
+      stopVoicePlayback,
+      voiceMode,
+      speakMessage,
     ]
   );
 
@@ -439,6 +578,22 @@ export default function ChatPage() {
               />
 
               <ToggleGroup
+                value={voiceMode}
+                onValueChange={(value) => {
+                  const next = value as VoiceMode;
+                  setVoiceMode(next);
+                  if (next === "off") {
+                    stopVoicePlayback();
+                  }
+                }}
+                options={[
+                  { value: "off", label: "Voice Off" },
+                  { value: "tr-TR", label: "Voice TR" },
+                  { value: "en-US", label: "Voice EN" },
+                ]}
+              />
+
+              <ToggleGroup
                 value={String(freshnessSlaMinutes)}
                 onValueChange={(value) => setFreshnessSlaMinutes(Number(value))}
                 options={[
@@ -524,6 +679,11 @@ export default function ChatPage() {
           sourceHealth={sourceHealth}
           onCitationClick={handleCitationClick}
           activeCitationId={activeCitationId}
+          onSpeakMessage={(messageId, content) => {
+            void speakMessage(messageId, content);
+          }}
+          speakingMessageId={speakingMessageId}
+          voiceEnabled={voiceMode !== "off"}
           onRetryLast={handleRetryLast}
           onSendMessage={(message) => {
             void handleSendMessage(message);

@@ -74,6 +74,14 @@ export interface SourceReference {
 
 export type TelemetryEventStatus = "running" | "completed" | "error" | "info";
 export type OperationalAlertSeverity = "advisory" | "warning" | "critical";
+export type ReasoningStage =
+  | "understanding_request"
+  | "intent_mapped"
+  | "evidence_retrieval"
+  | "drafting_brief"
+  | "evidence_check_complete";
+export type ReasoningConfidence = "High" | "Medium" | "Low";
+export type ReasoningVerification = "Verified" | "Partial";
 
 export interface TelemetryEvent {
   id: string;
@@ -122,6 +130,23 @@ export interface OperationalAlert {
   message: string;
   source?: string;
   timestamp: string;
+}
+
+export interface ReasoningEventPayload {
+  intentLabel?: string;
+  confidence?: ReasoningConfidence;
+  route?: string;
+  sources?: string[];
+  callCount?: number;
+  verification?: ReasoningVerification;
+  failOpen?: boolean;
+}
+
+export interface ReasoningSseEvent {
+  type: "reasoning_stage";
+  stage: ReasoningStage;
+  ts: string;
+  payload?: ReasoningEventPayload;
 }
 
 export interface EvidenceManifestItem {
