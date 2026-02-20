@@ -5,8 +5,6 @@ import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { AlertTriangle, X, Settings2 } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SourcesPanel } from "@/components/layout/sources-panel";
-import { Header } from "@/components/layout/header";
-import { Footer } from "@/components/layout/footer";
 import { ChatThread } from "@/components/chat/chat-thread";
 import { TimelinePanel } from "@/components/chat/timeline-panel";
 import { MessageComposer } from "@/components/chat/message-composer";
@@ -1016,8 +1014,6 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full flex-col bg-transparent">
-      <Header />
-
       <div className="flex min-h-0 flex-1">
       <Sidebar
         isCollapsed={sidebarCollapsed}
@@ -1209,8 +1205,6 @@ export default function ChatPage() {
         confidenceLabel={confidenceLabel}
       />
       </div>
-
-      <Footer />
     </div>
   );
 }
