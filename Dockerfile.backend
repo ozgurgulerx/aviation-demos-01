@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
 
 # Copy backend Python modules
 COPY src/*.py /app/
+COPY src/contracts /app/contracts
 
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
