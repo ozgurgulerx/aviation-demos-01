@@ -932,6 +932,61 @@ class UnifiedRetriever:
             )
         return dict_rows, citations
 
+    def _heuristic_sql_fallback(self, query: str, need_schema_detail: str) -> Optional[str]:
+        """Best-effort SQL fallback when writer returns NEED_SCHEMA."""
+        schema = self.current_sql_schema()
+        tables = {
+            str(t.get("table", "")).lower(): {
+                str(col.get("name", "")).lower()
+                for col in (t.get("columns") or [])
+                if isinstance(col, dict)
+            }
+            for t in schema.get("tables", [])
+            if isinstance(t, dict)
+        }
+        asrs_cols = tables.get("asrs_reports", set())
+        if not asrs_cols:
+            return None
+
+        q = (query or "").lower()
+        ask_top = any(token in q for token in ("top", "highest", "rank"))
+        ask_count = "count" in q or "how many" in q or "number of" in q
+        ask_facility = any(token in q for token in ("facility", "facilities", "airport", "airports", "location", "station"))
+        if not (ask_top and ask_count):
+            return None
+
+        if ask_facility and "location" in asrs_cols:
+            return (
+                "SELECT COALESCE(NULLIF(location, ''), 'UNKNOWN') AS facility, "
+                "COUNT(*) AS report_count "
+                "FROM asrs_reports "
+                "GROUP BY facility "
+                "ORDER BY report_count DESC "
+                "LIMIT 5"
+            )
+
+        if "aircraft_type" in asrs_cols:
+            return (
+                "SELECT COALESCE(NULLIF(aircraft_type, ''), 'UNKNOWN') AS category, "
+                "COUNT(*) AS report_count "
+                "FROM asrs_reports "
+                "GROUP BY category "
+                "ORDER BY report_count DESC "
+                "LIMIT 5"
+            )
+
+        if "flight_phase" in asrs_cols:
+            return (
+                "SELECT COALESCE(NULLIF(flight_phase, ''), 'UNKNOWN') AS category, "
+                "COUNT(*) AS report_count "
+                "FROM asrs_reports "
+                "GROUP BY category "
+                "ORDER BY report_count DESC "
+                "LIMIT 5"
+            )
+
+        return None
+
     # =========================================================================
     # Core Retrieval Methods
     # =========================================================================
@@ -975,6 +1030,15 @@ class UnifiedRetriever:
                 return [row], "", []
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
+            fallback_sql = self._heuristic_sql_fallback(query, sql)
+            if fallback_sql:
+                results, citations = self.execute_sql_query(fallback_sql)
+                if results and not results[0].get("error_code"):
+                    for row in results:
+                        if isinstance(row, dict):
+                            row["partial_schema"] = sql
+                            row["fallback_sql"] = fallback_sql
+                return results, fallback_sql, citations
             return [self._source_error_row("SQL", "sql_schema_missing", sql, {"sql": sql})], sql, []
 
         results, citations = self.execute_sql_query(sql)

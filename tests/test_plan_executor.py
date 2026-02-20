@@ -10,6 +10,8 @@ from plan_executor import PlanExecutor
 
 
 class _DummyRetriever:
+    strict_source_mode = False
+
     def source_event_meta(self, source: str):
         return {"source": source, "endpoint_label": "test", "freshness": "test"}
 
@@ -20,6 +22,12 @@ class _DummyRetriever:
         if "one" in query:
             return [{"id": "n1", "value": 1}], []
         return [{"id": "n2", "value": 2}], []
+
+    def _heuristic_sql_fallback(self, _query: str, _detail: str):
+        return "SELECT 'KJFK' AS facility, 2 AS report_count"
+
+    def execute_sql_query(self, _sql_query: str):
+        return [{"facility": "KJFK", "report_count": 2}], []
 
 
 class PlanExecutorTests(unittest.TestCase):
@@ -48,6 +56,29 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertTrue(done_events)
         self.assertEqual(done_events[0].get("contract_status"), "met")
         self.assertEqual(done_events[0].get("execution_mode"), "live")
+
+    def test_sql_need_schema_uses_heuristic_fallback(self):
+        retriever = _DummyRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_sql",
+                    tool="SQL",
+                    operation="aggregate",
+                    query="-- NEED_SCHEMA: damage_score missing",
+                    params={"evidence_type": "generic"},
+                )
+            ]
+        )
+
+        result = executor.execute(user_query="top facilities by count", plan=plan, schemas={})
+
+        self.assertIn("SQL", result.source_results)
+        rows = result.source_results["SQL"]
+        self.assertEqual(rows[0].get("facility"), "KJFK")
+        self.assertEqual(rows[0].get("report_count"), 2)
+        self.assertEqual(rows[0].get("partial_schema"), "-- NEED_SCHEMA: damage_score missing")
 
 
 if __name__ == "__main__":

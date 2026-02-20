@@ -213,6 +213,14 @@ class PlanExecutor:
 
         if source == "SQL":
             sql_query = call.query
+            if sql_query and sql_query.strip().startswith("-- NEED_SCHEMA"):
+                rows, citations, resolved_sql = self._handle_sql_need_schema(
+                    sql_query=sql_query,
+                    user_query=user_query,
+                    evidence_type=evidence_type,
+                    entities=entities,
+                )
+                return rows, citations, resolved_sql
             if not sql_query or not self._looks_like_sql(sql_query):
                 try:
                     sql_query = self._get_sql_writer().generate(
@@ -238,13 +246,13 @@ class PlanExecutor:
                         return rows, citations, None
                     return [{"error": str(exc), "error_code": "sql_generation_failed"}], [], None
             if sql_query.strip().startswith("-- NEED_SCHEMA"):
-                if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
-                    rows, citations = self.retriever.query_runway_constraints_fallback(
-                        user_query,
-                        airports=entities.get("airports") if isinstance(entities, dict) else None,
-                    )
-                    return rows, citations, sql_query
-                return [{"error": sql_query}], [], sql_query
+                rows, citations, resolved_sql = self._handle_sql_need_schema(
+                    sql_query=sql_query,
+                    user_query=user_query,
+                    evidence_type=evidence_type,
+                    entities=entities,
+                )
+                return rows, citations, resolved_sql
             rows, citations = self._execute_sql_raw(sql_query)
             return rows, citations, sql_query
 
@@ -305,6 +313,33 @@ class PlanExecutor:
     def _execute_sql_raw(self, sql_query: str) -> Tuple[List[Dict[str, Any]], List[Citation]]:
         return self.retriever.execute_sql_query(sql_query)
 
+    def _handle_sql_need_schema(
+        self,
+        sql_query: str,
+        user_query: str,
+        evidence_type: str,
+        entities: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], List[Citation], str]:
+        if evidence_type == "RunwayConstraints" and not self.retriever.strict_source_mode:
+            rows, citations = self.retriever.query_runway_constraints_fallback(
+                user_query,
+                airports=entities.get("airports") if isinstance(entities, dict) else None,
+            )
+            return rows, citations, sql_query
+
+        if not self.retriever.strict_source_mode:
+            fallback_sql = self.retriever._heuristic_sql_fallback(user_query, sql_query)
+            if fallback_sql:
+                rows, citations = self._execute_sql_raw(fallback_sql)
+                if rows and not rows[0].get("error_code"):
+                    for row in rows:
+                        if isinstance(row, dict):
+                            row["partial_schema"] = sql_query
+                            row["fallback_sql"] = fallback_sql
+                return rows, citations, fallback_sql
+
+        return [{"error": sql_query, "error_code": "sql_schema_missing"}], [], sql_query
+
     def _canon_tool(self, raw: str) -> str:
         value = (raw or "").strip().upper()
         mapping = {
@@ -346,6 +381,8 @@ class PlanExecutor:
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         evidence_type = str((params or {}).get("evidence_type", "")).strip()
+        if not evidence_type:
+            evidence_type = self._infer_evidence_type(source, call_id, operation)
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -358,6 +395,27 @@ class PlanExecutor:
                 enriched["__evidence_type"] = evidence_type
             out.append(enriched)
         return out
+
+    def _infer_evidence_type(self, source: str, call_id: str, operation: str) -> str:
+        source_u = (source or "").upper()
+        call_u = (call_id or "").upper()
+        op_u = (operation or "").upper()
+        token = f"{call_u}:{op_u}"
+
+        if source_u == "KQL":
+            if "METAR" in token:
+                return "METAR"
+            if "TAF" in token:
+                return "TAF"
+            if "HAZARD" in token:
+                return "Hazards"
+        if source_u == "NOSQL" and "NOTAM" in token:
+            return "NOTAM"
+        if source_u == "SQL" and ("RUNWAY" in token or "CONSTRAINT" in token):
+            return "RunwayConstraints"
+        if source_u == "VECTOR_REG" and ("SOP" in token or "POLICY" in token):
+            return "SOPClause"
+        return ""
 
     def _flatten_source_results(
         self,

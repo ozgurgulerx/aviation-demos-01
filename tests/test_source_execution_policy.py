@@ -38,6 +38,7 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         retriever.db = sqlite3.connect(":memory:")
         retriever.db.row_factory = sqlite3.Row
         retriever.search_clients = {}
+        retriever._vector_k_param = "k_nearest_neighbors"
         retriever.vector_source_to_index = {
             "VECTOR_OPS": "idx_ops_narratives",
             "VECTOR_REG": "idx_regulatory",
@@ -98,6 +99,37 @@ class SourceExecutionPolicyTests(unittest.TestCase):
 
         self.assertEqual(sql, "")
         self.assertEqual(rows[0].get("error_code"), "sql_generation_failed")
+
+    def test_query_sql_need_schema_uses_best_effort_fallback(self):
+        retriever = self._build_retriever()
+        cur = retriever.db.cursor()
+        cur.execute("CREATE TABLE asrs_reports (id INTEGER PRIMARY KEY, location TEXT, title TEXT)")
+        cur.execute("INSERT INTO asrs_reports (location, title) VALUES ('KJFK', 'r1')")
+        cur.execute("INSERT INTO asrs_reports (location, title) VALUES ('KJFK', 'r2')")
+        cur.execute("INSERT INTO asrs_reports (location, title) VALUES ('KLGA', 'r3')")
+        retriever.sql_writer.sql = "-- NEED_SCHEMA: damage_score column in asrs_reports"
+
+        rows, sql, _citations = retriever.query_sql(
+            "Top 5 facilities by ASRS report count and average damage score."
+        )
+
+        self.assertIn("GROUP BY facility", sql)
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertIsNone(rows[0].get("error_code"))
+        self.assertIn("partial_schema", rows[0])
+
+    def test_query_sql_need_schema_without_fallback_returns_schema_missing(self):
+        retriever = self._build_retriever()
+        cur = retriever.db.cursor()
+        cur.execute("CREATE TABLE asrs_reports (id INTEGER PRIMARY KEY, title TEXT)")
+        retriever.sql_writer.sql = "-- NEED_SCHEMA: damage_score column in asrs_reports"
+
+        rows, sql, _citations = retriever.query_sql(
+            "Top 5 facilities by ASRS report count and average damage score."
+        )
+
+        self.assertEqual(sql, "-- NEED_SCHEMA: damage_score column in asrs_reports")
+        self.assertEqual(rows[0].get("error_code"), "sql_schema_missing")
 
     def test_source_mode_blocks_sql_when_unavailable(self):
         retriever = self._build_retriever()
