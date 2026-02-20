@@ -179,6 +179,59 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         rows, _citations, _sql = retriever.retrieve_source("UNKNOWN", "x")
         self.assertIn("unknown_source", rows[0].get("error", ""))
 
+    def test_extract_airports_from_city_query(self):
+        retriever = self._build_retriever()
+        airports = retriever._extract_airports_from_query("flight risk brief towards New York")
+        self.assertIn("KJFK", airports)
+        self.assertIn("KLGA", airports)
+        self.assertIn("KEWR", airports)
+        self.assertNotIn("RISK", airports)
+        self.assertNotIn("YORK", airports)
+
+    def test_kql_weather_fallback_returns_airport_rows(self):
+        retriever = self._build_retriever()
+        retriever._metar_rows_for_airports = lambda airports, max_rows=12: [  # type: ignore[assignment]
+            {"station_id": airports[0], "raw_text": "METAR SAMPLE", "observation_time": "2026-02-20T10:00:00Z"}
+        ]
+        retriever._taf_rows_for_airports = lambda airports, max_rows=12: [  # type: ignore[assignment]
+            {"station_id": airports[0], "raw_text": "TAF SAMPLE", "issue_time": "2026-02-20T09:00:00Z"}
+        ]
+
+        with patch.object(ur, "FABRIC_KQL_ENDPOINT", ""):
+            rows, citations = retriever.query_kql("brief for New York", window_minutes=60)
+
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(citations[0].identifier, "eventhouse_weather_fallback")
+        self.assertIn("station_id", rows[0])
+
+    def test_nosql_fallback_uses_notam_docs_helper(self):
+        retriever = self._build_retriever()
+        retriever._notam_docs_for_airports = lambda _query, max_rows=30: [  # type: ignore[assignment]
+            {"facilityDesignator": "JFK", "notamNumber": "02/060"}
+        ]
+
+        with patch.object(ur, "FABRIC_NOSQL_ENDPOINT", ""):
+            rows, citations = retriever.query_nosql("New York NOTAMs")
+
+        self.assertEqual(rows[0]["facilityDesignator"], "JFK")
+        self.assertEqual(citations[0].identifier, "notam_snapshot")
+
+    def test_runway_constraints_fallback_from_local_dataset(self):
+        retriever = self._build_retriever()
+        data_runways = ROOT / "data" / "b-runways.csv"
+
+        def _latest_matching(pattern: str):
+            if "runways" in pattern and data_runways.exists():
+                return data_runways
+            return None
+
+        retriever._latest_matching = _latest_matching  # type: ignore[assignment]
+        rows, citations = retriever.query_runway_constraints_fallback("departure risk for New York")
+
+        airports = {row.get("airport") for row in rows if isinstance(row, dict)}
+        self.assertTrue({"KJFK", "KLGA", "KEWR"}.issubset(airports))
+        self.assertGreater(len(citations), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
