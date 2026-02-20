@@ -782,7 +782,7 @@ export default function ChatPage() {
           id: generateId(),
           role: "assistant",
           content:
-            "I encountered an error while preparing the pilot brief. Please retry or narrow the required data sources.",
+            "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.",
           createdAt: new Date(),
           isVerified: false,
         };
@@ -807,8 +807,9 @@ export default function ChatPage() {
         setOperationalAlert({
           id: generateId(),
           severity: "critical",
-          title: "Runtime Alert",
-          message: error instanceof Error ? error.message : "Unknown error",
+          title: "Briefing Service Interrupted",
+          message:
+            "Brief generation was interrupted. Re-check weather hazards, NOTAM status, and crew legality before release.",
           timestamp: new Date().toISOString(),
         });
       } finally {
@@ -863,8 +864,8 @@ export default function ChatPage() {
         ? "warning"
         : "destructive";
   const preflightText = preflightLoading
-    ? "Fabric preflight: checking"
-    : `Fabric preflight: ${preflightStatus.toUpperCase()}`;
+    ? "Data path health: checking"
+    : `Data path health: ${preflightStatus.toUpperCase()}`;
 
   return (
     <div className="flex h-full bg-transparent">
@@ -883,14 +884,14 @@ export default function ChatPage() {
         <div className="relative z-10 border-b border-border bg-card/80 px-4 py-3">
           <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="mission-chip">Pilot Brief Mode</span>
+              <span className="mission-chip">Flight Briefing Mode</span>
               <Badge variant="outline">{routeLabel}</Badge>
               <Badge variant={isLoading ? "warning" : "success"}>
-                {isLoading ? "Telemetry streaming" : "Idle"}
+                {isLoading ? "Briefing in progress" : "Ready"}
               </Badge>
               <Badge variant={preflightVariant}>{preflightText}</Badge>
               <Badge variant={fabricPreflight?.live_path_available ? "success" : "outline"}>
-                {fabricPreflight?.live_path_available ? "Live Fabric path ready" : "Fallback path available"}
+                {fabricPreflight?.live_path_available ? "Primary data path ready" : "Protected fallback ready"}
               </Badge>
               <Button
                 size="sm"
@@ -976,9 +977,9 @@ export default function ChatPage() {
                 </DialogTrigger>
                 <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
                   <DialogHeader>
-                    <DialogTitle>Context-to-Datastore Architecture</DialogTitle>
+                    <DialogTitle>Context-to-Evidence Architecture</DialogTitle>
                     <DialogDescription>
-                      Live source status and retrieval rationale for each datastore used by the pilot brief agent.
+                      Live source status and retrieval rationale for each datastore used by the flight brief assistant.
                     </DialogDescription>
                   </DialogHeader>
                   <ArchitectureMap sourceHealth={sourceHealth} />
@@ -1075,7 +1076,8 @@ function OperationalAlertBanner({
 }) {
   const reducedMotion = useReducedMotion();
   const severity = alert?.severity || "advisory";
-  const marquee = [alert?.message || "", alert?.message || ""];
+  const tickerMessage = alert ? toPilotRiskTickerMessage(alert) : "";
+  const marquee = [tickerMessage, tickerMessage];
 
   return (
     <AnimatePresence>
@@ -1097,12 +1099,12 @@ function OperationalAlertBanner({
           <div className="mx-auto flex max-w-5xl items-center gap-3">
             <div className="flex items-center gap-2 whitespace-nowrap text-xs font-semibold uppercase tracking-[0.1em]">
               <AlertTriangle className="h-4 w-4" />
-              {severity === "critical" ? "Critical Operational Advisory" : "Operational Advisory"}
+              {severity === "critical" ? "Critical Flight Risk Advisory" : "Flight Risk Advisory"}
             </div>
 
             <div className="min-w-0 flex-1 overflow-hidden">
               {reducedMotion ? (
-                <p className="truncate text-sm">{alert.message}</p>
+                <p className="truncate text-sm">{tickerMessage}</p>
               ) : (
                 <div className="alert-marquee-track">
                   {marquee.map((text, index) => (
@@ -1139,4 +1141,24 @@ function OperationalAlertBanner({
       )}
     </AnimatePresence>
   );
+}
+
+function toPilotRiskTickerMessage(alert: OperationalAlert): string {
+  const message = (alert.message || "").trim();
+  const infraSignalPattern =
+    /(runtime|backend|proxy|stream|deployment|kudu|telemetry|fabric|fallback|source mode|service)/i;
+
+  if (!message) {
+    return alert.severity === "critical"
+      ? "Critical risk update: verify weather cells, runway status, alternates, and crew legality before dispatch."
+      : "Risk update: confirm weather, NOTAM, and stand constraints before release.";
+  }
+
+  if (!infraSignalPattern.test(message)) {
+    return message;
+  }
+
+  return alert.severity === "critical"
+    ? "Critical risk update: briefing feed degraded. Verify weather cells, runway status, alternates, and crew legality before dispatch."
+    : "Risk update: one or more briefing feeds are degraded. Cross-check NOTAM, weather, and slot constraints before release.";
 }

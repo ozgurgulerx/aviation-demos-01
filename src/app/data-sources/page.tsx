@@ -28,7 +28,7 @@ import {
 } from "@/data/data-sources-content";
 
 export const metadata: Metadata = {
-  title: "Data Sources | SunExpress Pilot Brief Bot",
+  title: "Data Sources | AeroLynx Pilot Brief Bot",
   description:
     "Detailed inventory of aviation data sources, datastore mapping, and retrieval roles used in the demo.",
 };
