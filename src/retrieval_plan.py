@@ -17,6 +17,7 @@ VALID_SOURCES = {
     "VECTOR_REG",
     "VECTOR_AIRPORT",
     "NOSQL",
+    "FABRIC_SQL",
 }
 
 

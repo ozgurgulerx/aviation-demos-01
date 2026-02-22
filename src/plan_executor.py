@@ -326,6 +326,10 @@ class PlanExecutor:
             rows, citations = self.retriever.query_nosql(call.query or user_query)
             return rows, citations, None
 
+        if source == "FABRIC_SQL":
+            rows, citations = self.retriever.query_fabric_sql(call.query or user_query)
+            return rows, citations, None
+
         if source in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
             # Reuse shared embedding when the query text matches the original user query.
             effective_query = call.query or user_query

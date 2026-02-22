@@ -67,6 +67,8 @@ env:
   FABRIC_KQL_ENDPOINT: ${{ vars.FABRIC_KQL_ENDPOINT }}
   FABRIC_GRAPH_ENDPOINT: ${{ vars.FABRIC_GRAPH_ENDPOINT }}
   FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
+  FABRIC_SQL_ENDPOINT: ${{ vars.FABRIC_SQL_ENDPOINT }}
+  FABRIC_SQL_DATABASE: ${{ vars.FABRIC_SQL_DATABASE }}
   AZURE_COSMOS_ENDPOINT: ${{ vars.AZURE_COSMOS_ENDPOINT }}
   AZURE_COSMOS_DATABASE: ${{ vars.AZURE_COSMOS_DATABASE || 'aviationrag' }}
   AZURE_COSMOS_CONTAINER: ${{ vars.AZURE_COSMOS_CONTAINER || 'notams' }}
@@ -325,7 +327,10 @@ jobs:
             --from-literal=AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}" \
             --from-literal=AZURE_SEARCH_ADMIN_KEY="${{ secrets.AZURE_SEARCH_ADMIN_KEY }}" \
             --from-literal=PGPASSWORD="${{ secrets.PGPASSWORD }}" \
-            --from-literal=FABRIC_BEARER_TOKEN="${{ secrets.FABRIC_BEARER_TOKEN }}" \
+            --from-literal=FABRIC_CLIENT_ID="${{ secrets.FABRIC_CLIENT_ID }}" \
+            --from-literal=FABRIC_CLIENT_SECRET="${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            --from-literal=FABRIC_TENANT_ID="${{ secrets.FABRIC_TENANT_ID }}" \
+            --from-literal=AZURE_COSMOS_KEY="${{ secrets.AZURE_COSMOS_KEY }}" \
             --from-literal=APPLICATIONINSIGHTS_CONNECTION_STRING="${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}" \
             --dry-run=client -o yaml | kubectl apply -f -
 

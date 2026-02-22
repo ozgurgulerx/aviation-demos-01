@@ -199,7 +199,7 @@ IATA_TO_ICAO_MAP: Dict[str, str] = {
 # Tool name canonicalization
 # ---------------------------------------------------------------------------
 
-KNOWN_TOOLS: set[str] = {"KQL", "SQL", "GRAPH", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT", "NOSQL"}
+KNOWN_TOOLS: set[str] = {"KQL", "SQL", "GRAPH", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT", "NOSQL", "FABRIC_SQL"}
 
 TOOL_ALIASES: Dict[str, str] = {
     "EVENTHOUSEKQL": "KQL",
@@ -215,6 +215,9 @@ TOOL_ALIASES: Dict[str, str] = {
     "VECTOR_OPS": "VECTOR_OPS",
     "VECTOR_AIRPORT": "VECTOR_AIRPORT",
     "NOSQL": "NOSQL",
+    "FABRIC_SQL": "FABRIC_SQL",
+    "FABRICSQL": "FABRIC_SQL",
+    "FABRICWAREHOUSESQL": "FABRIC_SQL",
     "LAKEHOUSEDELTA": "KQL",
 }
 

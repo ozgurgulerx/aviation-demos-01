@@ -61,7 +61,9 @@ _SEMANTIC_MIN_SCORE = float(os.getenv("SEMANTIC_MIN_SCORE_THRESHOLD", "0.0"))
 FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
+FABRIC_SQL_ENDPOINT = os.getenv("FABRIC_SQL_ENDPOINT")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
+FABRIC_SQL_DATABASE = os.getenv("FABRIC_SQL_DATABASE", "").strip()
 
 AZURE_COSMOS_ENDPOINT = os.getenv("AZURE_COSMOS_ENDPOINT", "").strip()
 AZURE_COSMOS_KEY = os.getenv("AZURE_COSMOS_KEY", "").strip()
@@ -81,46 +83,49 @@ _fabric_token_cache: Dict[str, Any] = {}
 def _acquire_fabric_token() -> str:
     """Acquire Fabric bearer token via MSAL client credentials, with caching.
 
-    Falls back to static ``FABRIC_BEARER_TOKEN`` env var if MSAL env vars
-    are not configured.
+    Prefers MSAL client credentials (auto-refreshing) over static
+    ``FABRIC_BEARER_TOKEN`` env var, which expires after ~1 hour.
     """
+    # 1. Try MSAL client credentials (auto-refreshing) first.
+    client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
+    client_secret = os.getenv("FABRIC_CLIENT_SECRET", "").strip()
+    tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
+    if client_id and client_secret and tenant_id:
+        with _fabric_token_lock:
+            cached = _fabric_token_cache.get("token")
+            expires = _fabric_token_cache.get("expires_at", 0)
+            if cached and time.time() < expires - 120:  # 2-min buffer
+                return cached
+
+            token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+            body = urllib.parse.urlencode({
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": "https://api.fabric.microsoft.com/.default",
+            }).encode()
+            req = urllib.request.Request(token_url, data=body, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                access_token = data["access_token"]
+                expires_in = int(data.get("expires_in", 3600))
+                _fabric_token_cache["token"] = access_token
+                _fabric_token_cache["expires_at"] = time.time() + expires_in
+                logger.info("Acquired Fabric bearer token (expires_in=%ds)", expires_in)
+                return access_token
+            except Exception as exc:
+                logger.warning("MSAL token acquisition failed: %s", exc)
+                if cached:
+                    return cached
+
+    # 2. Fallback: static bearer token (local dev / manual override).
     static = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
     if static:
         return static
 
-    client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
-    client_secret = os.getenv("FABRIC_CLIENT_SECRET", "").strip()
-    tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
-    if not (client_id and client_secret and tenant_id):
-        return ""
-
-    with _fabric_token_lock:
-        cached = _fabric_token_cache.get("token")
-        expires = _fabric_token_cache.get("expires_at", 0)
-        if cached and time.time() < expires - 120:  # 2-min buffer
-            return cached
-
-        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-        body = urllib.parse.urlencode({
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://api.fabric.microsoft.com/.default",
-        }).encode()
-        req = urllib.request.Request(token_url, data=body, method="POST")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            access_token = data["access_token"]
-            expires_in = int(data.get("expires_in", 3600))
-            _fabric_token_cache["token"] = access_token
-            _fabric_token_cache["expires_at"] = time.time() + expires_in
-            logger.info("Acquired Fabric bearer token (expires_in=%ds)", expires_in)
-            return access_token
-        except Exception as exc:
-            logger.warning("MSAL token acquisition failed: %s", exc)
-            return cached or ""
+    return ""
 
 
 @dataclass
@@ -516,6 +521,8 @@ class UnifiedRetriever:
             if self._cosmos_container is not None:
                 return "live"
             return "live" if FABRIC_NOSQL_ENDPOINT else "blocked"
+        if source_norm == "FABRIC_SQL":
+            return "live" if FABRIC_SQL_ENDPOINT else "blocked"
         if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
             return "live" if self.search_clients else "blocked"
         return "unknown"
@@ -527,6 +534,7 @@ class UnifiedRetriever:
             "GRAPH": "fabric-graph",
             "NOSQL": "cosmos-nosql" if self._cosmos_container is not None else "fabric-nosql",
             "SQL": "warehouse-sql",
+            "FABRIC_SQL": "fabric-sql-warehouse",
             "VECTOR_OPS": "vector-ops",
             "VECTOR_REG": "vector-regulatory",
             "VECTOR_AIRPORT": "vector-airport",
@@ -536,6 +544,7 @@ class UnifiedRetriever:
             "GRAPH": "dependency-snapshot",
             "NOSQL": "ops-doc-snapshot",
             "SQL": "warehouse-snapshot",
+            "FABRIC_SQL": "warehouse-snapshot",
             "VECTOR_OPS": "indexed-context",
             "VECTOR_REG": "indexed-context",
             "VECTOR_AIRPORT": "indexed-context",
@@ -595,6 +604,7 @@ class UnifiedRetriever:
             ("fabric_kql_endpoint", FABRIC_KQL_ENDPOINT or "", "KQL"),
             ("fabric_graph_endpoint", FABRIC_GRAPH_ENDPOINT or "", "GRAPH"),
             ("fabric_nosql_endpoint", FABRIC_NOSQL_ENDPOINT or "", "NOSQL"),
+            ("fabric_sql_endpoint", FABRIC_SQL_ENDPOINT or "", "FABRIC_SQL"),
         ]
 
         live_configured = False
@@ -1534,6 +1544,59 @@ class UnifiedRetriever:
         detail = str(response.get("error")) if isinstance(response, dict) else "nosql_endpoint_query_failed"
         return [self._source_error_row("NOSQL", "nosql_runtime_error", detail)], []
 
+    def query_fabric_sql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
+        """Retrieve data from Fabric SQL warehouse via REST endpoint."""
+        if not FABRIC_SQL_ENDPOINT:
+            return [self._source_unavailable_row("FABRIC_SQL", "FABRIC_SQL_ENDPOINT not configured")], []
+
+        # Generate SQL from user query using sql_writer.
+        try:
+            schema = self.cached_sql_schema()
+            sql = self.sql_writer.generate(
+                user_query=query,
+                evidence_type="generic",
+                sql_schema=schema,
+                entities={"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []},
+                time_window={"horizon_min": 120, "start_utc": None, "end_utc": None},
+                constraints={"dialect": "tsql"},
+            )
+        except Exception as exc:
+            return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
+
+        if sql.strip().startswith("-- NEED_SCHEMA"):
+            return [self._source_error_row("FABRIC_SQL", "sql_schema_missing", sql, {"sql": sql})], []
+
+        payload: Dict[str, Any] = {"query": sql}
+        if FABRIC_SQL_DATABASE:
+            payload["database"] = FABRIC_SQL_DATABASE
+
+        response = self._post_json(FABRIC_SQL_ENDPOINT, payload)
+        if isinstance(response, dict) and response.get("error"):
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_runtime_error", str(response.get("error")), {"sql": sql})], []
+
+        rows: List[Dict[str, Any]] = []
+        if isinstance(response, list):
+            rows = response
+        elif isinstance(response, dict):
+            rows = response.get("rows", response.get("results", []))
+
+        if not rows:
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_runtime_error", "fabric_sql_query_returned_no_rows", {"sql": sql})], []
+
+        citations: List[Citation] = []
+        for idx, row in enumerate(rows[:10], start=1):
+            row_id = row.get("id") or f"fabric_sql_row_{idx}"
+            title = row.get("title") or f"Fabric SQL row {idx}"
+            citations.append(Citation(
+                source_type="FABRIC_SQL",
+                identifier=str(row_id),
+                title=str(title),
+                content_preview=str(row)[:120],
+                score=0.9,
+                dataset="fabric-sql-warehouse",
+            ))
+        return rows, citations
+
     # =========================================================================
     # Route Execution Methods
     # =========================================================================
@@ -1652,6 +1715,10 @@ class UnifiedRetriever:
                 return rows, citations, None
             if source == "NOSQL":
                 rows, citations = self.query_nosql(query)
+                span.set_attribute("row_count", len(rows))
+                return rows, citations, None
+            if source == "FABRIC_SQL":
+                rows, citations = self.query_fabric_sql(query)
                 span.set_attribute("row_count", len(rows))
                 return rows, citations, None
             if source in ("VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):

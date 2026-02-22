@@ -277,7 +277,7 @@ class AviationRagContextProvider:
             "ask_recommendation": ask_recommendation,
         }
         tool_catalog = {
-            "allowed_tools": ["GRAPH", "KQL", "SQL", "VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT", "NOSQL"],
+            "allowed_tools": ["GRAPH", "KQL", "SQL", "VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT", "NOSQL", "FABRIC_SQL"],
             "fallback_for": {
                 "NOTAM": ["VECTOR_REG", "NOSQL"],
                 "SOPClause": ["VECTOR_REG"],
