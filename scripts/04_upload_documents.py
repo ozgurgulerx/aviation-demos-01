@@ -132,7 +132,7 @@ def upload_documents(
     embedding_mode: str,
     start_offset: int = 0,
 ) -> None:
-    credential = DefaultAzureCredential()
+    credential = None
     openai_client = None
     if embedding_mode == "azure":
         openai_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
@@ -144,6 +144,7 @@ def upload_documents(
                 api_version="2024-06-01",
             )
         else:
+            credential = DefaultAzureCredential()
             token_provider = get_bearer_token_provider(
                 credential, "https://cognitiveservices.azure.com/.default"
             )
@@ -160,6 +161,8 @@ def upload_documents(
     if search_key:
         search_credential = AzureKeyCredential(search_key)
     else:
+        if credential is None:
+            credential = DefaultAzureCredential()
         search_credential = credential
 
     search_client = SearchClient(
@@ -173,9 +176,16 @@ def upload_documents(
         raise FileNotFoundError(f"Documents file not found: {docs_path}")
 
     docs: List[Dict[str, str]] = []
+    skipped = 0
     for raw_doc in iter_jsonl(docs_path):
-        doc = sanitize_document(raw_doc)
+        try:
+            doc = sanitize_document(raw_doc)
+        except ValueError:
+            skipped += 1
+            continue
         docs.append(doc)
+    if skipped:
+        print(f"  Skipped {skipped} documents with missing required fields")
 
     ensure_unique_ids(docs)
 

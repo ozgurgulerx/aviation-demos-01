@@ -77,6 +77,16 @@ Always verify Azure CLI context before provisioning/deploying:
 az account show --query "{user:user.name,tenantId:tenantId,name:name,id:id}" -o table
 ```
 
+## Azure OpenAI Configuration
+
+- **Endpoint:** `https://swedencentral.api.cognitive.microsoft.com/` (Sweden Central regional Cognitive Services endpoint)
+- **API Version:** `2025-04-01-preview`
+- **Auth:** API key (`AZURE_OPENAI_AUTH_MODE=api-key`). The endpoint is in the MngEnvMCAP705508 tenant — no cross-tenant credential needed.
+- **Deployments:**
+  - `gpt-5-nano` — primary LLM for query routing, SQL generation, and answer synthesis (`AZURE_OPENAI_DEPLOYMENT_NAME`)
+  - `gpt-5-mini` — reasoning/orchestrator model (`AZURE_OPENAI_REASONING_DEPLOYMENT_NAME`, `AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME`)
+  - `text-embedding-3-small` — embedding model (`AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME`)
+
 ## Architecture
 
 ```
@@ -107,7 +117,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 
 ### Backend
 - Flask with flask-cors (all origins allowed)
-- `DefaultAzureCredential` + `get_bearer_token_provider` for Azure OpenAI auth
+- API key auth for Azure OpenAI (`AZURE_OPENAI_AUTH_MODE=api-key`); `DefaultAzureCredential` supported as fallback
 - DB: PostgreSQL only (requires `PGHOST` set)
 - Single gunicorn worker in production (`--workers 1 --timeout 180`)
 - PII filter: 14 categories, confidence >= 0.8, fail-open on timeout (5s)
@@ -120,9 +130,13 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - `PII_API_KEY` — PII API key (not needed for container mode)
 
 ### Backend
-- `AZURE_OPENAI_ENDPOINT` — Azure OpenAI endpoint
-- `AZURE_OPENAI_API_KEY` — API key (fallback when no managed identity)
+- `AZURE_OPENAI_ENDPOINT` — Azure OpenAI endpoint (`https://swedencentral.api.cognitive.microsoft.com/`)
+- `AZURE_OPENAI_API_KEY` — API key for the regional endpoint
+- `AZURE_OPENAI_API_VERSION` — API version (default: `2025-04-01-preview`)
+- `AZURE_OPENAI_AUTH_MODE` — `api-key`, `token`, or `auto` (default: `auto`)
 - `AZURE_OPENAI_DEPLOYMENT_NAME` — LLM deployment (default: `gpt-5-nano`)
+- `AZURE_OPENAI_REASONING_DEPLOYMENT_NAME` — Reasoning/orchestrator deployment (default: `gpt-5-mini`)
+- `AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME` — Alias for orchestrator (default: `gpt-5-mini`)
 - `AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME` — Embedding model (default: `text-embedding-3-small`)
 - `AZURE_SEARCH_ENDPOINT` — AI Search endpoint
 - `AZURE_SEARCH_ADMIN_KEY` — AI Search admin key
@@ -140,7 +154,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 
 1. AI Search index may be empty until `scripts/04_upload_documents.py` is executed with real data
 2. Read-only PostgreSQL user `aviationrag_readonly` — not yet created
-3. GitHub Actions secrets (6 secrets) — not configured
+3. GitHub Actions secrets — configured (AZURE_OPENAI_API_KEY, AZURE_SEARCH_ADMIN_KEY, PG*, AZURE_TENANT_ID, etc.)
 4. Initial Docker image push to ACR — backend never built/pushed
 5. Login page (`app/login/page.tsx`) — still shows "Fund Intelligence" from predecessor project
 6. `chain` and `raptor` query types in frontend — no backend support

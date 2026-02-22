@@ -54,6 +54,24 @@ RULES:
 - Always output coverage checklist for required evidence.
 - If ask_recommendation=true, include SOPClause evidence.
 
+## Tool Descriptions
+- SQL: PostgreSQL warehouse. Use for counts, rankings, filters, timelines, airport metadata, route statistics, fleet data.
+- KQL: Fabric Eventhouse (Kusto). Use for real-time/near-real-time data: weather (METAR/TAF), live flight tracking, hazard alerts (SIGMET/PIREP).
+- GRAPH: Graph traversal over ops_graph_edges. Use for dependency analysis, impact chains, alternate airports, route networks, entity expansion.
+- VECTOR_OPS: Semantic search over operational narratives (idx_ops_narratives). Use for incident reports, near-miss narratives, safety observations, lessons learned. Best when query needs contextual understanding, similarity, or summarization of ASRS-type reports.
+- VECTOR_REG: Semantic search over regulatory documents (idx_regulatory). Use for NOTAMs, Airworthiness Directives, EASA/FAA bulletins, compliance checks, SOPs.
+- VECTOR_AIRPORT: Semantic search over airport operational documents (idx_airport_ops_docs). Use for runway specifications, station information, facility data, airport reference docs.
+- NOSQL: Cosmos DB document store. Use for operational NOTAMs, ground handling documents, parking stand assignments.
+- FABRIC_SQL: Fabric SQL Warehouse (T-SQL). Use for BTS on-time performance analytics, airline delay causes, schedule statistics, carrier performance benchmarks.
+
+## Tool Selection Rules
+- For narrative/similarity queries ("summarize", "similar", "what happened", "lessons"), ALWAYS include VECTOR_OPS.
+- For regulatory/compliance queries ("NOTAM", "airworthiness", "directive", "EASA"), include VECTOR_REG and/or NOSQL.
+- For airport operational details ("runway", "gate", "turnaround", "airport info"), include VECTOR_AIRPORT.
+- For delay/performance analytics ("delay", "on-time", "cancellation rate"), include FABRIC_SQL.
+- Select 2-4 complementary sources per query. Do NOT rely on a single source.
+- Always pair a structured source (SQL/KQL/FABRIC_SQL) with a semantic source (VECTOR_*) when the query mixes metrics and context.
+
 Plan schema:
 {
   "intent": {"name": string, "confidence": number},
@@ -125,12 +143,14 @@ class AgenticOrchestrator:
                 return self._fallback_plan(user_query, runtime_context, intent_graph, required_sources or [])
             if not any(plan.entities.get(k) for k in ("airports", "routes", "stations", "alternates")):
                 plan.entities = merged_entities
+            allowed = [str(t).upper() for t in (tool_catalog.get("allowed_tools") or [])]
             plan = self._ensure_required_evidence_calls(
                 plan,
                 user_query=user_query,
                 intent_graph=intent_graph,
-                allowed_tools=[str(t).upper() for t in (tool_catalog.get("allowed_tools") or [])],
+                allowed_tools=allowed,
             )
+            plan = self._enrich_plan_with_heuristics(plan, user_query, allowed)
             return self._enforce_required_sources(plan, required_sources or [])
         except Exception:
             logger.warning("Agentic planning failed, falling back to heuristic plan", exc_info=True)
@@ -179,7 +199,7 @@ class AgenticOrchestrator:
             if ev_name == "NOTAM":
                 canonical_tools = ["NOSQL", *[tool for tool in canonical_tools if tool != "NOSQL"]]
             evidence_tool_map[ev_name] = canonical_tools
-            for tool in canonical_tools[:1]:
+            for tool in canonical_tools[:2]:
                 depends_on = ["call_1"] if tool_calls and tool_calls[0].operation == "entity_expansion" else []
                 op = "lookup"
                 if tool == "SQL":
@@ -225,7 +245,7 @@ class AgenticOrchestrator:
             CoverageItem(evidence=str(req.get("name", "")), status="planned", via_tools=evidence_tool_map.get(str(req.get("name", "")), []))
             for req in required_evidence
         ]
-        return AgenticPlan(
+        plan = AgenticPlan(
             intent=Intent(name=intent_name, confidence=0.51),
             time_window=TimeWindow(horizon_min=int(runtime_context.get("default_time_horizon_min", 120) or 120)),
             entities=inferred_entities,
@@ -236,6 +256,7 @@ class AgenticOrchestrator:
             schema_requests=[],
             warnings=["LLM routing unavailable; fallback orchestration used."],
         )
+        return self._enrich_plan_with_heuristics(plan, query, [])
 
     def _merge_entities(self, base: Dict[str, Any], inferred: Dict[str, List[str]]) -> Dict[str, List[str]]:
         merged: Dict[str, List[str]] = {
@@ -376,12 +397,16 @@ class AgenticOrchestrator:
 
     def _infer_intent(self, query: str) -> str:
         q = query.lower()
-        if any(t in q for t in ("policy", "sop", "compliance", "clause")):
+        if any(t in q for t in ("policy", "sop", "compliance", "clause", "airworthiness", "directive", "easa", "bulletin", "regulatory")):
             return "Policy.Check"
         if any(t in q for t in ("arrival", "approach", "landing")):
             return "PilotBrief.Arrival"
-        if any(t in q for t in ("disruption", "delay", "irrops", "why")):
+        if any(t in q for t in ("on-time", "cancellation rate", "schedule performance", "bts", "carrier delay", "delay cause")):
+            return "Analytics.Compare"
+        if any(t in q for t in ("disruption", "irrops")):
             return "Disruption.Explain"
+        if any(t in q for t in ("summarize", "similar", "narrative", "what happened", "lessons", "bird strike", "incident report")):
+            return "Safety.Trend"
         if any(t in q for t in ("replay", "history", "last week", "yesterday")):
             return "Replay.History"
         if any(t in q for t in ("compare", "versus", "ranking", "benchmark")):
@@ -392,9 +417,64 @@ class AgenticOrchestrator:
             return "RouteNetwork.Query"
         if any(t in q for t in ("trend", "incident rate", "safety record", "accident")):
             return "Safety.Trend"
-        if any(t in q for t in ("airport info", "runway", "elevation", "frequency", "icao")):
+        if any(t in q for t in ("airport info", "runway", "elevation", "frequency", "icao", "gate", "turnaround", "station")):
             return "Airport.Info"
+        if any(t in q for t in ("delay", "performance")):
+            return "Analytics.Compare"
         return "PilotBrief.Departure"
+
+    def _enrich_plan_with_heuristics(
+        self, plan: AgenticPlan, user_query: str, allowed_tools: List[str],
+    ) -> AgenticPlan:
+        """Post-LLM heuristic: ensure query-relevant sources are included."""
+        query_l = user_query.lower()
+        existing_tools = {self._canonical_tool_name(c.tool) for c in plan.tool_calls}
+        allow_all = not allowed_tools
+        next_id = len(plan.tool_calls) + 1
+
+        enrichments: List[tuple[str, str, str]] = []
+        # Narrative/similarity -> VECTOR_OPS
+        if any(m in query_l for m in (
+            "summarize", "similar", "narrative", "what happened",
+            "examples", "lessons", "incident", "bird strike",
+        )):
+            enrichments.append(("VECTOR_OPS", "semantic_lookup", "Query mentions narrative/similarity"))
+        # Regulatory -> VECTOR_REG
+        if any(m in query_l for m in (
+            "airworthiness", "notam", "easa", "compliance",
+            "directive", "sop", "bulletin", "regulatory",
+        )):
+            enrichments.append(("VECTOR_REG", "semantic_lookup", "Query mentions regulatory content"))
+        # Airport ops -> VECTOR_AIRPORT
+        if any(m in query_l for m in (
+            "runway", "gate", "turnaround", "airport info",
+            "station info", "facility",
+        )):
+            enrichments.append(("VECTOR_AIRPORT", "semantic_lookup", "Query mentions airport operations"))
+        # Delay analytics -> FABRIC_SQL
+        if any(m in query_l for m in (
+            "delay", "on-time", "cancellation", "schedule performance",
+            "bts", "carrier performance",
+        )):
+            enrichments.append(("FABRIC_SQL", "sql_lookup", "Query mentions delay/performance analytics"))
+
+        for tool, op, reason in enrichments:
+            if tool in existing_tools:
+                continue
+            if not allow_all and tool not in allowed_tools:
+                continue
+            plan.tool_calls.append(ToolCall(
+                id=f"enrich_{next_id}",
+                tool=tool,
+                operation=op,
+                depends_on=[],
+                query=user_query,
+                params={"evidence_type": "heuristic_enrichment", "reason": reason},
+            ))
+            next_id += 1
+            existing_tools.add(tool)
+
+        return plan
 
     def _enforce_required_sources(self, plan: AgenticPlan, required_sources: List[str]) -> AgenticPlan:
         existing = {self._canonical_tool_name(c.tool) for c in plan.tool_calls}
@@ -433,5 +513,7 @@ class AgenticOrchestrator:
             "VECTOR_AIRPORT": "VECTOR_AIRPORT",
             "NOSQL": "NOSQL",
             "LAKEHOUSEDELTA": "KQL",
+            "FABRIC_SQL": "FABRIC_SQL",
+            "FABRICSQL": "FABRIC_SQL",
         }
-        return mapping.get(value, value if value in {"KQL", "SQL", "GRAPH", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT", "NOSQL"} else "")
+        return mapping.get(value, value if value in {"KQL", "SQL", "GRAPH", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT", "NOSQL", "FABRIC_SQL"} else "")

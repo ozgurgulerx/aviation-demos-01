@@ -8,7 +8,7 @@ import os
 import threading
 from typing import Dict, Optional, Tuple
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from azure.identity import AzureCliCredential, DefaultAzureCredential, get_bearer_token_provider
 from openai import AzureOpenAI
 
 logger = logging.getLogger(__name__)
@@ -32,8 +32,13 @@ def _auth_mode() -> str:
     return (os.getenv("AZURE_OPENAI_AUTH_MODE", "auto") or "auto").strip().lower()
 
 
-def _build_credential() -> DefaultAzureCredential:
+def _build_credential():
+    aoai_tenant = os.getenv("AZURE_OPENAI_TENANT_ID", "").strip()
     managed_identity_client_id = os.getenv("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID", "").strip() or None
+
+    if aoai_tenant:
+        logger.info("Using AzureCliCredential with tenant_id=%s", aoai_tenant)
+        return AzureCliCredential(tenant_id=aoai_tenant)
 
     kwargs: Dict[str, str] = {}
     if managed_identity_client_id:

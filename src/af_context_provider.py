@@ -282,6 +282,12 @@ class AviationRagContextProvider:
                 "NOTAM": ["VECTOR_REG", "NOSQL"],
                 "SOPClause": ["VECTOR_REG"],
                 "Hazards": ["KQL"],
+                "SafetyStats": ["VECTOR_OPS", "FABRIC_SQL"],
+                "AirportData": ["VECTOR_AIRPORT"],
+                "FleetData": ["FABRIC_SQL"],
+                "IncidentNarrative": ["VECTOR_OPS"],
+                "RegulatoryDoc": ["VECTOR_REG"],
+                "DelayAnalytics": ["FABRIC_SQL"],
             },
         }
         entities = {"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []}

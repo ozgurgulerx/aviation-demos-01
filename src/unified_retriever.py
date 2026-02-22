@@ -77,14 +77,21 @@ def _get_fabric_bearer_token() -> str:
 
 
 _fabric_token_lock = threading.Lock()
-_fabric_token_cache: Dict[str, Any] = {}
+_fabric_token_cache: Dict[str, Dict[str, Any]] = {}  # scope -> {token, expires_at}
+
+_FABRIC_DEFAULT_SCOPE = "https://api.fabric.microsoft.com/.default"
 
 
-def _acquire_fabric_token() -> str:
+def _acquire_fabric_token(scope: str = _FABRIC_DEFAULT_SCOPE) -> str:
     """Acquire Fabric bearer token via MSAL client credentials, with caching.
 
     Prefers MSAL client credentials (auto-refreshing) over static
     ``FABRIC_BEARER_TOKEN`` env var, which expires after ~1 hour.
+
+    Args:
+        scope: OAuth2 scope for the token request. Defaults to the Fabric API
+            scope. Pass a cluster-specific scope for Kusto endpoints
+            (e.g. ``https://trd-xxx.z2.kusto.fabric.microsoft.com/.default``).
     """
     # 1. Try MSAL client credentials (auto-refreshing) first.
     client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
@@ -92,8 +99,9 @@ def _acquire_fabric_token() -> str:
     tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
     if client_id and client_secret and tenant_id:
         with _fabric_token_lock:
-            cached = _fabric_token_cache.get("token")
-            expires = _fabric_token_cache.get("expires_at", 0)
+            entry = _fabric_token_cache.get(scope, {})
+            cached = entry.get("token")
+            expires = entry.get("expires_at", 0)
             if cached and time.time() < expires - 120:  # 2-min buffer
                 return cached
 
@@ -102,7 +110,7 @@ def _acquire_fabric_token() -> str:
                 "grant_type": "client_credentials",
                 "client_id": client_id,
                 "client_secret": client_secret,
-                "scope": "https://api.fabric.microsoft.com/.default",
+                "scope": scope,
             }).encode()
             req = urllib.request.Request(token_url, data=body, method="POST")
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -111,12 +119,14 @@ def _acquire_fabric_token() -> str:
                     data = json.loads(resp.read())
                 access_token = data["access_token"]
                 expires_in = int(data.get("expires_in", 3600))
-                _fabric_token_cache["token"] = access_token
-                _fabric_token_cache["expires_at"] = time.time() + expires_in
-                logger.info("Acquired Fabric bearer token (expires_in=%ds)", expires_in)
+                _fabric_token_cache[scope] = {
+                    "token": access_token,
+                    "expires_at": time.time() + expires_in,
+                }
+                logger.info("Acquired Fabric bearer token scope=%s (expires_in=%ds)", scope, expires_in)
                 return access_token
             except Exception as exc:
-                logger.warning("MSAL token acquisition failed: %s", exc)
+                logger.warning("MSAL token acquisition failed (scope=%s): %s", scope, exc)
                 if cached:
                     return cached
 
@@ -397,11 +407,11 @@ class UnifiedRetriever:
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def _post_json(self, endpoint: str, payload: Any) -> Any:
+    def _post_json(self, endpoint: str, payload: Any, token_scope: str = None) -> Any:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
-        token = _acquire_fabric_token()
+        token = _acquire_fabric_token(token_scope) if token_scope else _acquire_fabric_token()
         if token:
             req.add_header("Authorization", f"Bearer {token}")
         try:
@@ -465,28 +475,49 @@ class UnifiedRetriever:
         if not db_name:
             return [], "missing_fabric_kql_database"
 
-        response = self._post_json(endpoint, {"db": db_name, "csl": csl})
+        # Derive cluster-specific token scope from endpoint URL.
+        parsed = urllib.parse.urlparse(endpoint)
+        kusto_scope = f"{parsed.scheme}://{parsed.hostname}/.default"
+
+        # Kusto REST v1 endpoint: POST to {cluster}/v1/rest/query
+        kql_endpoint = endpoint.rstrip("/") + "/v1/rest/query"
+
+        response = self._post_json(kql_endpoint, {"db": db_name, "csl": csl}, token_scope=kusto_scope)
         if isinstance(response, dict) and response.get("error"):
             return [], str(response.get("error"))
-        if not isinstance(response, list):
-            return [], "unexpected_kusto_response_type"
 
-        for frame in response:
-            if not isinstance(frame, dict):
-                continue
-            if frame.get("FrameType") != "DataTable":
-                continue
-            if frame.get("TableKind") != "PrimaryResult":
-                continue
-
-            columns = [str(c.get("ColumnName", "")) for c in (frame.get("Columns") or []) if isinstance(c, dict)]
-            rows: List[Dict[str, Any]] = []
-            for row in frame.get("Rows") or []:
-                if not isinstance(row, list):
+        # v1 response: {"Tables": [{"TableName": ..., "Columns": [...], "Rows": [[...]]}]}
+        if isinstance(response, dict) and "Tables" in response:
+            for table in response["Tables"]:
+                if not isinstance(table, dict):
                     continue
-                rows.append(dict(zip(columns, row)))
-            return rows, None
-        return [], "kusto_primary_result_not_found"
+                columns = [str(c.get("ColumnName", "")) for c in (table.get("Columns") or [])]
+                rows: List[Dict[str, Any]] = []
+                for row in table.get("Rows") or []:
+                    if isinstance(row, list):
+                        rows.append(dict(zip(columns, row)))
+                if rows:
+                    return rows, None
+            return [], "kusto_tables_empty"
+
+        # v2 streaming format (legacy fallback)
+        if isinstance(response, list):
+            for frame in response:
+                if not isinstance(frame, dict):
+                    continue
+                if frame.get("FrameType") != "DataTable":
+                    continue
+                if frame.get("TableKind") != "PrimaryResult":
+                    continue
+                columns = [str(c.get("ColumnName", "")) for c in (frame.get("Columns") or [])]
+                rows = []
+                for row in frame.get("Rows") or []:
+                    if isinstance(row, list):
+                        rows.append(dict(zip(columns, row)))
+                return rows, None
+            return [], "kusto_primary_result_not_found"
+
+        return [], "unexpected_kusto_response_type"
 
     def _source_error_row(
         self, source: str, code: str, detail: str, extra: Optional[Dict[str, Any]] = None
@@ -522,6 +553,8 @@ class UnifiedRetriever:
                 return "live"
             return "live" if FABRIC_NOSQL_ENDPOINT else "blocked"
         if source_norm == "FABRIC_SQL":
+            if os.getenv("FABRIC_SQL_SERVER", "").strip():
+                return "live"
             return "live" if FABRIC_SQL_ENDPOINT else "blocked"
         if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
             return "live" if self.search_clients else "blocked"
@@ -1558,10 +1591,118 @@ class UnifiedRetriever:
         detail = str(response.get("error")) if isinstance(response, dict) else "nosql_endpoint_query_failed"
         return [self._source_error_row("NOSQL", "nosql_runtime_error", detail)], []
 
+    def _get_fabric_sql_schema(self) -> str:
+        """Return warehouse-specific schema hint for the Fabric SQL writer."""
+        return """
+Tables in Fabric SQL Warehouse (T-SQL dialect):
+
+- bts_ontime_reporting: Year INT, Quarter INT, Month INT, DayofMonth INT,
+    DayOfWeek INT, FlightDate VARCHAR, IATA_Code_Marketing_Airline VARCHAR,
+    Flight_Number_Marketing_Airline VARCHAR, IATA_Code_Operating_Airline VARCHAR,
+    Tail_Number VARCHAR, Flight_Number_Operating_Airline VARCHAR,
+    Origin VARCHAR, OriginCityName VARCHAR, OriginState VARCHAR,
+    Dest VARCHAR, DestCityName VARCHAR, DestState VARCHAR,
+    CRSDepTime VARCHAR, DepTime VARCHAR, DepDelay FLOAT, DepDelayMinutes FLOAT,
+    DepDel15 FLOAT, CRSArrTime VARCHAR, ArrTime VARCHAR, ArrDelay FLOAT,
+    ArrDelayMinutes FLOAT, ArrDel15 FLOAT, Cancelled FLOAT,
+    CancellationCode VARCHAR, Diverted FLOAT, CRSElapsedTime FLOAT,
+    ActualElapsedTime FLOAT, AirTime FLOAT, Distance FLOAT, DistanceGroup INT,
+    CarrierDelay FLOAT, WeatherDelay FLOAT, NASDelay FLOAT,
+    SecurityDelay FLOAT, LateAircraftDelay FLOAT
+
+- airline_delay_causes: year INT, month INT, carrier VARCHAR,
+    carrier_name VARCHAR, airport VARCHAR, airport_name VARCHAR,
+    arr_flights FLOAT, arr_del15 FLOAT, carrier_ct FLOAT,
+    weather_ct FLOAT, nas_ct FLOAT, security_ct FLOAT,
+    late_aircraft_ct FLOAT, arr_cancelled FLOAT, arr_diverted FLOAT,
+    arr_delay FLOAT, carrier_delay FLOAT, weather_delay FLOAT,
+    nas_delay FLOAT, security_delay FLOAT, late_aircraft_delay FLOAT
+
+Notes:
+- IATA_Code_Marketing_Airline is the 2-letter carrier code (e.g. 'DL', 'AA', 'UA')
+- Origin/Dest are IATA airport codes (e.g. 'ATL', 'JFK', 'LAX')
+- Delay columns are in minutes; NULL means no delay of that type
+- Cancelled: 1.0 = cancelled, 0.0 = not cancelled
+- Use TOP N instead of LIMIT N (T-SQL dialect)
+"""
+
+    def _query_fabric_sql_tds(self, query: str, server: str, database: str) -> Tuple[List[Dict], List[Citation]]:
+        """Query Fabric SQL Warehouse via TDS (pyodbc) with AAD token auth."""
+        # Generate SQL using warehouse-specific schema.
+        try:
+            schema = self._get_fabric_sql_schema()
+            sql = self.sql_writer.generate(
+                user_query=query,
+                evidence_type="generic",
+                sql_schema=schema,
+                entities={"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []},
+                time_window={"horizon_min": 120, "start_utc": None, "end_utc": None},
+                constraints={"dialect": "tsql"},
+            )
+        except Exception as exc:
+            return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
+
+        if sql.strip().startswith("-- NEED_SCHEMA"):
+            return [self._source_error_row("FABRIC_SQL", "sql_schema_missing", sql, {"sql": sql})], []
+
+        logger.info("FABRIC_SQL TDS query: %s", sql[:200])
+
+        try:
+            import pyodbc
+            import struct
+            from azure.identity import DefaultAzureCredential
+
+            credential = DefaultAzureCredential()
+            token = credential.get_token("https://database.windows.net/.default").token
+            encoded = token.encode("UTF-16-LE")
+            token_bytes = struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
+
+            conn_str = (
+                f"Driver={{ODBC Driver 18 for SQL Server}};"
+                f"Server={server},1433;"
+                f"Database={database};"
+                f"Encrypt=yes;"
+                f"TrustServerCertificate=no;"
+                f"Connection Timeout=30;"
+            )
+            conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            conn.close()
+        except Exception as exc:
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", str(exc), {"sql": sql})], []
+
+        if not rows:
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_no_rows", "query returned no rows", {"sql": sql})], []
+
+        citations: List[Citation] = []
+        for idx, row in enumerate(rows[:10], start=1):
+            row_id = row.get("id") or f"fabric_sql_row_{idx}"
+            title = row.get("title") or f"Fabric SQL row {idx}"
+            citations.append(Citation(
+                source_type="FABRIC_SQL",
+                identifier=str(row_id),
+                title=str(title),
+                content_preview=str(row)[:120],
+                score=0.9,
+                dataset="fabric-sql-warehouse",
+            ))
+        return rows, citations
+
     def query_fabric_sql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve data from Fabric SQL warehouse via REST endpoint."""
+        """Retrieve data from Fabric SQL warehouse (TDS preferred, REST fallback)."""
+        # Prefer TDS (pyodbc) path when FABRIC_SQL_SERVER is configured.
+        fabric_sql_server = os.getenv("FABRIC_SQL_SERVER", "").strip()
+        fabric_sql_database = os.getenv("FABRIC_SQL_DATABASE", "").strip() or FABRIC_SQL_DATABASE
+
+        if fabric_sql_server and fabric_sql_database:
+            return self._query_fabric_sql_tds(query, fabric_sql_server, fabric_sql_database)
+
+        # REST fallback (legacy path).
         if not FABRIC_SQL_ENDPOINT:
-            return [self._source_unavailable_row("FABRIC_SQL", "FABRIC_SQL_ENDPOINT not configured")], []
+            return [self._source_unavailable_row("FABRIC_SQL", "FABRIC_SQL not configured (set FABRIC_SQL_SERVER or FABRIC_SQL_ENDPOINT)")], []
 
         # Generate SQL from user query using sql_writer.
         try:

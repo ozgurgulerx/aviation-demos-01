@@ -53,6 +53,9 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"name": "RouteData", "requires_citations": False},
         {"name": "SafetyStats", "requires_citations": False},
         {"name": "AirportData", "requires_citations": False},
+        {"name": "IncidentNarrative", "requires_citations": True},
+        {"name": "RegulatoryDoc", "requires_citations": True},
+        {"name": "DelayAnalytics", "requires_citations": False},
     ],
     "tools": [
         {"name": "GRAPH", "kind": "graph"},
@@ -98,6 +101,17 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"intent": "Airport.Info", "evidence": "AirportData", "optional": False},
         {"intent": "Airport.Info", "evidence": "RunwayConstraints", "optional": True},
         {"intent": "Airport.Info", "evidence": "NOTAM", "optional": True},
+        # IncidentNarrative — for queries needing narrative/similarity/lessons
+        {"intent": "Safety.Trend", "evidence": "IncidentNarrative", "optional": False},
+        {"intent": "Disruption.Explain", "evidence": "IncidentNarrative", "optional": True},
+        {"intent": "PilotBrief.Departure", "evidence": "IncidentNarrative", "optional": True},
+        # RegulatoryDoc — for compliance/regulatory queries
+        {"intent": "Policy.Check", "evidence": "RegulatoryDoc", "optional": False},
+        {"intent": "PilotBrief.Departure", "evidence": "RegulatoryDoc", "optional": True},
+        {"intent": "PilotBrief.Arrival", "evidence": "RegulatoryDoc", "optional": True},
+        # DelayAnalytics — for delay/performance queries
+        {"intent": "Analytics.Compare", "evidence": "DelayAnalytics", "optional": False},
+        {"intent": "Disruption.Explain", "evidence": "DelayAnalytics", "optional": True},
     ],
     "authoritative_in": [
         {"evidence": "METAR", "tool": "KQL", "priority": 1},
@@ -118,6 +132,12 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"evidence": "AirportData", "tool": "SQL", "priority": 1,
          "hint_tables": ["demo.ourairports_airports", "demo.openflights_airports"]},
         {"evidence": "AirportData", "tool": "VECTOR_AIRPORT", "priority": 2},
+        {"evidence": "IncidentNarrative", "tool": "VECTOR_OPS", "priority": 1},
+        {"evidence": "IncidentNarrative", "tool": "SQL", "priority": 2},
+        {"evidence": "RegulatoryDoc", "tool": "VECTOR_REG", "priority": 1},
+        {"evidence": "RegulatoryDoc", "tool": "NOSQL", "priority": 2},
+        {"evidence": "DelayAnalytics", "tool": "FABRIC_SQL", "priority": 1},
+        {"evidence": "DelayAnalytics", "tool": "SQL", "priority": 2},
     ],
     "expansion_rules": [
         {"intent": "PilotBrief.Departure", "tool": "GRAPH", "reason": "airport->runway/navaid/notam/alternate expansion"},
