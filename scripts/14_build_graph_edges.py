@@ -360,13 +360,14 @@ def _gen_ops_edges(cur, schema: str) -> List[EdgeRow]:
         for row in cur.fetchall():
             edges.append(("FlightLeg", row[0], "CREWED_BY", "Crew", row[1]))
 
-    if "ops_mel_techlog_events" in available:
+    if "ops_mel_techlog_events" in available and "ops_flight_legs" in available:
         cur.execute(f"""
             SELECT DISTINCT
-                UPPER(tailnum) AS tail,
-                UPPER(leg_id) AS leg
-            FROM {qident(schema)}.ops_mel_techlog_events
-            WHERE tailnum IS NOT NULL AND leg_id IS NOT NULL
+                UPPER(fl.tailnum) AS tail,
+                UPPER(m.leg_id) AS leg
+            FROM {qident(schema)}.ops_mel_techlog_events m
+            JOIN {qident(schema)}.ops_flight_legs fl ON m.leg_id = fl.leg_id
+            WHERE fl.tailnum IS NOT NULL AND m.leg_id IS NOT NULL
         """)
         for row in cur.fetchall():
             edges.append(("Tail", row[0], "MEL_ON", "FlightLeg", row[1]))
@@ -495,6 +496,7 @@ def main() -> None:
                 edge_stats[e[2]] = edge_stats.get(e[2], 0) + 1
             print(f"  {label}: {len(edges)} edges")
         except Exception as exc:
+            conn.rollback()  # Reset transaction so subsequent queries work
             print(f"  {label}: FAILED — {exc}")
 
     # Deduplicate
