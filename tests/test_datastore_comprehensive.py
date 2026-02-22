@@ -58,6 +58,11 @@ def _build_retriever() -> UnifiedRetriever:
     retriever.sql_writer = _Writer()
     retriever.sql_generator = _Writer()
     retriever.use_legacy_sql_generator = False
+    retriever._cosmos_container = None
+    retriever._embedding_cache = {}
+    retriever._embedding_cache_order = []
+    retriever._embedding_cache_lock = __import__("threading").Lock()
+    retriever._embedding_cache_size = 256
     return retriever
 
 
@@ -288,6 +293,27 @@ class TestSQLValidation(unittest.TestCase):
             "SELECT 1 AS ok FROM asrs_reports LIMIT 1"
         )
         self.assertIsNone(rows[0].get("error_code"))
+
+    def test_allows_trailing_semicolon(self):
+        """A single trailing semicolon is a valid SQL terminator, not injection."""
+        rows, _ = self.retriever.execute_sql_query(
+            "SELECT COUNT(*) AS cnt FROM asrs_reports;"
+        )
+        self.assertIsNone(rows[0].get("error_code"), f"Trailing semicolon should pass: {rows[0]}")
+        self.assertGreater(rows[0]["cnt"], 0)
+
+    def test_allows_trailing_semicolon_with_whitespace(self):
+        rows, _ = self.retriever.execute_sql_query(
+            "SELECT COUNT(*) AS cnt FROM asrs_reports;  \n"
+        )
+        self.assertIsNone(rows[0].get("error_code"), f"Trailing semicolon+whitespace should pass: {rows[0]}")
+
+    def test_rejects_double_semicolon_multi_statement(self):
+        """Two statements separated by semicolon should still be blocked."""
+        rows, _ = self.retriever.execute_sql_query(
+            "SELECT 1 FROM asrs_reports; SELECT 2 FROM asrs_reports"
+        )
+        self.assertEqual(rows[0]["error_code"], "sql_validation_failed")
 
     def test_allows_with_cte(self):
         """CTE queries should pass validation — CTE alias names are excluded

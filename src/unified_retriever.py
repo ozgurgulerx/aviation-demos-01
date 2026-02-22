@@ -770,9 +770,11 @@ class UnifiedRetriever:
                 return {"code": "sql_validation_failed", "detail": f"sql_contains_blocked_operation: {pattern}"}
 
         # Check for semicolons outside of string literals to prevent multi-statement injection.
+        # A single trailing semicolon is a valid SQL terminator, so strip it first.
         stripped = re.sub(r'\$([a-zA-Z_]\w*)?\$.*?\$\1\$', '', sql, flags=re.DOTALL)
         stripped = re.sub(r'"[^"]*"', '', stripped)
         stripped = re.sub(r"'[^']*'", '', stripped)
+        stripped = stripped.rstrip().rstrip(";")
         if ";" in stripped:
             return {"code": "sql_validation_failed", "detail": "sql_multiple_statements_not_allowed"}
 
