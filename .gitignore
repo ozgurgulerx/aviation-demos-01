@@ -37,8 +37,8 @@ npm-debug.log*
 .cache/
 *.cache
 
-# Kubernetes secrets (keep templates, exclude actual secrets)
-k8s/backend-secret.yaml
+# Kubernetes secrets — backend-secret.yaml is a template with ${VAR} placeholders,
+# not real secrets. Real secrets are injected at deploy time via kubectl.
 
 # Temporary files
 /tmp/
