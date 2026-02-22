@@ -151,7 +151,10 @@ class SchemaProvider:
         return {
             "source": "builtin-default",
             "collected_at": self.retriever._now_iso(),
-            "schema_version": "graph-default-v1",
-            "node_types": ["Intent", "EvidenceType", "Tool", "Airport", "Runway", "Station", "Alternate"],
-            "edge_types": ["REQUIRES", "AUTHORITATIVE_IN", "EXPANDS_TO", "HAS_RUNWAY", "HAS_STATION", "HAS_ALTERNATE"],
+            "schema_version": "graph-default-v2",
+            "node_types": ["Airport", "FlightLeg", "Tail", "Intent", "EvidenceType", "Tool"],
+            "edge_types": ["DEPARTS", "ARRIVES", "OPERATES", "REQUIRES", "AUTHORITATIVE_IN", "EXPANDS_TO"],
+            # Aspirational types not yet in data:
+            # node: Runway, Station, Alternate
+            # edge: HAS_RUNWAY, HAS_STATION, HAS_ALTERNATE
         }

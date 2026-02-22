@@ -6,9 +6,12 @@ Evidence verification utilities for safety-oriented agentic RAG.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from contracts.agentic_plan import AgenticPlan
+
+if TYPE_CHECKING:
+    from intent_graph_provider import IntentGraphSnapshot
 
 
 @dataclass
@@ -16,6 +19,7 @@ class EvidenceVerificationResult:
     coverage: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     is_verified: bool = False
+    requery_suggestions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class EvidenceVerifier:
@@ -25,10 +29,16 @@ class EvidenceVerifier:
         source_results: Dict[str, List[Dict[str, Any]]],
         evidence_tool_map: Dict[str, List[str]],
         ask_recommendation: bool = False,
+        intent_graph: Optional["IntentGraphSnapshot"] = None,
     ) -> EvidenceVerificationResult:
         coverage: List[Dict[str, Any]] = []
         warnings: List[str] = []
+        requery_suggestions: List[Dict[str, Any]] = []
         required_ok = True
+
+        tried_tools: set = set()
+        for tools in evidence_tool_map.values():
+            tried_tools.update(tools)
 
         for req in plan.required_evidence:
             tools = evidence_tool_map.get(req.name, [])
@@ -45,6 +55,16 @@ class EvidenceVerifier:
             if not evidence_has_rows and not req.optional:
                 required_ok = False
                 warnings.append(f"Missing required evidence: {req.name}")
+                # Suggest fallback tools from intent graph that weren't already tried.
+                if intent_graph is not None:
+                    fallback_tools = intent_graph.tools_for_evidence(req.name)
+                    for ft in fallback_tools:
+                        if ft not in tried_tools:
+                            requery_suggestions.append({
+                                "evidence": req.name,
+                                "tool": ft,
+                                "reason": f"fallback for missing {req.name}",
+                            })
 
         if ask_recommendation:
             sop_cov = next((c for c in coverage if c.get("evidence") == "SOPClause"), None)
@@ -60,5 +80,5 @@ class EvidenceVerifier:
             coverage=coverage,
             warnings=warnings,
             is_verified=required_ok,
+            requery_suggestions=requery_suggestions,
         )
-

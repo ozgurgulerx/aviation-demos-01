@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 from agentic_orchestrator import AgenticOrchestrator
 from context_reconciler import SOURCE_PRIORITY_DEFAULT, reconcile_context
+from contracts.agentic_plan import ToolCall
 from evidence_verifier import EvidenceVerifier
 from intent_graph_provider import IntentGraphProvider
 from plan_executor import PlanExecutor
@@ -91,6 +92,7 @@ class AviationRagContextProvider:
         self.reconciliation_enabled = _env_bool("CONTEXT_RECONCILIATION_ENABLED", True)
         self.evidence_slotting_enabled = _env_bool("CONTEXT_EVIDENCE_SLOTTING_ENABLED", True)
         self.conflict_detection_enabled = _env_bool("CONTEXT_CONFLICT_DETECTION_ENABLED", True)
+        self._rrf_enabled = _env_bool("CONTEXT_RRF_ENABLED", False)
         self.source_priority = list(SOURCE_PRIORITY_DEFAULT)
         self.per_source_limits = {
             "SQL": _env_int("CONTEXT_LIMIT_SQL", 12),
@@ -170,7 +172,8 @@ class AviationRagContextProvider:
             explain_retrieval=explain_retrieval,
             forced_route=forced_route,
         )
-        retrieval_plan = build_retrieval_plan(plan_request, route, reasoning)
+        router_sources = list((precomputed_route or {}).get("sources", []))
+        retrieval_plan = build_retrieval_plan(plan_request, route, reasoning, router_sources=router_sources)
 
         source_results, source_traces, all_citations, sql_query = self._execute_plan(
             query=query,
@@ -258,7 +261,40 @@ class AviationRagContextProvider:
             source_results=execution.source_results,
             evidence_tool_map=execution.evidence_tool_map,
             ask_recommendation=ask_recommendation,
+            intent_graph=intent_graph,
         )
+        # Re-query loop: if evidence is missing and fallback tools are suggested, try them.
+        if verification.requery_suggestions and not verification.is_verified:
+            requery_calls = []
+            for idx, suggestion in enumerate(verification.requery_suggestions[:3]):
+                requery_calls.append(ToolCall(
+                    id=f"requery_{idx + 1}",
+                    tool=suggestion["tool"],
+                    operation="lookup",
+                    depends_on=[],
+                    query=query,
+                    params={"evidence_type": suggestion["evidence"]},
+                ))
+            if requery_calls:
+                from contracts.agentic_plan import AgenticPlan as _AP  # noqa: local re-import
+                mini_plan = _AP(
+                    entities=plan.entities,
+                    time_window=plan.time_window,
+                    tool_calls=requery_calls,
+                )
+                requery_execution = self.plan_executor.execute(query, mini_plan, schemas)
+                for src, rows in requery_execution.source_results.items():
+                    execution.source_results.setdefault(src, []).extend(rows)
+                execution.citations.extend(requery_execution.citations)
+                execution.source_traces.extend(requery_execution.source_traces)
+                # Re-verify with merged results.
+                verification = self.evidence_verifier.verify(
+                    plan=plan,
+                    source_results=execution.source_results,
+                    evidence_tool_map=execution.evidence_tool_map,
+                    ask_recommendation=ask_recommendation,
+                    intent_graph=intent_graph,
+                )
         required_evidence = [item.to_dict() for item in plan.required_evidence]
         authoritative_map = self._build_authoritative_map(intent_graph.data, required_evidence)
         reconciled = self._apply_reconciliation(
@@ -580,6 +616,7 @@ class AviationRagContextProvider:
             weights=self.fusion_weights,
             enable_evidence_slotting=self.evidence_slotting_enabled,
             enable_conflict_detection=self.conflict_detection_enabled,
+            enable_rrf=self._rrf_enabled,
         )
 
     def _resolve_route(
@@ -651,6 +688,11 @@ class AviationRagContextProvider:
 
         return "\n\n".join(sections)
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate token count using chars // 4 heuristic."""
+        return len(text) // 4 if text else 0
+
     def _compose_agentic_context_text(
         self,
         query: str,
@@ -660,44 +702,112 @@ class AviationRagContextProvider:
         warnings: List[str],
         coverage_summary: Dict[str, Any],
         conflict_summary: Dict[str, Any],
+        max_context_tokens: int = 6000,
     ) -> str:
-        sections: List[str] = [
+        # Build header sections.
+        header_sections: List[str] = [
             f"User query: {query}",
             f"Selected route: AGENTIC ({plan.get('intent', {}).get('name', 'unknown-intent')})",
             f"Required evidence: {', '.join(e.get('name', '') for e in plan.get('required_evidence', []))}",
         ]
         if sql_queries:
-            sections.append("Generated SQL:\n" + "\n\n".join(sql_queries.values()))
-        for source in ("GRAPH", "KQL", "NOSQL", "SQL", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT"):
-            rows = source_results.get(source)
-            if not rows:
-                continue
-            sections.append(f"{source} results:\n{self._format_rows(rows, source)}")
+            header_sections.append("Generated SQL:\n" + "\n\n".join(sql_queries.values()))
+
+        # Build footer sections (coverage, conflicts, warnings).
+        footer_sections: List[str] = []
         if coverage_summary:
-            sections.append(
+            footer_sections.append(
                 "Coverage summary:\n"
                 f"required_filled={coverage_summary.get('required_filled', 0)}/"
                 f"{coverage_summary.get('required_total', 0)}, "
                 f"missing_required={coverage_summary.get('missing_required', [])}"
             )
-        if conflict_summary:
-            sections.append(
-                "Conflict summary:\n"
+        if conflict_summary and conflict_summary.get("count", 0) > 0:
+            conflict_lines = [
                 f"count={conflict_summary.get('count', 0)}, severity={conflict_summary.get('severity', 'none')}"
+            ]
+            for ci in (conflict_summary.get("items") or [])[:5]:
+                conflict_lines.append(
+                    f"- type={ci.get('type')}, signal={ci.get('signal')}, severity={ci.get('severity')}: {ci.get('detail', '')}"
+                )
+            conflict_lines.append(
+                "INSTRUCTION: State the conflict explicitly and indicate which source is more authoritative."
             )
+            footer_sections.append("Conflict summary:\n" + "\n".join(conflict_lines))
         if warnings:
-            sections.append("Warnings:\n" + "\n".join(f"- {w}" for w in warnings))
-        return "\n\n".join(sections)
+            footer_sections.append("Warnings:\n" + "\n".join(f"- {w}" for w in warnings))
 
-    def _format_rows(self, rows: List[Dict[str, Any]], source: str) -> str:
+        header_text = "\n\n".join(header_sections)
+        footer_text = "\n\n".join(footer_sections) if footer_sections else ""
+        header_tokens = self._estimate_tokens(header_text)
+        footer_tokens = max(self._estimate_tokens(footer_text), 300)
+        remaining_tokens = max(0, max_context_tokens - header_tokens - footer_tokens)
+
+        # Iterate ranked sources with token budget.
+        required_evidence_names = [e.get("name", "") for e in plan.get("required_evidence", [])]
+        ranked_sources = self._rank_sources(source_results, required_evidence_names)
+        source_sections: List[str] = []
+        for source in ranked_sources:
+            rows = source_results.get(source)
+            if not rows or remaining_tokens <= 0:
+                continue
+            # Try decreasing row counts to fit within budget.
+            for try_rows in (8, 5, 3, 1):
+                candidate = f"{source} results:\n{self._format_rows(rows, source, max_rows=try_rows)}"
+                candidate_tokens = self._estimate_tokens(candidate)
+                if candidate_tokens <= remaining_tokens:
+                    source_sections.append(candidate)
+                    remaining_tokens -= candidate_tokens
+                    break
+
+        all_sections = header_sections + source_sections + footer_sections
+        return "\n\n".join(all_sections)
+
+    def _format_rows(self, rows: List[Dict[str, Any]], source: str, max_rows: int = 8) -> str:
         lines: List[str] = []
-        for idx, row in enumerate(rows[:8], start=1):
+        for idx, row in enumerate(rows[:max_rows], start=1):
+            # Build metadata prefix from fusion/evidence annotations.
+            meta_parts: List[str] = []
+            fusion = row.get("__fusion_score")
+            if fusion is not None:
+                meta_parts.append(f"relevance={round(float(fusion), 2)}")
+            ev_type = row.get("__evidence_type")
+            if ev_type:
+                meta_parts.append(f"evidence={ev_type}")
+            meta_prefix = f"[{', '.join(meta_parts)}] " if meta_parts else ""
+
             if source.startswith("VECTOR_"):
                 title = row.get("title") or row.get("id") or f"Document {idx}"
                 doc_id = row.get("asrs_report_id") or row.get("id") or ""
                 snippet = str(row.get("content", ""))[:220].replace("\n", " ")
-                lines.append(f"{idx}. {title} ({doc_id})\n   {snippet}")
+                lines.append(f"{idx}. {meta_prefix}{title} ({doc_id})\n   {snippet}")
                 continue
-            compact = ", ".join(f"{k}={v}" for k, v in list(row.items())[:8])
-            lines.append(f"{idx}. {compact}")
+            # Filter out __-prefixed internal keys from compact output.
+            compact = ", ".join(
+                f"{k}={v}" for k, v in list(row.items())[:10]
+                if not str(k).startswith("__")
+            )
+            lines.append(f"{idx}. {meta_prefix}{compact}")
         return "\n".join(lines) if lines else "No rows returned."
+
+    def _rank_sources(
+        self,
+        source_results: Dict[str, List[Dict[str, Any]]],
+        required_evidence_names: List[str],
+    ) -> List[str]:
+        """Order sources by (has_required_evidence, max_fusion_score) descending."""
+        required_set = set(required_evidence_names)
+
+        def _score_key(source: str) -> tuple:
+            rows = source_results.get(source, [])
+            has_required = any(
+                str(r.get("__evidence_type", "")).strip() in required_set
+                for r in rows if isinstance(r, dict)
+            )
+            max_fusion = max(
+                (float(r.get("__fusion_score", 0.0)) for r in rows if isinstance(r, dict)),
+                default=0.0,
+            )
+            return (has_required, max_fusion)
+
+        return sorted(source_results.keys(), key=_score_key, reverse=True)

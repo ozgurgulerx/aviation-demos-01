@@ -36,6 +36,11 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"name": "Disruption.Explain"},
         {"name": "Policy.Check"},
         {"name": "Replay.History"},
+        {"name": "Analytics.Compare"},
+        {"name": "Fleet.Status"},
+        {"name": "RouteNetwork.Query"},
+        {"name": "Safety.Trend"},
+        {"name": "Airport.Info"},
     ],
     "evidence": [
         {"name": "METAR", "requires_citations": False},
@@ -44,6 +49,10 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"name": "RunwayConstraints", "requires_citations": False},
         {"name": "Hazards", "requires_citations": False},
         {"name": "SOPClause", "requires_citations": True},
+        {"name": "FleetData", "requires_citations": False},
+        {"name": "RouteData", "requires_citations": False},
+        {"name": "SafetyStats", "requires_citations": False},
+        {"name": "AirportData", "requires_citations": False},
     ],
     "tools": [
         {"name": "GRAPH", "kind": "graph"},
@@ -72,6 +81,22 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"intent": "Replay.History", "evidence": "METAR", "optional": False},
         {"intent": "Replay.History", "evidence": "Hazards", "optional": False},
         {"intent": "Replay.History", "evidence": "NOTAM", "optional": True},
+        # Analytics.Compare
+        {"intent": "Analytics.Compare", "evidence": "SafetyStats", "optional": False},
+        {"intent": "Analytics.Compare", "evidence": "AirportData", "optional": True},
+        # Fleet.Status
+        {"intent": "Fleet.Status", "evidence": "FleetData", "optional": False},
+        {"intent": "Fleet.Status", "evidence": "SOPClause", "optional": True},
+        # RouteNetwork.Query
+        {"intent": "RouteNetwork.Query", "evidence": "RouteData", "optional": False},
+        {"intent": "RouteNetwork.Query", "evidence": "AirportData", "optional": True},
+        # Safety.Trend
+        {"intent": "Safety.Trend", "evidence": "SafetyStats", "optional": False},
+        {"intent": "Safety.Trend", "evidence": "Hazards", "optional": True},
+        # Airport.Info
+        {"intent": "Airport.Info", "evidence": "AirportData", "optional": False},
+        {"intent": "Airport.Info", "evidence": "RunwayConstraints", "optional": True},
+        {"intent": "Airport.Info", "evidence": "NOTAM", "optional": True},
     ],
     "authoritative_in": [
         {"evidence": "METAR", "tool": "KQL", "priority": 1},
@@ -81,6 +106,13 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"evidence": "RunwayConstraints", "tool": "SQL", "priority": 1},
         {"evidence": "Hazards", "tool": "KQL", "priority": 1},
         {"evidence": "SOPClause", "tool": "VECTOR_REG", "priority": 1},
+        {"evidence": "FleetData", "tool": "SQL", "priority": 1},
+        {"evidence": "RouteData", "tool": "SQL", "priority": 1},
+        {"evidence": "RouteData", "tool": "GRAPH", "priority": 2},
+        {"evidence": "SafetyStats", "tool": "SQL", "priority": 1},
+        {"evidence": "SafetyStats", "tool": "VECTOR_OPS", "priority": 2},
+        {"evidence": "AirportData", "tool": "SQL", "priority": 1},
+        {"evidence": "AirportData", "tool": "VECTOR_AIRPORT", "priority": 2},
     ],
     "expansion_rules": [
         {"intent": "PilotBrief.Departure", "tool": "GRAPH", "reason": "airport->stations/alternates expansion"},
@@ -117,6 +149,11 @@ class IntentGraphSnapshot:
                 }
             )
         return out
+
+    def expansion_rules_for_intent(self, intent_name: str) -> List[Dict[str, Any]]:
+        rules = self.data.get("expansion_rules") or []
+        return [dict(r) for r in rules
+                if isinstance(r, dict) and str(r.get("intent")) == intent_name]
 
     def tools_for_evidence(self, evidence_name: str) -> List[str]:
         rows = self.data.get("authoritative_in") or []

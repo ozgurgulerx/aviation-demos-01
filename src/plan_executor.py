@@ -122,6 +122,8 @@ class PlanExecutor:
                     try:
                         rows, citations, sql_query = future.result()
                         rows = self._annotate_rows(rows, source, call.id, call.operation, call.params, completed_at)
+                        if source == "GRAPH" and call.operation == "entity_expansion":
+                            self._enrich_entities_from_graph(plan, rows)
                         has_row_errors = self._rows_have_errors(rows)
                         columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
                         result.source_results_by_call[call.id] = CallResult(
@@ -208,6 +210,31 @@ class PlanExecutor:
         result.source_results = self._flatten_source_results(result.source_results_by_call, plan.tool_calls)
         result.citations = self._flatten_citations(result.source_results_by_call, plan.tool_calls)
         return result
+
+    _MAX_ENTITIES_PER_KEY = 50
+
+    def _enrich_entities_from_graph(self, plan: AgenticPlan, rows: List[Dict[str, Any]]) -> None:
+        """Parse GRAPH result rows and propagate discovered entities into plan.entities."""
+        node_type_map = {
+            "Airport": "airports",
+            "FlightLeg": "flight_ids",
+            "Tail": "flight_ids",
+        }
+        for row in rows:
+            if not isinstance(row, dict) or row.get("error") or row.get("error_code"):
+                continue
+            for prefix in ("src", "dst"):
+                ntype = str(row.get(f"{prefix}_type", "")).strip()
+                nid = str(row.get(f"{prefix}_id", "")).strip()
+                entity_key = node_type_map.get(ntype)
+                if not entity_key or not nid:
+                    continue
+                existing = plan.entities.get(entity_key)
+                if not isinstance(existing, list):
+                    existing = []
+                    plan.entities[entity_key] = existing
+                if nid not in existing and len(existing) < self._MAX_ENTITIES_PER_KEY:
+                    existing.append(nid)
 
     def _run_call(
         self,

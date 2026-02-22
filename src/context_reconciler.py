@@ -166,6 +166,30 @@ def compute_fusion_score(items: List[Dict[str, Any]], weights: Optional[Dict[str
         item["fusion_score"] = max(0.0, min(1.0, score))
 
 
+def compute_rrf_scores(items: List[Dict[str, Any]], k: int = 60) -> None:
+    """Reciprocal Rank Fusion: rank items within each source and compute RRF score."""
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        by_source.setdefault(str(item.get("source", "")), []).append(item)
+
+    for source_items in by_source.values():
+        source_items.sort(key=lambda it: -_as_float(it.get("raw_relevance", 0.0)))
+        for rank, item in enumerate(source_items):
+            item.setdefault("_rrf_contributions", [])
+            item["_rrf_contributions"].append(1.0 / (k + rank))
+
+    for item in items:
+        contributions = item.pop("_rrf_contributions", [])
+        rrf_raw = sum(contributions)
+        item["rrf_score_raw"] = rrf_raw
+
+    # Normalize to [0, 1].
+    max_rrf = max((_as_float(it.get("rrf_score_raw", 0.0)) for it in items), default=0.0)
+    for item in items:
+        raw = _as_float(item.get("rrf_score_raw", 0.0))
+        item["rrf_score"] = (raw / max_rrf) if max_rrf > 1e-9 else 0.0
+
+
 def dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen: set[Tuple[str, str, str]] = set()
@@ -329,6 +353,7 @@ def reconcile_context(
     weights: Optional[Dict[str, float]] = None,
     enable_evidence_slotting: bool = True,
     enable_conflict_detection: bool = True,
+    enable_rrf: bool = False,
 ) -> Dict[str, Any]:
     required = list(required_evidence or [])
     authoritative = dict(authoritative_map or {})
@@ -363,6 +388,13 @@ def reconcile_context(
 
     normalize_scores(items)
     compute_fusion_score(items, weights=weights)
+
+    if enable_rrf and len(items) > 1:
+        compute_rrf_scores(items)
+        for item in items:
+            fusion = _as_float(item.get("fusion_score", 0.0))
+            rrf = _as_float(item.get("rrf_score", 0.0))
+            item["fusion_score"] = max(0.0, min(1.0, 0.5 * fusion + 0.5 * rrf))
 
     items.sort(
         key=lambda it: (
@@ -411,6 +443,55 @@ def reconcile_context(
     conflict_summary = {"count": 0, "items": [], "severity": "none"}
     if enable_conflict_detection:
         conflict_summary = detect_conflicts(selected)
+        # Apply conflict penalty to items involved in detected conflicts.
+        if conflict_summary.get("count", 0) > 0:
+            conflict_signals = set()
+            for c in conflict_summary.get("items", []):
+                signal = str(c.get("signal", "")).strip().lower()
+                if signal:
+                    conflict_signals.add(signal)
+            if conflict_signals:
+                for item in selected:
+                    row = item.get("row", {}) or {}
+                    metric = str(row.get("metric", "")).strip().lower()
+                    entity = str(row.get("id") or row.get("facilityDesignator") or row.get("asrs_report_id") or "").strip().lower()
+                    if metric in conflict_signals or entity in conflict_signals:
+                        item["conflict_penalty"] = 0.5
+                        # Recompute fusion score with penalty.
+                        w = dict(DEFAULT_FUSION_WEIGHTS)
+                        required_bonus = 1.0 if item.get("required_evidence") else 0.0
+                        score = (
+                            w["relevance"] * _as_float(item.get("normalized_relevance", 0.0))
+                            + w["authority"] * _as_float(item.get("authority_score", 0.0))
+                            + w["freshness"] * _as_float(item.get("freshness_score", 0.0))
+                            + w["required_bonus"] * required_bonus
+                            - w["conflict_penalty"] * 0.5
+                        )
+                        item["fusion_score"] = max(0.0, min(1.0, score))
+                # Re-sort after penalty application.
+                selected.sort(
+                    key=lambda it: (
+                        priority_rank.get(str(it.get("source", "")), 999),
+                        -_as_float(it.get("fusion_score", 0.0)),
+                        str(it.get("identifier", "")),
+                        _as_float(it.get("row_index", 0.0)),
+                    )
+                )
+                # Update ordered_source_results with adjusted scores.
+                ordered_source_results.clear()
+                for source in sorted(source_results.keys(), key=lambda s: priority_rank.get(s, 999)):
+                    source_items = [it for it in selected if it.get("source") == source]
+                    source_items.sort(key=lambda it: -_as_float(it.get("fusion_score", 0.0)))
+                    ordered_rows_updated: List[Dict[str, Any]] = []
+                    for it in source_items:
+                        row_copy = dict(it.get("row", {}))
+                        row_copy["__fusion_score"] = round(_as_float(it.get("fusion_score", 0.0)), 6)
+                        row_copy["__normalized_relevance"] = round(_as_float(it.get("normalized_relevance", 0.0)), 6)
+                        row_copy["__authority_score"] = round(_as_float(it.get("authority_score", 0.0)), 6)
+                        row_copy["__freshness_score"] = round(_as_float(it.get("freshness_score", 0.0)), 6)
+                        ordered_rows_updated.append(row_copy)
+                    if ordered_rows_updated:
+                        ordered_source_results[source] = ordered_rows_updated
 
     reconciled_items = [
         {

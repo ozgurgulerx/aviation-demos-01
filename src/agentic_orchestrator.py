@@ -154,18 +154,22 @@ class AgenticOrchestrator:
         call_idx = 1
         inferred_entities = self._extract_entities_from_query(query)
 
-        # Graph expansion first for pilot brief intents.
-        if intent_name.startswith("PilotBrief"):
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{call_idx}",
-                    tool="GRAPH",
-                    operation="entity_expansion",
-                    depends_on=[],
-                    params={"hops": 2},
+        # Graph expansion driven by intent graph expansion_rules.
+        expansion_rules = intent_graph.expansion_rules_for_intent(intent_name)
+        if expansion_rules:
+            rule = expansion_rules[0]
+            tool_name = self._canonical_tool_name(str(rule.get("tool", "")))
+            if tool_name:
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{call_idx}",
+                        tool=tool_name,
+                        operation="entity_expansion",
+                        depends_on=[],
+                        params={"hops": 2, "expansion_reason": rule.get("reason", "")},
+                    )
                 )
-            )
-            call_idx += 1
+                call_idx += 1
 
         evidence_tool_map: Dict[str, List[str]] = {}
         for req in required_evidence:
@@ -372,6 +376,16 @@ class AgenticOrchestrator:
             return "Disruption.Explain"
         if any(t in q for t in ("replay", "history", "last week", "yesterday")):
             return "Replay.History"
+        if any(t in q for t in ("compare", "versus", "ranking", "benchmark")):
+            return "Analytics.Compare"
+        if any(t in q for t in ("fleet", "aircraft count", "fleet size")):
+            return "Fleet.Status"
+        if any(t in q for t in ("route", "connection", "destination", "network")):
+            return "RouteNetwork.Query"
+        if any(t in q for t in ("trend", "incident rate", "safety record", "accident")):
+            return "Safety.Trend"
+        if any(t in q for t in ("airport info", "runway", "elevation", "frequency", "icao")):
+            return "Airport.Info"
         return "PilotBrief.Departure"
 
     def _enforce_required_sources(self, plan: AgenticPlan, required_sources: List[str]) -> AgenticPlan:

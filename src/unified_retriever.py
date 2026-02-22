@@ -21,6 +21,12 @@ from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 
+try:
+    from azure.cosmos import CosmosClient, exceptions as cosmos_exceptions
+    _COSMOS_SDK_AVAILABLE = True
+except ImportError:
+    _COSMOS_SDK_AVAILABLE = False
+
 from azure_openai_client import get_shared_client
 from query_router import QueryRouter
 from query_writers import SQLWriter
@@ -46,10 +52,17 @@ except Exception:
     _RERANK_RAW_CANDIDATES = 20
 _RERANK_ENABLED = os.getenv("CONTEXT_RERANK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+_SEMANTIC_MIN_SCORE = float(os.getenv("SEMANTIC_MIN_SCORE_THRESHOLD", "0.0"))
+
 FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
+
+AZURE_COSMOS_ENDPOINT = os.getenv("AZURE_COSMOS_ENDPOINT", "").strip()
+AZURE_COSMOS_KEY = os.getenv("AZURE_COSMOS_KEY", "").strip()
+AZURE_COSMOS_DATABASE = os.getenv("AZURE_COSMOS_DATABASE", "aviationrag").strip()
+AZURE_COSMOS_CONTAINER = os.getenv("AZURE_COSMOS_CONTAINER", "notams").strip()
 
 
 def _get_fabric_bearer_token() -> str:
@@ -224,6 +237,12 @@ class UnifiedRetriever:
         self._schema_cache_expires_at: float = 0.0
         self._schema_cache_ttl: float = float(os.getenv("SQL_SCHEMA_CACHE_TTL_SECONDS", "300"))
 
+        # Embedding cache (LRU)
+        self._embedding_cache_size = int(os.getenv("EMBEDDING_CACHE_SIZE", "256"))
+        self._embedding_cache: Dict[str, List[float]] = {}
+        self._embedding_cache_order: List[str] = []
+        self._embedding_cache_lock = threading.Lock()
+
         # PII filter
         self.enable_pii_filter = enable_pii_filter
         if enable_pii_filter:
@@ -235,6 +254,45 @@ class UnifiedRetriever:
         else:
             self.pii_filter = None
             logger.warning("PII filter disabled")
+
+        # Cosmos DB client for NOSQL (NOTAM) retrieval
+        self._cosmos_container = None
+        if _COSMOS_SDK_AVAILABLE and AZURE_COSMOS_ENDPOINT:
+            try:
+                if AZURE_COSMOS_KEY:
+                    cosmos_client = CosmosClient(AZURE_COSMOS_ENDPOINT, credential=AZURE_COSMOS_KEY)
+                else:
+                    from azure.identity import DefaultAzureCredential
+                    cosmos_client = CosmosClient(AZURE_COSMOS_ENDPOINT, credential=DefaultAzureCredential())
+                cosmos_db = cosmos_client.get_database_client(AZURE_COSMOS_DATABASE)
+                self._cosmos_container = cosmos_db.get_container_client(AZURE_COSMOS_CONTAINER)
+                logger.info(
+                    "Connected to Cosmos DB: %s/%s/%s",
+                    AZURE_COSMOS_ENDPOINT, AZURE_COSMOS_DATABASE, AZURE_COSMOS_CONTAINER,
+                )
+            except Exception as exc:
+                self._cosmos_container = None
+                logger.warning("Cosmos DB unavailable (%s)", exc)
+        elif not _COSMOS_SDK_AVAILABLE and AZURE_COSMOS_ENDPOINT:
+            logger.warning("azure-cosmos SDK not installed; Cosmos NOSQL retrieval unavailable")
+
+    @staticmethod
+    def _filter_error_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove error/error_code rows from result lists before synthesis."""
+        return [row for row in rows if isinstance(row, dict) and not row.get("error") and not row.get("error_code")]
+
+    def _format_schema_for_legacy_generator(self, schema: Dict[str, Any]) -> str:
+        """Format live SQL schema for injection into legacy SQLGenerator context."""
+        lines: List[str] = []
+        for table_entry in schema.get("tables", []):
+            if not isinstance(table_entry, dict):
+                continue
+            table_name = table_entry.get("table", "")
+            schema_name = table_entry.get("schema", "")
+            columns = [str(col.get("name", "")) for col in (table_entry.get("columns") or []) if isinstance(col, dict)]
+            qualified = f"{schema_name}.{table_name}" if schema_name else table_name
+            lines.append(f"{qualified}: {', '.join(columns)}")
+        return "\n".join(lines)
 
     def _detect_vector_k_param(self) -> str:
         """Handle azure-search-documents SDK drift (k vs k_nearest_neighbors)."""
@@ -251,14 +309,32 @@ class UnifiedRetriever:
         return "k_nearest_neighbors"
 
     def get_embedding(self, text: str) -> List[float]:
-        """Get embedding from Azure OpenAI."""
+        """Get embedding from Azure OpenAI with LRU cache."""
+        normalized = text.strip()[:8000]
+        with self._embedding_cache_lock:
+            if normalized in self._embedding_cache:
+                self._embedding_cache_order.remove(normalized)
+                self._embedding_cache_order.append(normalized)
+                logger.info("perf stage=%s cache=hit", "get_embedding")
+                return self._embedding_cache[normalized]
+
         _t0 = time.perf_counter()
         response = self.llm.embeddings.create(
             model=self.embedding_deployment,
-            input=text[:8000]
+            input=normalized,
         )
-        logger.info("perf stage=%s ms=%.1f", "get_embedding", (time.perf_counter() - _t0) * 1000)
-        return response.data[0].embedding
+        result = response.data[0].embedding
+        elapsed = (time.perf_counter() - _t0) * 1000
+
+        with self._embedding_cache_lock:
+            self._embedding_cache[normalized] = result
+            self._embedding_cache_order.append(normalized)
+            while len(self._embedding_cache_order) > self._embedding_cache_size:
+                evicted = self._embedding_cache_order.pop(0)
+                self._embedding_cache.pop(evicted, None)
+
+        logger.info("perf stage=%s cache=miss ms=%.1f", "get_embedding", elapsed)
+        return result
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -384,6 +460,8 @@ class UnifiedRetriever:
                 return "live"
             return "fallback" if self.sql_available else "blocked"
         if source_norm == "NOSQL":
+            if self._cosmos_container is not None:
+                return "live"
             return "live" if FABRIC_NOSQL_ENDPOINT else "blocked"
         if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
             return "live" if self.search_clients else "blocked"
@@ -394,7 +472,7 @@ class UnifiedRetriever:
         store_type_map = {
             "KQL": "fabric-eventhouse",
             "GRAPH": "fabric-graph",
-            "NOSQL": "fabric-nosql",
+            "NOSQL": "cosmos-nosql" if self._cosmos_container is not None else "fabric-nosql",
             "SQL": "warehouse-sql",
             "VECTOR_OPS": "vector-ops",
             "VECTOR_REG": "vector-regulatory",
@@ -481,6 +559,24 @@ class UnifiedRetriever:
                     "endpoint": endpoint if endpoint else "",
                 }
             )
+
+        # Cosmos DB health check
+        if self._cosmos_container is not None:
+            live_configured = True
+            try:
+                self._cosmos_container.read()
+                cosmos_status = "pass"
+                cosmos_detail = "cosmos_container_reachable"
+            except Exception as exc:
+                cosmos_status = "fail"
+                cosmos_detail = f"cosmos_probe_failed: {exc}"
+            checks.append({
+                "name": "cosmos_nosql",
+                "status": cosmos_status,
+                "detail": cosmos_detail,
+                "mode": "live",
+                "endpoint": AZURE_COSMOS_ENDPOINT,
+            })
 
         sql_mode = self.source_mode("SQL")
         checks.append(
@@ -845,7 +941,12 @@ class UnifiedRetriever:
                 )
         except Exception as exc:
             try:
-                sql = self.sql_generator.generate(enhanced_query)
+                schema = self.cached_sql_schema()
+                if schema.get("tables"):
+                    schema_text = self._format_schema_for_legacy_generator(schema)
+                    sql = self.sql_generator.generate_with_context(enhanced_query, context=schema_text)
+                else:
+                    sql = self.sql_generator.generate(enhanced_query)
             except Exception as fallback_exc:
                 row = self._source_error_row(
                     "SQL",
@@ -990,6 +1091,12 @@ class UnifiedRetriever:
 
         results_list.sort(key=lambda row: float(row.get("__vector_score_final", 0.0) or 0.0), reverse=True)
         citations.sort(key=lambda c: c.score, reverse=True)
+
+        # Relevance filtering (1.2): drop low-score results when threshold is configured.
+        if _SEMANTIC_MIN_SCORE > 0:
+            results_list = [r for r in results_list if float(r.get("__vector_score_final", 0)) >= _SEMANTIC_MIN_SCORE]
+            citations = [c for c in citations if c.score >= _SEMANTIC_MIN_SCORE]
+
         logger.info("perf stage=%s source=%s ms=%.1f", "query_semantic", source, (time.perf_counter() - _t0_sem) * 1000)
         return results_list[:top], citations[:top]
 
@@ -1171,8 +1278,8 @@ class UnifiedRetriever:
             detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
             return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
 
-    def _query_graph_pg_fallback(self, query: str) -> Tuple[List[Dict], List[Citation]]:
-        """Fallback: query ops_graph_edges from PostgreSQL when Fabric endpoint is unavailable."""
+    def _query_graph_pg_fallback(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
+        """Fallback: query ops_graph_edges from PostgreSQL with iterative BFS multi-hop traversal."""
         if not self.sql_available:
             return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable")], []
 
@@ -1183,36 +1290,65 @@ class UnifiedRetriever:
             return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL")], []
 
         tokens = self._query_tokens(query)
-        if tokens:
-            placeholders = ", ".join(f"'{t}'" for t in tokens)
+        if not tokens:
+            sql = "SELECT src_type, src_id, edge_type, dst_type, dst_id FROM ops_graph_edges LIMIT 30"
+            rows, citations = self.execute_sql_query(sql)
+            if rows and not rows[0].get("error_code"):
+                return rows, [Citation(source_type="GRAPH", identifier="graph_pg_fallback", title="Graph edges (PostgreSQL fallback)", content_preview=str(rows)[:120], score=0.8, dataset="ops_graph_edges")]
+            return rows, citations
+
+        # Iterative BFS: start from seed tokens, expand up to `hops` iterations.
+        max_hops = min(hops, 4)
+        frontier: set = set(tokens)
+        visited_ids: set = set()
+        seen_edges: set = set()
+        all_rows: List[Dict] = []
+        max_total_rows = 200
+
+        for _hop in range(max_hops):
+            if not frontier or len(all_rows) >= max_total_rows:
+                break
+            search_ids = sorted(frontier - visited_ids)
+            if not search_ids:
+                break
+            visited_ids.update(search_ids)
+            # Sanitize tokens (defense-in-depth: _query_tokens already limits to alnum).
+            safe_ids = [t.replace("'", "''") for t in search_ids]
+            placeholders = ", ".join(f"'{t}'" for t in safe_ids)
             sql = (
                 f"SELECT src_type, src_id, edge_type, dst_type, dst_id "
                 f"FROM ops_graph_edges "
                 f"WHERE UPPER(src_id) IN ({placeholders}) OR UPPER(dst_id) IN ({placeholders}) "
                 f"LIMIT 50"
             )
-        else:
-            sql = "SELECT src_type, src_id, edge_type, dst_type, dst_id FROM ops_graph_edges LIMIT 30"
+            rows, _ = self.execute_sql_query(sql)
+            next_frontier: set = set()
+            for row in rows:
+                if not isinstance(row, dict) or row.get("error_code"):
+                    continue
+                edge_key = (str(row.get("src_type", "")), str(row.get("src_id", "")), str(row.get("edge_type", "")), str(row.get("dst_type", "")), str(row.get("dst_id", "")))
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                all_rows.append(row)
+                if len(all_rows) >= max_total_rows:
+                    break
+                src_id = str(row.get("src_id", "")).upper()
+                dst_id = str(row.get("dst_id", "")).upper()
+                if src_id and src_id not in visited_ids:
+                    next_frontier.add(src_id)
+                if dst_id and dst_id not in visited_ids:
+                    next_frontier.add(dst_id)
+            frontier = next_frontier
 
-        rows, citations = self.execute_sql_query(sql)
-        if rows and not rows[0].get("error_code"):
-            graph_citations = [
-                Citation(
-                    source_type="GRAPH",
-                    identifier="graph_pg_fallback",
-                    title="Graph edges (PostgreSQL fallback)",
-                    content_preview=str(rows)[:120],
-                    score=0.8,
-                    dataset="ops_graph_edges",
-                )
-            ]
-            return rows, graph_citations
-        return rows, citations
+        if all_rows:
+            return all_rows, [Citation(source_type="GRAPH", identifier="graph_pg_fallback", title="Graph edges (PostgreSQL fallback)", content_preview=str(all_rows)[:120], score=0.8, dataset="ops_graph_edges")]
+        return [self._source_error_row("GRAPH", "graph_runtime_error", "bfs_returned_no_rows")], []
 
     def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve graph relationships from Fabric graph endpoint, with PostgreSQL fallback."""
         if not FABRIC_GRAPH_ENDPOINT:
-            return self._query_graph_pg_fallback(query)
+            return self._query_graph_pg_fallback(query, hops=hops)
 
         if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
             tokens = self._query_tokens(query)
@@ -1252,10 +1388,65 @@ class UnifiedRetriever:
             detail = str(response.get("error")) if isinstance(response, dict) else "graph_endpoint_query_failed"
             return [self._source_error_row("GRAPH", "graph_runtime_error", detail)], []
 
+    def _query_cosmos_notams(self, query: str) -> Tuple[List[Dict], List[Citation]]:
+        """Query NOTAM documents from Cosmos DB for NoSQL."""
+        airports = self._extract_airports_from_query(query)
+        try:
+            if airports:
+                placeholders = ", ".join(f"@icao{i}" for i in range(len(airports)))
+                cosmos_sql = (
+                    f"SELECT * FROM c WHERE c.icao IN ({placeholders})"
+                    " AND c.status = 'active'"
+                    " ORDER BY c.effective_from DESC"
+                )
+                parameters = [{"name": f"@icao{i}", "value": code} for i, code in enumerate(airports)]
+                items = list(self._cosmos_container.query_items(
+                    query=cosmos_sql,
+                    parameters=parameters,
+                    enable_cross_partition_query=True,
+                    max_item_count=30,
+                ))
+            else:
+                cosmos_sql = (
+                    "SELECT * FROM c WHERE c.status = 'active'"
+                    " ORDER BY c.effective_from DESC"
+                    " OFFSET 0 LIMIT 30"
+                )
+                items = list(self._cosmos_container.query_items(
+                    query=cosmos_sql,
+                    enable_cross_partition_query=True,
+                    max_item_count=30,
+                ))
+        except Exception as exc:
+            return [self._source_error_row("NOSQL", "cosmos_runtime_error", str(exc))], []
+
+        if not items:
+            return [self._source_error_row("NOSQL", "nosql_runtime_error", "cosmos_query_returned_no_docs")], []
+
+        citations: List[Citation] = []
+        for idx, doc in enumerate(items[:10], start=1):
+            notam_num = doc.get("notam_number") or doc.get("id") or f"notam_{idx}"
+            icao = doc.get("icao", "")
+            title = f"NOTAM {notam_num}" + (f" ({icao})" if icao else "")
+            citations.append(Citation(
+                source_type="NOSQL",
+                identifier=str(doc.get("id", notam_num)),
+                title=title,
+                content_preview=str(doc.get("content", ""))[:120],
+                score=1.0,
+                dataset="cosmos-notams",
+            ))
+        return items, citations
+
     def query_nosql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve NoSQL-style records from live endpoint."""
+        """Retrieve NoSQL-style records — Cosmos DB first, then Fabric REST fallback."""
+        # Path 1: Cosmos DB native SDK
+        if self._cosmos_container is not None:
+            return self._query_cosmos_notams(query)
+
+        # Path 2: Fabric REST / Kusto endpoint (backward compat)
         if not FABRIC_NOSQL_ENDPOINT:
-            return [self._source_unavailable_row("NOSQL", "FABRIC_NOSQL_ENDPOINT not configured")], []
+            return [self._source_unavailable_row("NOSQL", "NOSQL source not configured (no Cosmos DB or FABRIC_NOSQL_ENDPOINT)")], []
 
         if self._is_kusto_endpoint(FABRIC_NOSQL_ENDPOINT):
             docs, _error = self._kusto_rows(FABRIC_NOSQL_ENDPOINT, "hazards_airsigmets | take 30")
@@ -1309,8 +1500,14 @@ class UnifiedRetriever:
         )
 
     def execute_semantic_route(self, query: str) -> RetrievalResult:
-        """Execute semantic-only retrieval."""
-        results, citations = self.query_semantic(query)
+        """Execute semantic-only retrieval (multi-index)."""
+        multi_sources = _env_csv("SEMANTIC_ROUTE_INDEXES", "VECTOR_OPS,VECTOR_REG")
+        valid = [s.upper() for s in multi_sources if s.upper() in self.vector_source_to_index]
+        if not valid:
+            valid = ["VECTOR_OPS"]
+        results, citations = self.query_semantic_multi(
+            query, sources=valid, top_per_source=max(1, 5 // len(valid))
+        )
 
         context = {"semantic_results": [
             {k: v for k, v in r.items() if k != "content_vector"}
@@ -1477,10 +1674,17 @@ Guidelines:
 - Be concise but informative
 - Format numbers nicely
 - If showing multiple items, use a clear list or table format
-- Reference the data sources when relevant
+- Reference data sources using [N] citation markers for key claims
+- Do not make claims unsupported by the retrieved context
 - If the context is insufficient, say so clearly"""
 
-    def _synthesize_answer(self, query: str, context: dict, route: str) -> str:
+    def _synthesize_answer(
+        self,
+        query: str,
+        context: dict,
+        route: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
         """Generate natural language answer from retrieved context."""
         _t0_synth = time.perf_counter()
 
@@ -1491,13 +1695,17 @@ Retrieved Data:
 {context}
 """
 
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": self._synthesis_system_prompt(route)},
+        ]
+        if conversation_history:
+            messages.extend(conversation_history)
+        messages.append({"role": "user", "content": context_str})
+
         try:
             response = self.llm.chat.completions.create(
                 model=self.llm_deployment,
-                messages=[
-                    {"role": "system", "content": self._synthesis_system_prompt(route)},
-                    {"role": "user", "content": context_str}
-                ]
+                messages=messages,
             )
             logger.info("perf stage=%s ms=%.1f", "synthesize_answer", (time.perf_counter() - _t0_synth) * 1000)
             return response.choices[0].message.content
@@ -1506,7 +1714,11 @@ Retrieved Data:
             return "I'm unable to generate a response right now due to a temporary service issue. Please try again shortly."
 
     def _synthesize_answer_stream(
-        self, query: str, context: dict, route: str
+        self,
+        query: str,
+        context: dict,
+        route: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Stream synthesis tokens as agent_update events (true streaming)."""
         _t0_synth = time.perf_counter()
@@ -1518,13 +1730,17 @@ Retrieved Data:
 {context}
 """
 
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": self._synthesis_system_prompt(route)},
+        ]
+        if conversation_history:
+            messages.extend(conversation_history)
+        messages.append({"role": "user", "content": context_str})
+
         try:
             stream = self.llm.chat.completions.create(
                 model=self.llm_deployment,
-                messages=[
-                    {"role": "system", "content": self._synthesis_system_prompt(route)},
-                    {"role": "user", "content": context_str},
-                ],
+                messages=messages,
                 stream=True,
             )
             for chunk in stream:
@@ -1533,8 +1749,96 @@ Retrieved Data:
             logger.info("perf stage=%s ms=%.1f", "synthesize_answer_stream", (time.perf_counter() - _t0_synth) * 1000)
         except Exception as exc:
             logger.error("LLM streaming synthesis failed: %s — falling back to non-streaming", exc)
-            answer = self._synthesize_answer(query, context, route)
+            answer = self._synthesize_answer(query, context, route, conversation_history=conversation_history)
             yield {"type": "agent_update", "content": answer}
+
+
+# =============================================================================
+# Context Window Management (3.1)
+# =============================================================================
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token count: ~4 chars per token."""
+    return len(text) // 4
+
+
+def _truncate_context_to_budget(context_dict: Dict[str, Any], budget: int) -> Dict[str, Any]:
+    """Truncate synthesis context to stay within a token budget.
+
+    Always includes small summary keys.  Iterates source keys in priority order
+    and includes items until the budget is exhausted.
+    """
+    if budget <= 0:
+        return context_dict
+
+    # Always-include keys (small metadata).
+    always_include = {"coverage_summary", "conflict_summary"}
+    result: Dict[str, Any] = {}
+    running = 0
+    for key in always_include:
+        if key in context_dict:
+            val = str(context_dict[key])
+            running += _estimate_tokens(val)
+            result[key] = context_dict[key]
+
+    # Priority order for source data.
+    priority_keys = [
+        "reconciled_items", "sql_results", "kql_results",
+        "graph_results", "nosql_results", "vector_results",
+    ]
+    for key in priority_keys:
+        if key not in context_dict:
+            continue
+        items = context_dict[key]
+        if not isinstance(items, list):
+            result[key] = items
+            running += _estimate_tokens(str(items))
+            continue
+
+        # Sort by fusion score if available.
+        sorted_items = sorted(
+            items,
+            key=lambda r: float(r.get("__fusion_score", 0)) if isinstance(r, dict) else 0,
+            reverse=True,
+        )
+        kept: List[Any] = []
+        for item in sorted_items:
+            cost = _estimate_tokens(str(item))
+            if running + cost > budget and kept:
+                break
+            kept.append(item)
+            running += cost
+        result[key] = kept
+
+    # Carry over any remaining keys not in the priority list.
+    for key in context_dict:
+        if key not in result:
+            result[key] = context_dict[key]
+
+    return result
+
+
+# =============================================================================
+# Answer Grounding Check (3.3)
+# =============================================================================
+
+def _check_answer_grounding(answer: str, citation_count: int) -> Dict[str, Any]:
+    """Check whether the synthesized answer references valid citations."""
+    markers = set(int(m) for m in re.findall(r'\[(\d+)\]', answer))
+    valid = {m for m in markers if 1 <= m <= citation_count}
+    invalid = markers - valid
+    if valid and not invalid:
+        status = "grounded"
+    elif valid:
+        status = "partially_grounded"
+    else:
+        status = "ungrounded"
+    return {
+        "has_citations": len(valid) > 0,
+        "citation_markers": sorted(valid),
+        "invalid_markers": sorted(invalid),
+        "grounding_status": status,
+    }
 
 
 # =============================================================================
