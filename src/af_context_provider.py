@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,10 @@ from plan_executor import PlanExecutor
 from retrieval_plan import RetrievalRequest, RetrievalPlan, SourcePlan, build_retrieval_plan
 from schema_provider import SchemaProvider
 from unified_retriever import Citation, UnifiedRetriever
+from opentelemetry import trace as _otel_trace
 from shared_utils import utc_now as _utc_now, env_bool as _env_bool, env_int as _env_int
+
+_cp_tracer = _otel_trace.get_tracer("aviation-rag-backend", "0.1.0")
 
 
 @dataclass
@@ -117,6 +121,36 @@ class AviationRagContextProvider:
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
         precomputed_route: Optional[Dict[str, Any]] = None,
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> AviationRagContext:
+        with _cp_tracer.start_as_current_span("context.build", attributes={"query.length": len(query), "retrieval_mode": retrieval_mode}):
+            return self._build_context_inner(
+                query=query,
+                retrieval_mode=retrieval_mode,
+                forced_route=forced_route,
+                query_profile=query_profile,
+                required_sources=required_sources,
+                freshness_sla_minutes=freshness_sla_minutes,
+                explain_retrieval=explain_retrieval,
+                risk_mode=risk_mode,
+                ask_recommendation=ask_recommendation,
+                precomputed_route=precomputed_route,
+                on_trace=on_trace,
+            )
+
+    def _build_context_inner(
+        self,
+        query: str,
+        retrieval_mode: str = "code-rag",
+        forced_route: Optional[str] = None,
+        query_profile: str = "pilot-brief",
+        required_sources: Optional[List[str]] = None,
+        freshness_sla_minutes: Optional[int] = None,
+        explain_retrieval: bool = False,
+        risk_mode: str = "standard",
+        ask_recommendation: bool = False,
+        precomputed_route: Optional[Dict[str, Any]] = None,
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AviationRagContext:
         if retrieval_mode == "code-rag" and self._agentic_enabled and self.orchestrator is not None:
             try:
@@ -128,6 +162,7 @@ class AviationRagContextProvider:
                     explain_retrieval=explain_retrieval,
                     risk_mode=risk_mode,
                     ask_recommendation=ask_recommendation,
+                    on_trace=on_trace,
                 )
             except Exception as exc:
                 logger.warning("Agentic orchestration failed, falling back to legacy planner", exc_info=True)
@@ -145,6 +180,7 @@ class AviationRagContextProvider:
             explain_retrieval=explain_retrieval,
             additional_reasoning=fallback_note,
             precomputed_route=precomputed_route,
+            on_trace=on_trace,
         )
 
     def _build_legacy_context(
@@ -158,6 +194,7 @@ class AviationRagContextProvider:
         explain_retrieval: bool,
         additional_reasoning: str,
         precomputed_route: Optional[Dict[str, Any]] = None,
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AviationRagContext:
         route, reasoning, sql_hint = self._resolve_route(
             query, retrieval_mode, forced_route, precomputed_route=precomputed_route
@@ -179,6 +216,7 @@ class AviationRagContextProvider:
             query=query,
             plan=retrieval_plan,
             sql_hint=sql_hint,
+            on_trace=on_trace,
         )
 
         reconciled = self._apply_reconciliation(source_results)
@@ -228,6 +266,7 @@ class AviationRagContextProvider:
         explain_retrieval: bool,
         risk_mode: str,
         ask_recommendation: bool,
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AviationRagContext:
         intent_graph = self.intent_graph_provider.load()
         schemas = self.schema_provider.snapshot()
@@ -255,7 +294,7 @@ class AviationRagContextProvider:
             schemas=schemas,
             required_sources=required_sources,
         )
-        execution = self.plan_executor.execute(query, plan, schemas)
+        execution = self.plan_executor.execute(query, plan, schemas, on_trace=on_trace)
         verification = self.evidence_verifier.verify(
             plan=plan,
             source_results=execution.source_results,
@@ -267,13 +306,19 @@ class AviationRagContextProvider:
         if verification.requery_suggestions and not verification.is_verified:
             requery_calls = []
             for idx, suggestion in enumerate(verification.requery_suggestions[:3]):
+                requery_params: Dict[str, Any] = {"evidence_type": suggestion["evidence"]}
+                hint_tables = intent_graph.hint_tables_for_evidence(
+                    suggestion["evidence"], suggestion["tool"]
+                )
+                if hint_tables:
+                    requery_params["hint_tables"] = hint_tables
                 requery_calls.append(ToolCall(
                     id=f"requery_{idx + 1}",
                     tool=suggestion["tool"],
                     operation="lookup",
                     depends_on=[],
                     query=query,
-                    params={"evidence_type": suggestion["evidence"]},
+                    params=requery_params,
                 ))
             if requery_calls:
                 from contracts.agentic_plan import AgenticPlan as _AP  # noqa: local re-import
@@ -282,7 +327,7 @@ class AviationRagContextProvider:
                     time_window=plan.time_window,
                     tool_calls=requery_calls,
                 )
-                requery_execution = self.plan_executor.execute(query, mini_plan, schemas)
+                requery_execution = self.plan_executor.execute(query, mini_plan, schemas, on_trace=on_trace)
                 for src, rows in requery_execution.source_results.items():
                     execution.source_results.setdefault(src, []).extend(rows)
                 execution.citations.extend(requery_execution.citations)
@@ -371,6 +416,7 @@ class AviationRagContextProvider:
         query: str,
         plan: RetrievalPlan,
         sql_hint: Optional[str],
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[Citation], Optional[str]]:
         steps = sorted(plan.steps, key=lambda s: s.priority)
         source_results: Dict[str, List[Dict[str, Any]]] = {}
@@ -399,28 +445,38 @@ class AviationRagContextProvider:
             rows, row_citations, out_sql = self.retriever.retrieve_source(step.source, query, params)
             return step.source, rows, row_citations, out_sql
 
+        plan_event_id = str(uuid.uuid4())
+        start_times: Dict[Any, float] = {}
+        step_event_ids: Dict[int, str] = {}
+
         with ThreadPoolExecutor(max_workers=max(1, min(6, len(steps)))) as executor:
             future_map = {}
             for idx, step in enumerate(steps):
-                source_traces.append(
-                    {
-                        "type": "source_call_start",
-                        "source": step.source,
-                        "planned_source": step.source,
-                        "executed_source": step.source,
-                        "reason": step.reason,
-                        "priority": step.priority,
-                        "source_meta": self.retriever.source_event_meta(step.source),
-                        "execution_mode": self.retriever.source_mode(step.source),
-                        "contract_status": "planned",
-                        "timestamp": _utc_now(),
-                    }
-                )
+                step_event_ids[idx] = str(uuid.uuid4())
+                trace_start = {
+                    "type": "source_call_start",
+                    "source": step.source,
+                    "planned_source": step.source,
+                    "executed_source": step.source,
+                    "reason": step.reason,
+                    "priority": step.priority,
+                    "source_meta": self.retriever.source_event_meta(step.source),
+                    "execution_mode": self.retriever.source_mode(step.source),
+                    "contract_status": "planned",
+                    "timestamp": _utc_now(),
+                    "event_id": step_event_ids[idx],
+                    "parent_event_id": plan_event_id,
+                }
+                source_traces.append(trace_start)
+                if on_trace:
+                    on_trace(trace_start)
                 future = executor.submit(_run, step)
                 future_map[future] = (idx, step)
+                start_times[future] = time.perf_counter()
 
             for future in as_completed(future_map):
                 idx, step = future_map[future]
+                duration_ms = round((time.perf_counter() - start_times[future]) * 1000, 1)
                 try:
                     source, rows, row_citations, out_sql = future.result()
                     step_outputs[idx] = (source, rows, row_citations, out_sql)
@@ -436,46 +492,54 @@ class AviationRagContextProvider:
                     else:
                         contract_status = "met"
                     columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
-                    source_traces.append(
-                        {
-                            "type": "source_call_done",
-                            "source": source,
-                            "planned_source": step.source,
-                            "executed_source": source,
-                            "row_count": len(rows),
-                            "citation_count": len(row_citations),
-                            "source_meta": self.retriever.source_event_meta(source),
-                            "execution_mode": execution_mode,
-                            "contract_status": contract_status,
-                            "timestamp": _utc_now(),
-                            "columns": columns,
-                            "rows_preview": rows_preview,
-                            "rows_truncated": rows_truncated,
-                        }
-                    )
+                    trace_done = {
+                        "type": "source_call_done",
+                        "source": source,
+                        "planned_source": step.source,
+                        "executed_source": source,
+                        "row_count": len(rows),
+                        "citation_count": len(row_citations),
+                        "source_meta": self.retriever.source_event_meta(source),
+                        "execution_mode": execution_mode,
+                        "contract_status": contract_status,
+                        "timestamp": _utc_now(),
+                        "columns": columns,
+                        "rows_preview": rows_preview,
+                        "rows_truncated": rows_truncated,
+                        "duration_ms": duration_ms,
+                        "event_id": step_event_ids[idx],
+                        "parent_event_id": plan_event_id,
+                    }
+                    source_traces.append(trace_done)
+                    if on_trace:
+                        on_trace(trace_done)
                 except Exception as exc:
                     step_outputs[idx] = (step.source, [{"error": str(exc)}], [], None)
                     columns, rows_preview, rows_truncated = self._build_rows_preview(
                         [{"error": str(exc)}]
                     )
-                    source_traces.append(
-                        {
-                            "type": "source_call_done",
-                            "source": step.source,
-                            "planned_source": step.source,
-                            "executed_source": step.source,
-                            "row_count": 1,
-                            "citation_count": 0,
-                            "error": str(exc),
-                            "source_meta": self.retriever.source_event_meta(step.source),
-                            "execution_mode": self.retriever.source_mode(step.source),
-                            "contract_status": "failed",
-                            "timestamp": _utc_now(),
-                            "columns": columns,
-                            "rows_preview": rows_preview,
-                            "rows_truncated": rows_truncated,
-                        }
-                    )
+                    trace_err = {
+                        "type": "source_call_done",
+                        "source": step.source,
+                        "planned_source": step.source,
+                        "executed_source": step.source,
+                        "row_count": 1,
+                        "citation_count": 0,
+                        "error": str(exc),
+                        "source_meta": self.retriever.source_event_meta(step.source),
+                        "execution_mode": self.retriever.source_mode(step.source),
+                        "contract_status": "failed",
+                        "timestamp": _utc_now(),
+                        "columns": columns,
+                        "rows_preview": rows_preview,
+                        "rows_truncated": rows_truncated,
+                        "duration_ms": duration_ms,
+                        "event_id": step_event_ids[idx],
+                        "parent_event_id": plan_event_id,
+                    }
+                    source_traces.append(trace_err)
+                    if on_trace:
+                        on_trace(trace_err)
 
         for idx in range(len(steps)):
             if idx not in step_outputs:

@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,9 @@ from concurrent.futures import ThreadPoolExecutor
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
+from opentelemetry import trace as _otel_trace
+
+_ur_tracer = _otel_trace.get_tracer("aviation-rag-backend", "0.1.0")
 
 try:
     from azure.cosmos import CosmosClient, exceptions as cosmos_exceptions
@@ -68,6 +72,55 @@ AZURE_COSMOS_CONTAINER = os.getenv("AZURE_COSMOS_CONTAINER", "notams").strip()
 def _get_fabric_bearer_token() -> str:
     """Re-read bearer token from env on each call so rotated tokens take effect."""
     return os.getenv("FABRIC_BEARER_TOKEN", "")
+
+
+_fabric_token_lock = threading.Lock()
+_fabric_token_cache: Dict[str, Any] = {}
+
+
+def _acquire_fabric_token() -> str:
+    """Acquire Fabric bearer token via MSAL client credentials, with caching.
+
+    Falls back to static ``FABRIC_BEARER_TOKEN`` env var if MSAL env vars
+    are not configured.
+    """
+    static = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+    if static:
+        return static
+
+    client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
+    client_secret = os.getenv("FABRIC_CLIENT_SECRET", "").strip()
+    tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
+    if not (client_id and client_secret and tenant_id):
+        return ""
+
+    with _fabric_token_lock:
+        cached = _fabric_token_cache.get("token")
+        expires = _fabric_token_cache.get("expires_at", 0)
+        if cached and time.time() < expires - 120:  # 2-min buffer
+            return cached
+
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        body = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://api.fabric.microsoft.com/.default",
+        }).encode()
+        req = urllib.request.Request(token_url, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            access_token = data["access_token"]
+            expires_in = int(data.get("expires_in", 3600))
+            _fabric_token_cache["token"] = access_token
+            _fabric_token_cache["expires_at"] = time.time() + expires_in
+            logger.info("Acquired Fabric bearer token (expires_in=%ds)", expires_in)
+            return access_token
+        except Exception as exc:
+            logger.warning("MSAL token acquisition failed: %s", exc)
+            return cached or ""
 
 
 @dataclass
@@ -343,7 +396,7 @@ class UnifiedRetriever:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
-        token = _get_fabric_bearer_token()
+        token = _acquire_fabric_token()
         if token:
             req.add_header("Authorization", f"Bearer {token}")
         try:
@@ -499,7 +552,7 @@ class UnifiedRetriever:
             return {"status": "warn", "detail": "not_configured"}
 
         req = urllib.request.Request(endpoint, method="GET")
-        token = _get_fabric_bearer_token()
+        token = _acquire_fabric_token()
         if token:
             req.add_header("Authorization", f"Bearer {token}")
         try:
@@ -519,7 +572,7 @@ class UnifiedRetriever:
     def fabric_preflight(self) -> Dict[str, Any]:
         checks: List[Dict[str, Any]] = []
 
-        fabric_token = _get_fabric_bearer_token()
+        fabric_token = _acquire_fabric_token()
         token_status = "pass" if fabric_token else "warn"
         checks.append(
             {
@@ -1580,27 +1633,37 @@ class UnifiedRetriever:
         if source_mode == "blocked":
             row = self._source_unavailable_row(source, f"{source} is blocked by current source policy/configuration")
             return [row], [], None
-        if source == "SQL":
-            rows, sql, citations = self.query_sql(query, cfg.get("sql_hint"))
-            return rows, citations, sql
-        if source == "KQL":
-            rows, citations = self.query_kql(query, window_minutes=int(cfg.get("window_minutes", 60)))
-            return rows, citations, None
-        if source == "GRAPH":
-            rows, citations = self.query_graph(query, hops=int(cfg.get("hops", 2)))
-            return rows, citations, None
-        if source == "NOSQL":
-            rows, citations = self.query_nosql(query)
-            return rows, citations, None
-        if source in ("VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):
-            rows, citations = self.query_semantic(
-                query,
-                top=int(cfg.get("top", 5)),
-                embedding=cfg.get("embedding"),
-                source=source,
-                filter_expression=cfg.get("filter"),
-            )
-            return rows, citations, None
+        with _ur_tracer.start_as_current_span(f"source.{source.lower()}", attributes={"query.length": len(query)}) as span:
+            if source == "SQL":
+                rows, sql, citations = self.query_sql(query, cfg.get("sql_hint"))
+                span.set_attribute("row_count", len(rows))
+                return rows, citations, sql
+            if source == "KQL":
+                wm = int(cfg.get("window_minutes", 60))
+                rows, citations = self.query_kql(query, window_minutes=wm)
+                span.set_attribute("row_count", len(rows))
+                span.set_attribute("window_minutes", wm)
+                return rows, citations, None
+            if source == "GRAPH":
+                hops = int(cfg.get("hops", 2))
+                rows, citations = self.query_graph(query, hops=hops)
+                span.set_attribute("row_count", len(rows))
+                span.set_attribute("hops", hops)
+                return rows, citations, None
+            if source == "NOSQL":
+                rows, citations = self.query_nosql(query)
+                span.set_attribute("row_count", len(rows))
+                return rows, citations, None
+            if source in ("VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):
+                rows, citations = self.query_semantic(
+                    query,
+                    top=int(cfg.get("top", 5)),
+                    embedding=cfg.get("embedding"),
+                    source=source,
+                    filter_expression=cfg.get("filter"),
+                )
+                span.set_attribute("row_count", len(rows))
+                return rows, citations, None
         return [{"error": f"unknown_source:{source}"}], [], None
 
     # =========================================================================
@@ -1723,6 +1786,7 @@ Retrieved Data:
         conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Stream synthesis tokens as agent_update events (true streaming)."""
+        _synth_span = _ur_tracer.start_span("synthesis", attributes={"route": route})
         _t0_synth = time.perf_counter()
 
         context_str = f"""
@@ -1748,8 +1812,13 @@ Retrieved Data:
             for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     yield {"type": "agent_update", "content": chunk.choices[0].delta.content}
-            logger.info("perf stage=%s ms=%.1f", "synthesize_answer_stream", (time.perf_counter() - _t0_synth) * 1000)
+            _synth_ms = (time.perf_counter() - _t0_synth) * 1000
+            _synth_span.set_attribute("latency_ms", _synth_ms)
+            _synth_span.end()
+            logger.info("perf stage=%s ms=%.1f", "synthesize_answer_stream", _synth_ms)
         except Exception as exc:
+            _synth_span.set_attribute("error", True)
+            _synth_span.end()
             logger.error("LLM streaming synthesis failed: %s — falling back to non-streaming", exc)
             answer = self._synthesize_answer(query, context, route, conversation_history=conversation_history)
             yield {"type": "agent_update", "content": answer}

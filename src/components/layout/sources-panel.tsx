@@ -17,7 +17,7 @@ import { Separator } from "@/components/ui/separator";
 import { cn, formatDateTime } from "@/lib/utils";
 import { getDatastoreVisual } from "@/lib/datastore";
 import { motionTokens } from "@/lib/motion";
-import type { Citation, SourceHealthStatus } from "@/types";
+import type { Citation, GroundingInfo, SourceHealthStatus } from "@/types";
 
 interface SourcesPanelProps {
   isCollapsed: boolean;
@@ -28,6 +28,7 @@ interface SourcesPanelProps {
   sourceHealth: SourceHealthStatus[];
   route?: string;
   confidenceLabel: string;
+  groundingInfo?: GroundingInfo | null;
 }
 
 export function SourcesPanel({
@@ -39,6 +40,7 @@ export function SourcesPanel({
   sourceHealth,
   route,
   confidenceLabel,
+  groundingInfo,
 }: SourcesPanelProps) {
   const reducedMotion = useReducedMotion();
 
@@ -78,6 +80,26 @@ export function SourcesPanel({
                 <span className="text-muted-foreground">Route: <span className="font-mono font-semibold text-foreground">{route || "Pending"}</span></span>
                 <span className="text-muted-foreground">Confidence: <span className="font-semibold text-foreground">{confidenceLabel}</span></span>
               </div>
+
+              {groundingInfo && (
+                <div className="mt-2">
+                  <Badge
+                    variant={
+                      groundingInfo.groundingStatus === "grounded"
+                        ? "success"
+                        : groundingInfo.groundingStatus === "partially_grounded"
+                          ? "warning"
+                          : "destructive"
+                    }
+                  >
+                    {groundingInfo.groundingStatus === "grounded"
+                      ? "Grounded"
+                      : groundingInfo.groundingStatus === "partially_grounded"
+                        ? "Partially Grounded"
+                        : "Ungrounded"}
+                  </Badge>
+                </div>
+              )}
 
             </motion.div>
           ) : (
@@ -287,7 +309,16 @@ function getSourceTone(sourceId: string): SourceTone {
     };
   }
 
-  if (source === "NOSQL" || source === "POSTGRES") {
+  if (source === "NOSQL") {
+    return {
+      accentBar: "bg-purple-500/80",
+      queryCard: "border-purple-500/45 bg-purple-500/[0.08]",
+      queryBorder: "border-purple-500/55",
+      readyCard: "border-purple-500/35 bg-purple-500/[0.05]",
+    };
+  }
+
+  if (source === "POSTGRES") {
     return {
       accentBar: "bg-teal-500/80",
       queryCard: "border-teal-500/45 bg-teal-500/[0.08]",

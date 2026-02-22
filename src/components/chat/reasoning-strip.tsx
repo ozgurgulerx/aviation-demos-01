@@ -27,6 +27,7 @@ interface StageDefinition {
 }
 
 const STAGES: StageDefinition[] = [
+  { key: "pii_scan", label: "PII scan" },
   { key: "understanding_request", label: "Understanding request" },
   { key: "intent_mapped", label: "Intent mapped" },
   { key: "evidence_retrieval", label: "Evidence retrieval" },
@@ -71,6 +72,8 @@ export function ReasoningStrip({
     return "";
   }, [latest]);
 
+  const compactDetail = latest?.payload?.detail || "";
+
   if (!isLoading && events.length === 0) {
     return null;
   }
@@ -106,6 +109,17 @@ export function ReasoningStrip({
               {compactArtifact}
             </p>
           )}
+          {compactDetail && (
+            <motion.p
+              key={compactDetail}
+              initial={reducedMotion ? false : { opacity: 0, y: 2 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: reducedMotion ? 0 : 0.15 }}
+              className="mt-0.5 truncate text-xs text-muted-foreground"
+            >
+              {compactDetail}
+            </motion.p>
+          )}
         </div>
 
         <Button
@@ -138,6 +152,7 @@ export function ReasoningStrip({
           >
             {STAGES.map((stage, index) => {
               const stageEvent = findStageEvent(events, stage.key);
+              const baselineMs = events[0] ? new Date(events[0].ts).getTime() : null;
               const stageStatus =
                 index < currentStageIndex
                   ? "done"
@@ -162,9 +177,23 @@ export function ReasoningStrip({
                       <p className="truncate text-xs font-medium">{stage.label}</p>
                     </div>
                     <p className="font-mono text-[10px] text-muted-foreground">
-                      {stageEvent ? toUtcClock(stageEvent.ts) : "--:--:--"}
+                      {stageEvent
+                        ? `${toUtcClock(stageEvent.ts)} ${formatElapsedMs(baselineMs, stageEvent.ts)}`
+                        : "--:--:--"}
                     </p>
                   </div>
+
+                  {stageStatus === "active" && stageEvent?.payload?.detail && (
+                    <motion.p
+                      key={stageEvent.payload.detail}
+                      initial={reducedMotion ? false : { opacity: 0 }}
+                      animate={{ opacity: 0.8 }}
+                      transition={{ duration: reducedMotion ? 0 : 0.15 }}
+                      className="mt-1 text-xs text-muted-foreground italic"
+                    >
+                      {stageEvent.payload.detail}
+                    </motion.p>
+                  )}
 
                   {stage.key === "intent_mapped" && stageEvent?.payload?.intentLabel && (
                     <p className="mt-1 text-xs text-muted-foreground">
@@ -245,4 +274,14 @@ function toUtcClock(value: string): string {
     second: "2-digit",
     timeZone: "UTC",
   });
+}
+
+function formatElapsedMs(baselineMs: number | null, eventTs: string): string {
+  if (baselineMs === null) return "";
+  const eventMs = new Date(eventTs).getTime();
+  if (Number.isNaN(eventMs)) return "";
+  const delta = eventMs - baselineMs;
+  if (delta < 0) return "";
+  if (delta < 1000) return `+${delta}ms`;
+  return `+${(delta / 1000).toFixed(1)}s`;
 }

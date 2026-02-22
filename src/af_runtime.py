@@ -16,16 +16,19 @@ import asyncio
 import inspect
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, Iterable, List, Optional
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional
 
 from concurrent.futures import ThreadPoolExecutor
 
 import re
+
+from opentelemetry import trace, metrics as otel_metrics
 
 from af_context_provider import AviationRagContextProvider
 from af_tools import AviationRagTools, build_agent_framework_tools
@@ -33,6 +36,19 @@ from pii_filter import PII_HIGH_SEVERITY, PII_LOW_SEVERITY
 from unified_retriever import Citation, UnifiedRetriever, _truncate_context_to_budget, _check_answer_grounding
 
 logger = logging.getLogger(__name__)
+
+# OTel instruments — no-op when APPLICATIONINSIGHTS_CONNECTION_STRING is unset.
+_tracer = trace.get_tracer("aviation-rag-backend", "0.1.0")
+_meter = otel_metrics.get_meter("aviation-rag-backend", "0.1.0")
+
+_query_counter = _meter.create_counter("rag.query.count", description="Total RAG queries")
+_route_counter = _meter.create_counter("rag.route.count", description="Queries per route")
+_error_counter = _meter.create_counter("rag.error.count", description="Pipeline errors")
+_pii_block_counter = _meter.create_counter("rag.pii.blocked", description="PII-blocked queries")
+
+_query_latency = _meter.create_histogram("rag.query.latency_ms", unit="ms", description="End-to-end query latency")
+_source_latency = _meter.create_histogram("rag.source.latency_ms", unit="ms", description="Per-source retrieval latency")
+_synthesis_latency = _meter.create_histogram("rag.synthesis.latency_ms", unit="ms", description="LLM synthesis latency")
 
 
 @dataclass
@@ -289,6 +305,22 @@ class AgentFrameworkRuntime:
 
         return None
 
+    @staticmethod
+    def _reasoning_stage_event(
+        stage: str,
+        detail: str,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        """Build a reasoning_stage SSE event."""
+        payload: Dict[str, Any] = {"detail": detail}
+        payload.update(extra)
+        return {
+            "type": "reasoning_stage",
+            "stage": stage,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
+        }
+
     def run_stream(
         self,
         query: str,
@@ -305,6 +337,7 @@ class AgentFrameworkRuntime:
     ) -> Generator[Dict[str, Any], None, None]:
         _t0_total = time.perf_counter()
         sid = session_id or str(uuid.uuid4())
+        _resolved_route = "UNKNOWN"
 
         yield {
             "type": "agent_update",
@@ -337,6 +370,9 @@ class AgentFrameworkRuntime:
                 "sessionId": sid,
             }
 
+        # --- Reasoning: PII scan starting ---
+        yield self._reasoning_stage_event("pii_scan", "Scanning for PII entities...")
+
         # Run PII check and query routing in parallel — they are independent.
         _t0_parallel = time.perf_counter()
         precomputed_route = None
@@ -347,14 +383,43 @@ class AgentFrameworkRuntime:
         def _routing_task():
             return self.retriever.router.smart_route(query)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            pii_future = pool.submit(_pii_task)
-            route_future = pool.submit(_routing_task)
-            pii_result = pii_future.result()
-            try:
-                precomputed_route = route_future.result()
-            except Exception:
-                precomputed_route = None
+        with _tracer.start_as_current_span("pipeline.pii_routing", attributes={"query.length": len(query), "session.id": sid}) as _pii_span:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                pii_future = pool.submit(_pii_task)
+                route_future = pool.submit(_routing_task)
+
+                # Poll both futures so we can emit reasoning events as each completes.
+                pii_done = route_done = False
+                pii_result = None
+                while not (pii_done and route_done):
+                    if not pii_done and pii_future.done():
+                        pii_done = True
+                        pii_result = pii_future.result()
+                        yield self._reasoning_stage_event(
+                            "pii_scan",
+                            "PII scan complete \u2014 no PII detected" if not pii_result.has_pii else "PII scan complete \u2014 PII detected",
+                        )
+                    if not route_done and route_future.done():
+                        route_done = True
+                        try:
+                            precomputed_route = route_future.result()
+                        except Exception:
+                            precomputed_route = None
+                        route_label = (precomputed_route or {}).get("route", "HYBRID")
+                        route_reasoning = (precomputed_route or {}).get("reasoning", "")
+                        yield self._reasoning_stage_event(
+                            "understanding_request",
+                            f"Query classified as {route_label}",
+                            route=route_label,
+                            reasoning=route_reasoning,
+                        )
+                    if not (pii_done and route_done):
+                        time.sleep(0.02)
+
+                # Ensure pii_result is set (should always be by now).
+                if pii_result is None:
+                    pii_result = pii_future.result()
+            _pii_span.set_attribute("pii.detected", pii_result.has_pii)
 
         logger.info(
             "perf stage=%s ms=%.1f",
@@ -369,6 +434,7 @@ class AgentFrameworkRuntime:
                 low = [e for e in pii_result.entities if e.category in PII_LOW_SEVERITY]
                 if high:
                     # High-severity PII → block as before.
+                    _pii_block_counter.add(1, {"severity": "high"})
                     warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
                     for event in self._emit_text_chunks(warning):
                         yield event
@@ -393,6 +459,7 @@ class AgentFrameworkRuntime:
                     }
             else:
                 # Non-tiered mode: block all PII.
+                _pii_block_counter.add(1, {"severity": "high"})
                 warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
                 for event in self._emit_text_chunks(warning):
                     yield event
@@ -408,22 +475,32 @@ class AgentFrameworkRuntime:
 
         if self._af_enabled:
             try:
-                yield from self._run_with_agent_framework(
-                    query,
-                    sid,
-                    retrieval_mode,
-                    query_profile=query_profile,
-                    required_sources=required_sources or [],
-                    freshness_sla_minutes=freshness_sla_minutes,
-                    explain_retrieval=explain_retrieval,
-                    risk_mode=risk_mode,
-                    ask_recommendation=ask_recommendation,
-                    demo_scenario=demo_scenario,
-                    precomputed_route=precomputed_route,
-                    conversation_history=conversation_history,
-                )
+                with _tracer.start_as_current_span("pipeline.agent_framework", attributes={"session.id": sid, "framework": self._framework_label}):
+                    for event in self._run_with_agent_framework(
+                        query,
+                        sid,
+                        retrieval_mode,
+                        query_profile=query_profile,
+                        required_sources=required_sources or [],
+                        freshness_sla_minutes=freshness_sla_minutes,
+                        explain_retrieval=explain_retrieval,
+                        risk_mode=risk_mode,
+                        ask_recommendation=ask_recommendation,
+                        demo_scenario=demo_scenario,
+                        precomputed_route=precomputed_route,
+                        conversation_history=conversation_history,
+                    ):
+                        if event.get("type") == "agent_done":
+                            _resolved_route = event.get("route", "AGENTIC")
+                        yield event
+                _total_ms = (time.perf_counter() - _t0_total) * 1000
+                _query_counter.add(1)
+                _route_counter.add(1, {"route": _resolved_route})
+                _query_latency.record(_total_ms, {"route": _resolved_route})
+                logger.info("perf stage=%s ms=%.1f", "run_stream_total", _total_ms)
                 return
             except Exception as exc:
+                _error_counter.add(1, {"stage": "agent_framework"})
                 logger.exception("Agent Framework run failed")
                 yield {
                     "type": "agent_update",
@@ -432,21 +509,29 @@ class AgentFrameworkRuntime:
                     "sessionId": sid,
                 }
 
-        yield from self._run_with_local_pipeline(
-            query,
-            sid,
-            retrieval_mode,
-            query_profile=query_profile,
-            required_sources=required_sources or [],
-            freshness_sla_minutes=freshness_sla_minutes,
-            explain_retrieval=explain_retrieval,
-            risk_mode=risk_mode,
-            ask_recommendation=ask_recommendation,
-            demo_scenario=demo_scenario,
-            precomputed_route=precomputed_route,
-            conversation_history=conversation_history,
-        )
-        logger.info("perf stage=%s ms=%.1f", "run_stream_total", (time.perf_counter() - _t0_total) * 1000)
+        with _tracer.start_as_current_span("pipeline.local", attributes={"session.id": sid}):
+            for event in self._run_with_local_pipeline(
+                query,
+                sid,
+                retrieval_mode,
+                query_profile=query_profile,
+                required_sources=required_sources or [],
+                freshness_sla_minutes=freshness_sla_minutes,
+                explain_retrieval=explain_retrieval,
+                risk_mode=risk_mode,
+                ask_recommendation=ask_recommendation,
+                demo_scenario=demo_scenario,
+                precomputed_route=precomputed_route,
+                conversation_history=conversation_history,
+            ):
+                if event.get("type") == "agent_done":
+                    _resolved_route = event.get("route", "LOCAL")
+                yield event
+        _total_ms = (time.perf_counter() - _t0_total) * 1000
+        _query_counter.add(1)
+        _route_counter.add(1, {"route": _resolved_route})
+        _query_latency.record(_total_ms, {"route": _resolved_route})
+        logger.info("perf stage=%s ms=%.1f", "run_stream_total", _total_ms)
 
     def _run_with_agent_framework(
         self,
@@ -466,6 +551,15 @@ class AgentFrameworkRuntime:
         session = self._get_or_create_session(session_id)
         call_id = str(uuid.uuid4())
 
+        # --- Reasoning: intent mapped / building retrieval plan ---
+        route_label = (precomputed_route or {}).get("route", "HYBRID")
+        yield self._reasoning_stage_event(
+            "intent_mapped",
+            "Building retrieval plan...",
+            route=route_label,
+            sources=list((precomputed_route or {}).get("sources", [])),
+        )
+
         yield {
             "type": "tool_call",
             "id": call_id,
@@ -483,24 +577,69 @@ class AgentFrameworkRuntime:
             },
         }
 
+        # Run build_context in a thread so we can drain source traces in real-time.
+        trace_queue: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue()
+        ctx_holder: List[Any] = []  # mutable container for thread result
+        exc_holder: List[Exception] = []
         _t0_ctx = time.perf_counter()
-        ctx = self.context_provider.build_context(
-            query,
-            retrieval_mode=retrieval_mode,
-            query_profile=query_profile,
-            required_sources=required_sources,
-            freshness_sla_minutes=freshness_sla_minutes,
-            explain_retrieval=explain_retrieval,
-            risk_mode=risk_mode,
-            ask_recommendation=ask_recommendation,
-            precomputed_route=precomputed_route,
-        )
+
+        def _build_ctx() -> None:
+            try:
+                ctx = self.context_provider.build_context(
+                    query,
+                    retrieval_mode=retrieval_mode,
+                    query_profile=query_profile,
+                    required_sources=required_sources,
+                    freshness_sla_minutes=freshness_sla_minutes,
+                    explain_retrieval=explain_retrieval,
+                    risk_mode=risk_mode,
+                    ask_recommendation=ask_recommendation,
+                    precomputed_route=precomputed_route,
+                    on_trace=trace_queue.put,
+                )
+                ctx_holder.append(ctx)
+            except Exception as exc:
+                exc_holder.append(exc)
+            finally:
+                trace_queue.put(None)  # sentinel
+
+        ctx_thread = threading.Thread(target=_build_ctx, daemon=True)
+        ctx_thread.start()
+
+        # Drain trace queue in real-time — emit source_call_* events as they arrive.
+        traces_streamed = False
+        while True:
+            try:
+                trace_event = trace_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if trace_event is None:
+                break
+            traces_streamed = True
+            for item in self._emit_source_trace_events(trace_event):
+                yield item
+
+        ctx_thread.join()
+        if exc_holder:
+            raise exc_holder[0]
+        ctx = ctx_holder[0]
+
         logger.info("perf stage=%s ms=%.1f", "build_context_af", (time.perf_counter() - _t0_ctx) * 1000)
         if ctx.retrieval_plan:
             yield {"type": "retrieval_plan", "plan": ctx.retrieval_plan}
-        for trace in ctx.source_traces:
-            for item in self._emit_source_trace_events(trace):
-                yield item
+        # Only emit batch traces if on_trace callback was not used (backward compat).
+        if not traces_streamed:
+            for trace in ctx.source_traces:
+                for item in self._emit_source_trace_events(trace):
+                    yield item
+
+        # --- Reasoning: drafting brief ---
+        yield self._reasoning_stage_event(
+            "drafting_brief",
+            "Synthesizing answer from evidence...",
+            route=ctx.route,
+        )
+
         yield {
             "type": "tool_result",
             "id": call_id,
@@ -564,6 +703,15 @@ class AgentFrameworkRuntime:
 
         grounding = _check_answer_grounding(af_answer_text, len(ctx.citations))
 
+        # --- Reasoning: evidence check complete ---
+        yield self._reasoning_stage_event(
+            "evidence_check_complete",
+            "Evidence verification complete",
+            verification="Verified" if is_verified else "Partial",
+            failOpen=not is_verified,
+            route=ctx.route,
+        )
+
         yield {
             "type": "agent_done",
             "isVerified": is_verified,
@@ -590,6 +738,16 @@ class AgentFrameworkRuntime:
         conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         call_id = str(uuid.uuid4())
+
+        # --- Reasoning: intent mapped / building retrieval plan ---
+        route_label = (precomputed_route or {}).get("route", "HYBRID")
+        yield self._reasoning_stage_event(
+            "intent_mapped",
+            "Building retrieval plan...",
+            route=route_label,
+            sources=list((precomputed_route or {}).get("sources", [])),
+        )
+
         yield {
             "type": "tool_call",
             "id": call_id,
@@ -607,18 +765,53 @@ class AgentFrameworkRuntime:
             },
         }
 
+        # Run run_rag_lookup in a thread so we can drain source traces in real-time.
+        trace_queue: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue()
+        result_holder: List[Dict[str, Any]] = []
+        exc_holder: List[Exception] = []
         _t0_rag = time.perf_counter()
-        tool_result = self.toolset.run_rag_lookup(
-            query,
-            retrieval_mode=retrieval_mode,
-            query_profile=query_profile,
-            required_sources=required_sources,
-            freshness_sla_minutes=freshness_sla_minutes,
-            explain_retrieval=explain_retrieval,
-            risk_mode=risk_mode,
-            ask_recommendation=ask_recommendation,
-            precomputed_route=precomputed_route,
-        )
+
+        def _run_lookup() -> None:
+            try:
+                tool_result = self.toolset.run_rag_lookup(
+                    query,
+                    retrieval_mode=retrieval_mode,
+                    query_profile=query_profile,
+                    required_sources=required_sources,
+                    freshness_sla_minutes=freshness_sla_minutes,
+                    explain_retrieval=explain_retrieval,
+                    risk_mode=risk_mode,
+                    ask_recommendation=ask_recommendation,
+                    precomputed_route=precomputed_route,
+                    on_trace=trace_queue.put,
+                )
+                result_holder.append(tool_result)
+            except Exception as exc:
+                exc_holder.append(exc)
+            finally:
+                trace_queue.put(None)  # sentinel
+
+        lookup_thread = threading.Thread(target=_run_lookup, daemon=True)
+        lookup_thread.start()
+
+        # Drain trace queue in real-time.
+        traces_streamed = False
+        while True:
+            try:
+                trace_event = trace_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if trace_event is None:
+                break
+            traces_streamed = True
+            for item in self._emit_source_trace_events(trace_event):
+                yield item
+
+        lookup_thread.join()
+        if exc_holder:
+            raise exc_holder[0]
+        tool_result = result_holder[0]
+
         logger.info("perf stage=%s ms=%.1f", "rag_lookup", (time.perf_counter() - _t0_rag) * 1000)
         route = tool_result.get("route", "HYBRID")
         reasoning = tool_result.get("reasoning", "Fallback retrieval path")
@@ -631,9 +824,18 @@ class AgentFrameworkRuntime:
         citations_payload = tool_result.get("citations", [])
         if tool_result.get("retrieval_plan"):
             yield {"type": "retrieval_plan", "plan": tool_result.get("retrieval_plan")}
-        for trace in tool_result.get("source_traces", []):
-            for item in self._emit_source_trace_events(trace):
-                yield item
+        # Only emit batch traces if on_trace was not used.
+        if not traces_streamed:
+            for trace in tool_result.get("source_traces", []):
+                for item in self._emit_source_trace_events(trace):
+                    yield item
+
+        # --- Reasoning: drafting brief ---
+        yield self._reasoning_stage_event(
+            "drafting_brief",
+            "Synthesizing answer from evidence...",
+            route=route,
+        )
 
         yield {
             "type": "tool_result",
@@ -708,6 +910,15 @@ class AgentFrameworkRuntime:
             local_is_verified = len(citations_payload) > 0
 
         local_grounding = _check_answer_grounding(local_answer_text, len(citations_payload))
+
+        # --- Reasoning: evidence check complete ---
+        yield self._reasoning_stage_event(
+            "evidence_check_complete",
+            "Evidence verification complete",
+            verification="Verified" if local_is_verified else "Partial",
+            failOpen=not local_is_verified,
+            route=route,
+        )
 
         yield {
             "type": "agent_done",

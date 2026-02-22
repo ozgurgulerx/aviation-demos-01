@@ -47,6 +47,7 @@ class SQLWriter:
 
 Rules:
 - Use only tables/columns provided in sql_schema.
+- If hint_tables is provided in constraints, PREFER those tables for the query.
 - Prefer simple SELECTs with WHERE filters and LIMIT.
 - If needed columns are missing, output exactly:
 -- NEED_SCHEMA: <what is missing>

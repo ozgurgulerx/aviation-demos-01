@@ -76,11 +76,19 @@ export interface SourceReference {
 export type TelemetryEventStatus = "running" | "completed" | "error" | "info";
 export type OperationalAlertSeverity = "advisory" | "warning" | "critical";
 export type ReasoningStage =
+  | "pii_scan"
   | "understanding_request"
   | "intent_mapped"
   | "evidence_retrieval"
   | "drafting_brief"
   | "evidence_check_complete";
+
+export interface GroundingInfo {
+  hasCitations: boolean;
+  citationMarkers: number[];
+  invalidMarkers: number[];
+  groundingStatus: "grounded" | "partially_grounded" | "ungrounded";
+}
 export type ReasoningConfidence = "High" | "Medium" | "Low";
 export type ReasoningVerification = "Verified" | "Partial";
 
@@ -101,7 +109,8 @@ export interface TelemetryEvent {
     | "freshness_guardrail"
     | "fallback_mode_changed"
     | "fabric_preflight"
-    | "operational_alert";
+    | "operational_alert"
+    | "pii_redacted";
   stage: string;
   message: string;
   status: TelemetryEventStatus;
@@ -134,6 +143,7 @@ export interface OperationalAlert {
 }
 
 export interface ReasoningEventPayload {
+  detail?: string;
   intentLabel?: string;
   confidence?: ReasoningConfidence;
   route?: string;

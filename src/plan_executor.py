@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class PlanExecutor:
         user_query: str,
         plan: AgenticPlan,
         schemas: Dict[str, Any],
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> PlanExecutionResult:
         result = PlanExecutionResult()
 
@@ -98,21 +99,22 @@ class PlanExecutor:
                     source = self._canon_tool(call.tool)
                     started_at = _utc_now()
                     started_at_map[call.id] = started_at
-                    result.source_traces.append(
-                        {
-                            "type": "source_call_start",
-                            "source": source,
-                            "planned_source": source,
-                            "executed_source": source,
-                            "reason": call.operation,
-                            "priority": 0,
-                            "source_meta": self.retriever.source_event_meta(source),
-                            "execution_mode": self.retriever.source_mode(source),
-                            "contract_status": "planned",
-                            "event_id": call.id,
-                            "timestamp": started_at,
-                        }
-                    )
+                    trace_start = {
+                        "type": "source_call_start",
+                        "source": source,
+                        "planned_source": source,
+                        "executed_source": source,
+                        "reason": call.operation,
+                        "priority": 0,
+                        "source_meta": self.retriever.source_event_meta(source),
+                        "execution_mode": self.retriever.source_mode(source),
+                        "contract_status": "planned",
+                        "event_id": call.id,
+                        "timestamp": started_at,
+                    }
+                    result.source_traces.append(trace_start)
+                    if on_trace:
+                        on_trace(trace_start)
                     future_map[pool.submit(self._run_call, call, user_query, plan, schemas)] = call
 
                 for future in as_completed(future_map):
@@ -145,24 +147,25 @@ class PlanExecutor:
                             contract_status = "failed"
                         else:
                             contract_status = "met"
-                        result.source_traces.append(
-                            {
-                                "type": "source_call_done",
-                                "source": source,
-                                "planned_source": source,
-                                "executed_source": source,
-                                "row_count": len(rows),
-                                "citation_count": len(citations),
-                                "source_meta": self.retriever.source_event_meta(source),
-                                "execution_mode": execution_mode,
-                                "contract_status": contract_status,
-                                "event_id": call.id,
-                                "timestamp": completed_at,
-                                "columns": columns,
-                                "rows_preview": rows_preview,
-                                "rows_truncated": rows_truncated,
-                            }
-                        )
+                        trace_done = {
+                            "type": "source_call_done",
+                            "source": source,
+                            "planned_source": source,
+                            "executed_source": source,
+                            "row_count": len(rows),
+                            "citation_count": len(citations),
+                            "source_meta": self.retriever.source_event_meta(source),
+                            "execution_mode": execution_mode,
+                            "contract_status": contract_status,
+                            "event_id": call.id,
+                            "timestamp": completed_at,
+                            "columns": columns,
+                            "rows_preview": rows_preview,
+                            "rows_truncated": rows_truncated,
+                        }
+                        result.source_traces.append(trace_done)
+                        if on_trace:
+                            on_trace(trace_done)
                     except Exception as exc:
                         error_rows = self._annotate_rows(
                             [{"error": str(exc)}],
@@ -185,25 +188,26 @@ class PlanExecutor:
                             params=dict(call.params or {}),
                         )
                         columns, rows_preview, rows_truncated = self._build_rows_preview(error_rows)
-                        result.source_traces.append(
-                            {
-                                "type": "source_call_done",
-                                "source": source,
-                                "planned_source": source,
-                                "executed_source": source,
-                                "row_count": 1,
-                                "citation_count": 0,
-                                "error": str(exc),
-                                "source_meta": self.retriever.source_event_meta(source),
-                                "execution_mode": self.retriever.source_mode(source),
-                                "contract_status": "failed",
-                                "event_id": call.id,
-                                "timestamp": completed_at,
-                                "columns": columns,
-                                "rows_preview": rows_preview,
-                                "rows_truncated": rows_truncated,
-                            }
-                        )
+                        trace_err = {
+                            "type": "source_call_done",
+                            "source": source,
+                            "planned_source": source,
+                            "executed_source": source,
+                            "row_count": 1,
+                            "citation_count": 0,
+                            "error": str(exc),
+                            "source_meta": self.retriever.source_event_meta(source),
+                            "execution_mode": self.retriever.source_mode(source),
+                            "contract_status": "failed",
+                            "event_id": call.id,
+                            "timestamp": completed_at,
+                            "columns": columns,
+                            "rows_preview": rows_preview,
+                            "rows_truncated": rows_truncated,
+                        }
+                        result.source_traces.append(trace_err)
+                        if on_trace:
+                            on_trace(trace_err)
                     done_ids.add(call.id)
                     pending.pop(call.id, None)
 

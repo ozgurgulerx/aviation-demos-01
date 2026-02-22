@@ -103,15 +103,18 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"evidence": "TAF", "tool": "KQL", "priority": 1},
         {"evidence": "NOTAM", "tool": "NOSQL", "priority": 1},
         {"evidence": "NOTAM", "tool": "VECTOR_REG", "priority": 2},
-        {"evidence": "RunwayConstraints", "tool": "SQL", "priority": 1},
+        {"evidence": "RunwayConstraints", "tool": "SQL", "priority": 1,
+         "hint_tables": ["demo.ourairports_runways", "demo.ourairports_airports"]},
         {"evidence": "Hazards", "tool": "KQL", "priority": 1},
         {"evidence": "SOPClause", "tool": "VECTOR_REG", "priority": 1},
-        {"evidence": "FleetData", "tool": "SQL", "priority": 1},
+        {"evidence": "FleetData", "tool": "SQL", "priority": 1,
+         "hint_tables": ["demo.ops_flight_legs", "demo.ops_mel_techlog_events"]},
         {"evidence": "RouteData", "tool": "SQL", "priority": 1},
         {"evidence": "RouteData", "tool": "GRAPH", "priority": 2},
         {"evidence": "SafetyStats", "tool": "SQL", "priority": 1},
         {"evidence": "SafetyStats", "tool": "VECTOR_OPS", "priority": 2},
-        {"evidence": "AirportData", "tool": "SQL", "priority": 1},
+        {"evidence": "AirportData", "tool": "SQL", "priority": 1,
+         "hint_tables": ["demo.ourairports_airports", "demo.openflights_airports"]},
         {"evidence": "AirportData", "tool": "VECTOR_AIRPORT", "priority": 2},
     ],
     "expansion_rules": [
@@ -160,6 +163,18 @@ class IntentGraphSnapshot:
         matches = [r for r in rows if isinstance(r, dict) and str(r.get("evidence")) == evidence_name]
         matches.sort(key=lambda r: int(r.get("priority", 999)))
         return [str(r.get("tool")) for r in matches if r.get("tool")]
+
+    def hint_tables_for_evidence(self, evidence_name: str, tool_name: str) -> List[str]:
+        """Return hint_tables for a given evidence/tool pair, if defined."""
+        rows = self.data.get("authoritative_in") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("evidence")) == evidence_name and str(row.get("tool")).upper() == tool_name.upper():
+                hints = row.get("hint_tables")
+                if isinstance(hints, list):
+                    return [str(h) for h in hints]
+        return []
 
 
 class IntentGraphProvider:

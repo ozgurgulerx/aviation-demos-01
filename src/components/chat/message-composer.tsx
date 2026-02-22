@@ -113,16 +113,24 @@ export function MessageComposer({
       return;
     }
 
+    // Delay mock stream by 800ms to give real reasoning_stage events a chance
+    // to arrive from the backend. If real events appear within the delay, the
+    // hasLiveReasoning check on re-render will prevent mock from starting.
     setMockReasoningEvents([]);
-    const stopMock = startMockReasoningStream({
-      prompt: lastSubmittedPrompt || "Pilot brief request",
-      onEvent: (event) => {
-        setMockReasoningEvents((previous) => [...previous, event]);
-      },
-    });
+    let stopMock: (() => void) | undefined;
+    const delayTimer = setTimeout(() => {
+      stopMock = startMockReasoningStream({
+        prompt: lastSubmittedPrompt || "Pilot brief request",
+        onEvent: (event) => {
+          setMockReasoningEvents((previous) => [...previous, event]);
+        },
+      });
+    }, 800);
 
-    // TODO(unit): replace mock stream with backend-driven SSE reasoning events.
-    return stopMock;
+    return () => {
+      clearTimeout(delayTimer);
+      stopMock?.();
+    };
   }, [isLoading, lastSubmittedPrompt, reasoningEvents]);
 
   // Focus trap and accessibility announcement when blocked

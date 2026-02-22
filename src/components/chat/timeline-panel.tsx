@@ -146,12 +146,12 @@ export function TimelinePanel({
                         transition={{ duration: reducedMotion ? 0 : motionTokens.micro }}
                         className="rounded border border-border/70 bg-background/70 px-1.5 font-mono text-[10px] hover:bg-background disabled:cursor-not-allowed disabled:opacity-55"
                         onClick={() => {
-                          if (hasPreview) {
+                          if (hasPreview || source.status === "error") {
                             setSelectedSource(source.source);
                           }
                         }}
-                        disabled={!hasPreview}
-                        title={hasPreview ? "View retrieved rows" : "No row preview available for this source call"}
+                        disabled={!hasPreview && source.status !== "error"}
+                        title={hasPreview ? "View retrieved rows" : source.status === "error" ? "View error details" : "No row preview available for this source call"}
                       >
                         {source.rowCount} rows
                       </motion.button>

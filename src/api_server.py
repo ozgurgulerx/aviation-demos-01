@@ -3,8 +3,23 @@
 
 import logging
 import os
+import sys
 
 from flask import Flask, Response, jsonify, request, stream_with_context
+
+# Structured JSON logging when python-json-logger is available.
+try:
+    from pythonjsonlogger.json import JsonFormatter  # type: ignore[import-untyped]
+    _json_handler = logging.StreamHandler(sys.stdout)
+    _json_handler.setFormatter(JsonFormatter(
+        fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
+        rename_fields={"asctime": "timestamp", "levelname": "level"},
+    ))
+    logging.root.handlers.clear()
+    logging.root.addHandler(_json_handler)
+    logging.root.setLevel(logging.INFO)
+except ImportError:
+    logging.basicConfig(level=logging.INFO)
 from flask_cors import CORS
 from af_runtime import AgentFrameworkRuntime
 from af_streaming import to_sse
@@ -15,6 +30,13 @@ app = Flask(__name__)
 CORS(app, origins=[
     os.getenv("ALLOWED_ORIGIN", "https://aviation-rag-frontend-705508.azurewebsites.net"),
 ])
+
+# Auto-instrument Flask with OpenTelemetry when providers are available.
+try:
+    from opentelemetry.instrumentation.flask import FlaskInstrumentor
+    FlaskInstrumentor().instrument_app(app)
+except ImportError:
+    pass
 
 runtime = None
 

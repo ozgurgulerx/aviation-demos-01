@@ -15,7 +15,9 @@ gunicorn>=21.2.0
 # Agent Framework runtime + observability
 agent-framework>=1.0.0b260212
 opentelemetry-sdk>=1.26.0
+opentelemetry-instrumentation-flask>=0.47b0
 azure-monitor-opentelemetry-exporter>=1.0.0b35
+python-json-logger>=2.0.7
 
 # Testing
 pytest>=7.0.0

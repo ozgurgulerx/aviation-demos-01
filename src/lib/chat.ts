@@ -57,6 +57,8 @@ export interface StreamEvent {
     | "fallback_mode_changed"
     | "fabric_preflight"
     | "operational_alert"
+    | "pii_redacted"
+    | "reasoning_stage"
     | "done"
     | "error";
   id?: string;
@@ -107,6 +109,23 @@ export interface StreamEvent {
   scenario?: string;
   severity?: OperationalAlertSeverity;
   title?: string;
+  ts?: string;
+  payload?: {
+    detail?: string;
+    intentLabel?: string;
+    confidence?: string;
+    route?: string;
+    sources?: string[];
+    callCount?: number;
+    verification?: string;
+    failOpen?: boolean;
+  };
+  grounding?: {
+    has_citations?: boolean;
+    citation_markers?: number[];
+    invalid_markers?: number[];
+    grounding_status?: string;
+  };
 }
 
 export function parseSSELine(line: string): StreamEvent | null {
@@ -306,12 +325,30 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         status: "error",
         timestamp,
       };
+    case "pii_redacted":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: "pii",
+        message: event.message || "PII redacted from query",
+        status: "info",
+        timestamp,
+      };
     case "progress":
       return {
         id: fallbackId,
         type: event.type,
         stage: event.stage || "progress",
         message: event.message || "Progress update",
+        status: "running",
+        timestamp,
+      };
+    case "reasoning_stage":
+      return {
+        id: fallbackId,
+        type: "progress",
+        stage: event.stage || "reasoning",
+        message: event.payload?.detail || `Reasoning: ${event.stage || "processing"}`,
         status: "running",
         timestamp,
       };
@@ -429,7 +466,7 @@ export function updateSourceHealth(
         event.type === "source_call_start"
           ? "querying"
           : event.type === "source_call_done"
-            ? "ready"
+            ? event.error ? "error" : "ready"
             : "idle",
       rowCount: event.row_count || 0,
       updatedAt: eventTimestamp,
@@ -447,7 +484,7 @@ export function updateSourceHealth(
             event.type === "source_call_start"
               ? "querying"
               : event.type === "source_call_done"
-                ? "ready"
+                ? event.error ? "error" : "ready"
                 : item.status,
           rowCount:
             event.type === "source_call_done"

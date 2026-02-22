@@ -188,6 +188,10 @@ class AgenticOrchestrator:
                     op = "kql_lookup"
                 elif tool.startswith("VECTOR_"):
                     op = "semantic_lookup"
+                params: Dict[str, Any] = {"evidence_type": ev_name}
+                hint_tables = intent_graph.hint_tables_for_evidence(ev_name, tool)
+                if hint_tables:
+                    params["hint_tables"] = hint_tables
                 tool_calls.append(
                     ToolCall(
                         id=f"call_{call_idx}",
@@ -195,7 +199,7 @@ class AgenticOrchestrator:
                         operation=op,
                         depends_on=depends_on,
                         query=query,
-                        params={"evidence_type": ev_name},
+                        params=params,
                     )
                 )
                 call_idx += 1
@@ -335,6 +339,10 @@ class AgenticOrchestrator:
                 operation = "semantic_lookup"
             elif selected_tool == "GRAPH":
                 operation = "entity_expansion"
+            call_params: Dict[str, Any] = {"evidence_type": evidence}
+            hint_tables = intent_graph.hint_tables_for_evidence(evidence, selected_tool)
+            if hint_tables:
+                call_params["hint_tables"] = hint_tables
             plan.tool_calls.append(
                 ToolCall(
                     id=f"call_{next_id}",
@@ -342,7 +350,7 @@ class AgenticOrchestrator:
                     operation=operation,
                     depends_on=depends_on,
                     query=user_query,
-                    params={"evidence_type": evidence},
+                    params=call_params,
                 )
             )
             next_id += 1

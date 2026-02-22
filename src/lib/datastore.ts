@@ -37,9 +37,9 @@ const VISUALS: Record<string, DatastoreVisual> = {
   },
   NOSQL: {
     id: "NOSQL",
-    shortLabel: "Azure PostgreSQL",
-    longLabel: "Azure PostgreSQL",
-    iconSrc: "/service-icons/postgresql.jpeg",
+    shortLabel: "Cosmos DB",
+    longLabel: "Azure Cosmos DB (NOTAMs)",
+    iconSrc: "/service-icons/cosmosdb.svg",
     isFabric: false,
   },
   POSTGRES: {

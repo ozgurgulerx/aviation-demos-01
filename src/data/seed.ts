@@ -228,7 +228,7 @@ export const DATA_PROVIDERS = [
   { name: "Fabric Warehouse (SQL)", type: "Relational" },
   { name: "Fabric Graph (Preview)", type: "Dependency" },
   { name: "Azure AI Search", type: "Vector" },
-  { name: "Azure PostgreSQL", type: "Snapshot" },
+  { name: "Azure Cosmos DB", type: "NOTAM" },
 ];
 
 export interface DataSourceBlueprint {
@@ -270,10 +270,10 @@ export const DATA_SOURCE_BLUEPRINT: DataSourceBlueprint[] = [
   },
   {
     id: "NOSQL",
-    label: "Evidence snapshots",
-    datastore: "Azure PostgreSQL",
+    label: "NOTAM store",
+    datastore: "Azure Cosmos DB (NOTAMs)",
     retrievalMode: "Document point reads",
-    rationale: "Used for immutable evidence and replayability when needed.",
+    rationale: "Used for active NOTAM retrieval by airport ICAO code.",
   },
 ];
 

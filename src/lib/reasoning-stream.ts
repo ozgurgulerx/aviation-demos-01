@@ -6,6 +6,7 @@ interface MockReasoningStreamOptions {
 }
 
 const STAGE_ORDER: ReasoningSseEvent["stage"][] = [
+  "pii_scan",
   "understanding_request",
   "intent_mapped",
   "evidence_retrieval",

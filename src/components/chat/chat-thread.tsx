@@ -30,6 +30,7 @@ interface ChatThreadProps {
   voiceEnabled?: boolean;
   voiceStatuses?: Record<string, "idle" | "preparing" | "ready" | "error">;
   onSendMessage?: (message: string) => void;
+  currentReasoningDetail?: string;
 }
 
 const iconMap: Record<QueryType, React.ElementType> = {
@@ -57,6 +58,7 @@ export function ChatThread({
   voiceEnabled = true,
   voiceStatuses = {},
   onSendMessage,
+  currentReasoningDetail,
 }: ChatThreadProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -178,7 +180,17 @@ export function ChatThread({
                   <Loader2 className="h-4 w-4 animate-spin text-primary" />
                 </div>
                 <div className="max-w-[88%] flex-1 rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
-                  Analyzing intent, retrieval path, and evidence...
+                  <AnimatePresence mode="wait">
+                    <motion.span
+                      key={currentReasoningDetail || "default"}
+                      initial={reducedMotion ? false : { opacity: 0, y: 4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
+                      transition={{ duration: reducedMotion ? 0 : 0.15 }}
+                    >
+                      {currentReasoningDetail || "Analyzing intent, retrieval path, and evidence..."}
+                    </motion.span>
+                  </AnimatePresence>
                 </div>
               </motion.div>
             )}

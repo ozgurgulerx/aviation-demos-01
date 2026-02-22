@@ -5,7 +5,7 @@ Agent Framework tool wrappers for Aviation RAG retrieval primitives.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from af_context_provider import AviationRagContextProvider
 from unified_retriever import Citation, UnifiedRetriever
@@ -62,6 +62,7 @@ class AviationRagTools:
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
         precomputed_route: Optional[Dict[str, Any]] = None,
+        on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         ctx = self.context_provider.build_context(
             query,
@@ -73,6 +74,7 @@ class AviationRagTools:
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
             precomputed_route=precomputed_route,
+            on_trace=on_trace,
         )
         return {
             "route": ctx.route,

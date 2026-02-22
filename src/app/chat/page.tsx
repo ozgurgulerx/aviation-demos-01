@@ -35,6 +35,7 @@ import type {
   TelemetryEvent,
   SourceHealthStatus,
   FabricPreflightStatus,
+  GroundingInfo,
   OperationalAlert,
   ReasoningConfidence,
   ReasoningEventPayload,
@@ -69,6 +70,7 @@ function toSpeechText(raw: string): string {
 }
 
 const REASONING_STAGE_ORDER: ReasoningStage[] = [
+  "pii_scan",
   "understanding_request",
   "intent_mapped",
   "evidence_retrieval",
@@ -373,6 +375,7 @@ export default function ChatPage() {
   );
 
   const [showFollowUps, setShowFollowUps] = useState(true);
+  const [groundingInfo, setGroundingInfo] = useState<GroundingInfo | null>(null);
   const [routeLabel, setRouteLabel] = useState<string>("Pending");
   const [confidenceLabel, setConfidenceLabel] = useState<string>("Awaiting run");
   const [fabricPreflight, setFabricPreflight] = useState<FabricPreflightStatus | null>(null);
@@ -447,6 +450,7 @@ export default function ChatPage() {
     setSourceHealth(createInitialSourceHealth());
     setRouteLabel("Pending");
     setConfidenceLabel("Awaiting run");
+    setGroundingInfo(null);
     setOperationalAlert(null);
     setVoiceStatuses({});
     voiceClipByMessageRef.current = {};
@@ -734,8 +738,10 @@ export default function ChatPage() {
       setSourceHealth(createInitialSourceHealth());
       setRouteLabel("Running");
       setConfidenceLabel("Calculating");
+      setGroundingInfo(null);
       setOperationalAlert(null);
       retrievalProgressRef.current = { sources: new Set<string>(), callCount: 0 };
+      emitReasoningEvent("pii_scan");
       emitReasoningEvent("understanding_request");
       stopVoicePlayback();
 
@@ -772,6 +778,23 @@ export default function ChatPage() {
 
         const processEvent = (event: ReturnType<typeof parseSSEFrames>["events"][number]) => {
           const eventTs = resolveStreamEventTimestamp(event);
+
+          if (event.type === "reasoning_stage" && event.stage) {
+            emitReasoningEvent(
+              event.stage as ReasoningStage,
+              event.payload ? {
+                detail: event.payload.detail,
+                intentLabel: event.payload.intentLabel,
+                confidence: event.payload.confidence as ReasoningConfidence | undefined,
+                route: event.payload.route,
+                sources: event.payload.sources,
+                callCount: event.payload.callCount,
+                verification: event.payload.verification as ReasoningEventPayload["verification"],
+                failOpen: event.payload.failOpen,
+              } : undefined,
+              event.ts || eventTs,
+            );
+          }
 
           if (event.type === "tool_call" || event.type === "progress") {
             emitReasoningEvent("understanding_request", undefined, eventTs);
@@ -844,6 +867,36 @@ export default function ChatPage() {
               },
               eventTs
             );
+
+            if (event.grounding) {
+              const g = event.grounding;
+              setGroundingInfo({
+                hasCitations: !!g.has_citations,
+                citationMarkers: Array.isArray(g.citation_markers) ? g.citation_markers : [],
+                invalidMarkers: Array.isArray(g.invalid_markers) ? g.invalid_markers : [],
+                groundingStatus: (g.grounding_status as GroundingInfo["groundingStatus"]) || "ungrounded",
+              });
+            }
+          }
+
+          if (event.type === "pii_redacted") {
+            setOperationalAlert({
+              id: generateId(),
+              severity: "advisory",
+              title: "PII Redacted",
+              message: event.message || "Low-severity PII was redacted from your query before processing.",
+              timestamp: eventTs,
+            });
+          }
+
+          if (event.type === "freshness_guardrail") {
+            setOperationalAlert({
+              id: generateId(),
+              severity: "advisory",
+              title: "Freshness Guardrail Active",
+              message: event.message || "Data freshness SLA enforced",
+              timestamp: eventTs,
+            });
           }
 
           if (event.type === "agent_error" || event.type === "error") {
@@ -1166,6 +1219,11 @@ export default function ChatPage() {
           onSendMessage={(message) => {
             void handleSendMessage(message);
           }}
+          currentReasoningDetail={
+            reasoningEvents.length > 0
+              ? reasoningEvents[reasoningEvents.length - 1]?.payload?.detail
+              : undefined
+          }
         />
 
         <FollowUpChips
@@ -1203,6 +1261,7 @@ export default function ChatPage() {
         sourceHealth={sourceHealth}
         route={routeLabel}
         confidenceLabel={confidenceLabel}
+        groundingInfo={groundingInfo}
       />
       </div>
     </div>
