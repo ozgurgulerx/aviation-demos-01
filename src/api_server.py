@@ -39,9 +39,6 @@ def health():
 def chat():
     """Main chat endpoint. Streams AF-native events using SSE."""
     data = request.get_json(silent=True) or {}
-    # Single-turn: only the latest user message is used per request.
-    # The backend does not maintain conversation history.
-    # TODO: implement multi-turn by accepting and forwarding the full messages array.
     message = data.get("message")
     retrieval_mode = data.get("retrieval_mode", "code-rag")
     conversation_id = data.get("conversation_id")
@@ -52,6 +49,22 @@ def chat():
     risk_mode = data.get("risk_mode", "standard")
     ask_recommendation = bool(data.get("ask_recommendation", False))
     demo_scenario = data.get("demo_scenario")
+
+    # Multi-turn: extract conversation history from messages array.
+    max_history_turns = int(os.getenv("MAX_CONVERSATION_HISTORY_TURNS", "3"))
+    conversation_history = None
+    raw_messages = data.get("messages")
+    if isinstance(raw_messages, list) and raw_messages:
+        pairs = [
+            {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+            for m in raw_messages
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        # Keep last N turn-pairs (each pair = 2 messages), excluding the final user message.
+        if len(pairs) > 1:
+            conversation_history = pairs[-(max_history_turns * 2 + 1):-1]
+            if not conversation_history:
+                conversation_history = None
 
     if not message:
         return jsonify({"error": "Missing 'message' field"}), 400
@@ -75,6 +88,7 @@ def chat():
                 risk_mode=risk_mode,
                 ask_recommendation=ask_recommendation,
                 demo_scenario=demo_scenario,
+                conversation_history=conversation_history,
             ):
                 yield to_sse(event)
         except Exception as exc:

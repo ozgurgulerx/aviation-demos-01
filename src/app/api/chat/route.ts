@@ -106,9 +106,6 @@ export async function POST(request: NextRequest) {
       askRecommendation,
       demoScenario,
     } = parsed.data;
-    // Single-turn: only the last user message is forwarded to the backend.
-    // The backend does not maintain conversation history; each request is independent.
-    // TODO: implement multi-turn by forwarding the full messages array to the backend.
     const lastUserMessage = messages.filter((m) => m.role === "user").pop();
     if (!lastUserMessage) {
       return new Response(
@@ -128,6 +125,7 @@ export async function POST(request: NextRequest) {
         signal: controller.signal,
         body: JSON.stringify({
           message: lastUserMessage.content,
+          messages: messages.map((m) => ({ role: m.role, content: m.content })),
           retrieval_mode: retrievalMode,
           conversation_id: conversationId,
           query_profile: queryProfile,

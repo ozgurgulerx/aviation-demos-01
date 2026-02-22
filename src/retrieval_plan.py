@@ -112,10 +112,16 @@ def _wants_airport_ops(query_l: str) -> bool:
     return any(m in query_l for m in markers)
 
 
+def _wants_nosql(query_l: str) -> bool:
+    markers = ("notam", "operational doc", "ops doc", "ground handling doc", "parking stand")
+    return any(m in query_l for m in markers)
+
+
 def build_retrieval_plan(
     request: RetrievalRequest,
     route: str,
     route_reasoning: str,
+    router_sources: Optional[List[str]] = None,
 ) -> RetrievalPlan:
     query_l = request.query.lower()
     profile = (request.query_profile or "pilot-brief").strip().lower()
@@ -134,39 +140,49 @@ def build_retrieval_plan(
             )
         )
 
-    # Baseline by route.
-    if route in ("SQL", "HYBRID"):
-        add("SQL", "Structured metrics and deterministic filters", 10)
-    if route in ("SEMANTIC", "HYBRID"):
-        add("VECTOR_OPS", "Narrative and semantic context", 20)
+    # When the router provides an explicit source list, use it as primary.
+    if router_sources:
+        for idx, src in enumerate(router_sources):
+            normed = _norm_source(src)
+            if normed:
+                add(normed, "Router-selected source", 10 + idx)
+    else:
+        # Baseline by route.
+        if route in ("SQL", "HYBRID"):
+            add("SQL", "Structured metrics and deterministic filters", 10)
+        if route in ("SEMANTIC", "HYBRID"):
+            add("VECTOR_OPS", "Narrative and semantic context", 20)
 
-    # Profile-driven enrichments.
-    if profile in ("pilot-brief", "ops-live", "operations"):
-        add("SQL", "Operational KPIs from relational tables", 10)
-        add("VECTOR_OPS", "Relevant operational narratives", 20)
+        # Profile-driven enrichments.
+        if profile in ("pilot-brief", "ops-live", "operations"):
+            add("SQL", "Operational KPIs from relational tables", 10)
+            add("VECTOR_OPS", "Relevant operational narratives", 20)
 
-    if profile in ("compliance", "regulatory"):
-        add("VECTOR_REG", "Regulatory corpus retrieval", 15)
-        add("SQL", "Fleet applicability checks", 25)
+        if profile in ("compliance", "regulatory"):
+            add("VECTOR_REG", "Regulatory corpus retrieval", 15)
+            add("SQL", "Fleet applicability checks", 25)
 
-    # Query-driven source activation.
-    if _wants_realtime(query_l) or (request.freshness_sla_minutes is not None and request.freshness_sla_minutes <= 60):
-        add("KQL", "Live operational and weather windows", 5, {"window_minutes": request.freshness_sla_minutes or 60})
+        # Query-driven source activation.
+        if _wants_realtime(query_l) or (request.freshness_sla_minutes is not None and request.freshness_sla_minutes <= 60):
+            add("KQL", "Live operational and weather windows", 5, {"window_minutes": request.freshness_sla_minutes or 60})
 
-    if _wants_graph(query_l):
-        add("GRAPH", "Dependency and impact traversal", 8, {"hops": 2})
+        if _wants_graph(query_l):
+            add("GRAPH", "Dependency and impact traversal", 8, {"hops": 2})
 
-    if _wants_regulatory(query_l):
-        add("VECTOR_REG", "NOTAM/AD and compliance lookup", 12)
+        if _wants_regulatory(query_l):
+            add("VECTOR_REG", "NOTAM/AD and compliance lookup", 12)
 
-    if _wants_narrative(query_l):
-        add("VECTOR_OPS", "Narrative similarity retrieval", 18)
+        if _wants_narrative(query_l):
+            add("VECTOR_OPS", "Narrative similarity retrieval", 18)
 
-    if _wants_airport_ops(query_l):
-        add("VECTOR_AIRPORT", "Airport/runway/station document lookup", 22)
+        if _wants_airport_ops(query_l):
+            add("VECTOR_AIRPORT", "Airport/runway/station document lookup", 22)
 
-    if request.retrieval_mode == "foundry-iq":
-        add("VECTOR_OPS", "Foundry IQ semantic-first context", 15)
+        if _wants_nosql(query_l):
+            add("NOSQL", "Operational document / NOTAM lookup", 24)
+
+        if request.retrieval_mode == "foundry-iq":
+            add("VECTOR_OPS", "Foundry IQ semantic-first context", 15)
 
     # Required sources from caller.
     for raw in request.required_sources:

@@ -58,6 +58,9 @@ python scripts/01_extract_data.py --input data/asrs/raw --output data/processed
 python scripts/02_load_database.py --mode postgres --data data/processed
 python scripts/03_create_search_index.py
 python scripts/04_upload_documents.py --data data/processed
+
+# Seed Cosmos DB with sample NOTAMs
+python scripts/13_seed_cosmos_notams.py
 ```
 
 ## Azure Tenant Context (Required)
@@ -128,6 +131,10 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - `ASRS_QUERY_TEMPLATE_JSON` — optional JSON object of fixed query params for ASRS export requests
 - `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` — PostgreSQL connection
 - `PII_ENDPOINT` / `PII_CONTAINER_ENDPOINT` — PII service URL
+- `AZURE_COSMOS_ENDPOINT` — Cosmos DB for NoSQL endpoint (NOTAM storage)
+- `AZURE_COSMOS_KEY` — Cosmos DB primary key
+- `AZURE_COSMOS_DATABASE` — Cosmos DB database name (default: `aviationrag`)
+- `AZURE_COSMOS_CONTAINER` — Cosmos DB container name (default: `notams`)
 
 ## What Is TBD
 

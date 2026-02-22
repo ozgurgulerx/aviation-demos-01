@@ -71,15 +71,31 @@ ROUTING_PROMPT = """You are a query router for an aviation safety Q&A system wit
 - quantitative answer plus narrative context
 - operational questions needing both data and context
 
+## Source Selection
+
+In addition to route, select the most appropriate data sources from:
+- SQL: PostgreSQL warehouse — for counts, rankings, exact filters, timelines, airport data, route networks
+- KQL: Fabric Eventhouse — for current weather (METAR/TAF), live flight tracking, recent hazards
+- GRAPH: Fabric Graph — for dependency paths, impact analysis, alternate airport selection
+- VECTOR_OPS: AI Search narratives — for incident reports, near-miss narratives, safety observations
+- VECTOR_REG: AI Search regulatory — for NOTAMs, Airworthiness Directives, EASA/FAA bulletins
+- VECTOR_AIRPORT: AI Search airport ops — for runway specs, station info, facility data
+- NOSQL: Fabric NoSQL — for operational documents, NOTAMs, ground handling docs, parking stands
+
+Select 1-4 sources that best answer the query. Omit sources that add no value.
+
 ## Output Format
 
 Return JSON only:
 {
     "route": "SQL|SEMANTIC|HYBRID",
     "reasoning": "Brief explanation of why this route",
-    "sql_hint": "Optional hint for SQL generation if route is SQL/HYBRID"
+    "sql_hint": "Optional hint for SQL generation if route is SQL/HYBRID",
+    "sources": ["SQL", "VECTOR_OPS"]
 }
 """
+
+from retrieval_plan import VALID_SOURCES
 
 
 class QueryRouter:
@@ -107,6 +123,14 @@ class QueryRouter:
                 result["route"] = "HYBRID"
             if "reasoning" not in result:
                 result["reasoning"] = "Default routing"
+
+            # Parse and validate sources list.
+            raw_sources = result.get("sources", [])
+            result["sources"] = (
+                [s.upper() for s in raw_sources if isinstance(s, str) and s.upper() in VALID_SOURCES]
+                if isinstance(raw_sources, list)
+                else []
+            )
 
             return result
         except Exception as exc:
@@ -145,6 +169,26 @@ class QueryRouter:
             return "HYBRID"
 
         return "HYBRID"
+
+    def smart_route(self, query: str) -> dict:
+        """Heuristic-first routing: skip LLM when keywords give a confident answer.
+
+        Returns the same dict shape as ``route()`` (route, reasoning, sql_hint, sources).
+        When ``USE_SMART_ROUTING`` is false this delegates entirely to the LLM.
+        """
+        if not os.getenv("USE_SMART_ROUTING", "true").strip().lower() in {"1", "true", "yes", "y", "on"}:
+            return self.route(query)
+
+        heuristic = self.quick_route(query)
+        if heuristic in ("SQL", "SEMANTIC"):
+            return {
+                "route": heuristic,
+                "reasoning": f"Heuristic routing (confident: {heuristic})",
+                "sql_hint": None,
+                "sources": [],
+            }
+        # HYBRID is ambiguous — escalate to LLM for better source selection.
+        return self.route(query)
 
 
 def route_query(query: str, use_llm: bool = True) -> dict:

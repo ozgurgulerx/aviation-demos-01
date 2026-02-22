@@ -100,6 +100,12 @@ FABRIC_KQL_ENDPOINT="${FABRIC_KQL_ENDPOINT:-}"
 FABRIC_GRAPH_ENDPOINT="${FABRIC_GRAPH_ENDPOINT:-}"
 FABRIC_NOSQL_ENDPOINT="${FABRIC_NOSQL_ENDPOINT:-}"
 
+# Cosmos DB settings
+COSMOS_ACCOUNT_NAME="${COSMOS_ACCOUNT_NAME:-cosmos-aviation-rag}"
+COSMOS_DATABASE_NAME="${COSMOS_DATABASE_NAME:-aviationrag}"
+COSMOS_CONTAINER_NAME="${COSMOS_CONTAINER_NAME:-notams}"
+CREATE_COSMOS="${CREATE_COSMOS:-true}"
+
 # Optional behavior
 CREATE_ACR="${CREATE_ACR:-true}"
 DEPLOY_K8S="${DEPLOY_K8S:-true}"
@@ -127,18 +133,18 @@ PG_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${PG_SERVER_RG}
 
 # Section 1: Resource Group
 if az group show -n "$RESOURCE_GROUP" >/dev/null 2>&1; then
-  echo "[1/10] Resource group exists: ${RESOURCE_GROUP}"
+  echo "[1/11] Resource group exists: ${RESOURCE_GROUP}"
 else
   az group create --name "$RESOURCE_GROUP" --location "$LOCATION" -o none
-  echo "[1/10] Created resource group: ${RESOURCE_GROUP}"
+  echo "[1/11] Created resource group: ${RESOURCE_GROUP}"
 fi
 
 # Section 2: VNet + subnets
 if az network vnet show -g "$RESOURCE_GROUP" -n "$VNET_NAME" >/dev/null 2>&1; then
-  echo "[2/10] VNet exists: ${VNET_NAME}"
+  echo "[2/11] VNet exists: ${VNET_NAME}"
 else
   az network vnet create --resource-group "$RESOURCE_GROUP" --name "$VNET_NAME" --address-prefix "$VNET_CIDR" -o none
-  echo "[2/10] Created VNet: ${VNET_NAME}"
+  echo "[2/11] Created VNet: ${VNET_NAME}"
 fi
 
 if ! az network vnet subnet show -g "$RESOURCE_GROUP" --vnet-name "$VNET_NAME" -n subnet-aks >/dev/null 2>&1; then
@@ -151,24 +157,24 @@ if ! az network vnet subnet show -g "$RESOURCE_GROUP" --vnet-name "$VNET_NAME" -
   az network vnet subnet create --resource-group "$RESOURCE_GROUP" --vnet-name "$VNET_NAME" --name subnet-privateendpoint --address-prefix "$PRIVATE_ENDPOINT_SUBNET_CIDR" --disable-private-endpoint-network-policies true -o none
 fi
 
-echo "[2/10] Subnets ready"
+echo "[2/11] Subnets ready"
 
 # Section 3: ACR
 if bool_true "$CREATE_ACR"; then
   if az acr show -g "$ACR_RESOURCE_GROUP" -n "$ACR_NAME" >/dev/null 2>&1; then
-    echo "[3/10] ACR exists: ${ACR_NAME}"
+    echo "[3/11] ACR exists: ${ACR_NAME}"
   else
     az acr create --resource-group "$ACR_RESOURCE_GROUP" --name "$ACR_NAME" --sku Basic --location "$LOCATION" -o none
-    echo "[3/10] Created ACR: ${ACR_NAME}"
+    echo "[3/11] Created ACR: ${ACR_NAME}"
   fi
 else
-  echo "[3/10] Skipping ACR creation (CREATE_ACR=${CREATE_ACR})"
+  echo "[3/11] Skipping ACR creation (CREATE_ACR=${CREATE_ACR})"
 fi
 ACR_LOGIN_SERVER="$(az acr show -g "$ACR_RESOURCE_GROUP" -n "$ACR_NAME" --query loginServer -o tsv)"
 
 # Section 4: AKS
 if az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" >/dev/null 2>&1; then
-  echo "[4/10] AKS exists: ${AKS_NAME}"
+  echo "[4/11] AKS exists: ${AKS_NAME}"
 else
   az aks create \
     --resource-group "$RESOURCE_GROUP" \
@@ -185,7 +191,7 @@ else
     --generate-ssh-keys \
     --attach-acr "$ACR_NAME" \
     -o none
-  echo "[4/10] Created AKS: ${AKS_NAME}"
+  echo "[4/11] Created AKS: ${AKS_NAME}"
 fi
 az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_NAME" --overwrite-existing
 
@@ -205,25 +211,25 @@ if ! az postgres flexible-server show -g "$PG_SERVER_RG" -n "$PG_SERVER" >/dev/n
       --sku-name "$PG_SKU" \
       --version "$PG_VERSION" \
       -o none
-    echo "[5/10] Created PostgreSQL server: ${PG_SERVER}"
+    echo "[5/11] Created PostgreSQL server: ${PG_SERVER}"
   else
     echo "PostgreSQL server not found: ${PG_SERVER_RG}/${PG_SERVER}" >&2
     echo "Set CREATE_PG_SERVER=true (and admin creds) or point PG_SERVER/PG_SERVER_RG to an existing server." >&2
     exit 1
   fi
 else
-  echo "[5/10] PostgreSQL server exists: ${PG_SERVER}"
+  echo "[5/11] PostgreSQL server exists: ${PG_SERVER}"
 fi
 
 if bool_true "$CREATE_PG_DATABASE"; then
   if az postgres flexible-server db show --resource-group "$PG_SERVER_RG" --server-name "$PG_SERVER" --database-name "$PG_DATABASE" >/dev/null 2>&1; then
-    echo "[5/10] PostgreSQL DB exists: ${PG_DATABASE}"
+    echo "[5/11] PostgreSQL DB exists: ${PG_DATABASE}"
   else
     az postgres flexible-server db create --resource-group "$PG_SERVER_RG" --server-name "$PG_SERVER" --database-name "$PG_DATABASE" -o none
-    echo "[5/10] Created PostgreSQL DB: ${PG_DATABASE}"
+    echo "[5/11] Created PostgreSQL DB: ${PG_DATABASE}"
   fi
 else
-  echo "[5/10] Skipping PostgreSQL DB create (CREATE_PG_DATABASE=${CREATE_PG_DATABASE})"
+  echo "[5/11] Skipping PostgreSQL DB create (CREATE_PG_DATABASE=${CREATE_PG_DATABASE})"
 fi
 
 # Section 6: PostgreSQL private endpoint + DNS
@@ -266,24 +272,77 @@ if bool_true "$ENABLE_POSTGRES_PRIVATE_ENDPOINT"; then
     az network private-dns record-set a add-record --resource-group "$RESOURCE_GROUP" --zone-name "$DNS_ZONE" --record-set-name "$PG_SERVER" --ipv4-address "$PRIVATE_IP" -o none
   fi
 
-  echo "[6/10] PostgreSQL private endpoint and DNS ready"
+  echo "[6/11] PostgreSQL private endpoint and DNS ready"
 else
-  echo "[6/10] Skipping PostgreSQL private endpoint setup"
+  echo "[6/11] Skipping PostgreSQL private endpoint setup"
 fi
 
-# Section 7: App Service
+# Section 7: Azure Cosmos DB (serverless, NoSQL — NOTAM storage)
+if bool_true "$CREATE_COSMOS"; then
+  if az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" >/dev/null 2>&1; then
+    echo "[7/11] Cosmos DB account exists: ${COSMOS_ACCOUNT_NAME}"
+  else
+    az cosmosdb create \
+      --resource-group "$RESOURCE_GROUP" \
+      --name "$COSMOS_ACCOUNT_NAME" \
+      --kind GlobalDocumentDB \
+      --locations regionName="$LOCATION" failoverPriority=0 isZoneRedundant=false \
+      --capabilities EnableServerless \
+      -o none
+    echo "[7/11] Created Cosmos DB account: ${COSMOS_ACCOUNT_NAME}"
+  fi
+
+  if az cosmosdb sql database show -g "$RESOURCE_GROUP" -a "$COSMOS_ACCOUNT_NAME" -n "$COSMOS_DATABASE_NAME" >/dev/null 2>&1; then
+    echo "[7/11] Cosmos database exists: ${COSMOS_DATABASE_NAME}"
+  else
+    az cosmosdb sql database create \
+      --resource-group "$RESOURCE_GROUP" \
+      --account-name "$COSMOS_ACCOUNT_NAME" \
+      --name "$COSMOS_DATABASE_NAME" \
+      -o none
+    echo "[7/11] Created Cosmos database: ${COSMOS_DATABASE_NAME}"
+  fi
+
+  if az cosmosdb sql container show -g "$RESOURCE_GROUP" -a "$COSMOS_ACCOUNT_NAME" -d "$COSMOS_DATABASE_NAME" -n "$COSMOS_CONTAINER_NAME" >/dev/null 2>&1; then
+    echo "[7/11] Cosmos container exists: ${COSMOS_CONTAINER_NAME}"
+  else
+    az cosmosdb sql container create \
+      --resource-group "$RESOURCE_GROUP" \
+      --account-name "$COSMOS_ACCOUNT_NAME" \
+      --database-name "$COSMOS_DATABASE_NAME" \
+      --name "$COSMOS_CONTAINER_NAME" \
+      --partition-key-path "/icao" \
+      -o none
+    echo "[7/11] Created Cosmos container: ${COSMOS_CONTAINER_NAME}"
+  fi
+
+  COSMOS_PRIMARY_KEY="$(az cosmosdb keys list -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query primaryMasterKey -o tsv)"
+  COSMOS_ENDPOINT="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query documentEndpoint -o tsv)"
+  export AZURE_COSMOS_ENDPOINT="$COSMOS_ENDPOINT"
+  export AZURE_COSMOS_KEY="$COSMOS_PRIMARY_KEY"
+  export AZURE_COSMOS_DATABASE="$COSMOS_DATABASE_NAME"
+  export AZURE_COSMOS_CONTAINER="$COSMOS_CONTAINER_NAME"
+else
+  echo "[7/11] Skipping Cosmos DB creation (CREATE_COSMOS=${CREATE_COSMOS})"
+  AZURE_COSMOS_ENDPOINT="${AZURE_COSMOS_ENDPOINT:-}"
+  AZURE_COSMOS_KEY="${AZURE_COSMOS_KEY:-}"
+  AZURE_COSMOS_DATABASE="${AZURE_COSMOS_DATABASE:-$COSMOS_DATABASE_NAME}"
+  AZURE_COSMOS_CONTAINER="${AZURE_COSMOS_CONTAINER:-$COSMOS_CONTAINER_NAME}"
+fi
+
+# Section 8: App Service
 if az appservice plan show -g "$RESOURCE_GROUP" -n "$APP_SERVICE_PLAN" >/dev/null 2>&1; then
-  echo "[7/10] App Service plan exists: ${APP_SERVICE_PLAN}"
+  echo "[8/11] App Service plan exists: ${APP_SERVICE_PLAN}"
 else
   az appservice plan create --resource-group "$RESOURCE_GROUP" --name "$APP_SERVICE_PLAN" --sku "$APP_SERVICE_PLAN_SKU" --is-linux -o none
-  echo "[7/10] Created App Service plan: ${APP_SERVICE_PLAN}"
+  echo "[8/11] Created App Service plan: ${APP_SERVICE_PLAN}"
 fi
 
 if az webapp show -g "$RESOURCE_GROUP" -n "$WEBAPP_NAME" >/dev/null 2>&1; then
-  echo "[7/10] Web App exists: ${WEBAPP_NAME}"
+  echo "[8/11] Web App exists: ${WEBAPP_NAME}"
 else
   az webapp create --resource-group "$RESOURCE_GROUP" --plan "$APP_SERVICE_PLAN" --name "$WEBAPP_NAME" --runtime "NODE:20-lts" -o none
-  echo "[7/10] Created Web App: ${WEBAPP_NAME}"
+  echo "[8/11] Created Web App: ${WEBAPP_NAME}"
 fi
 
 az webapp identity assign --resource-group "$RESOURCE_GROUP" --name "$WEBAPP_NAME" -o none
@@ -326,7 +385,7 @@ az webapp config appsettings set \
   -o none
 az webapp config set --resource-group "$RESOURCE_GROUP" --name "$WEBAPP_NAME" --startup-file "node server.js" -o none
 
-echo "[7/10] App Service configured"
+echo "[8/11] App Service configured"
 
 # Section 8: Render/apply k8s runtime manifests
 if bool_true "$DEPLOY_K8S"; then
@@ -378,9 +437,9 @@ if bool_true "$DEPLOY_K8S"; then
     --docker-password "$ACR_PASSWORD" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-  echo "[8/10] Kubernetes manifests applied"
+  echo "[9/11] Kubernetes manifests applied"
 else
-  echo "[8/10] Skipping Kubernetes deployment"
+  echo "[9/11] Skipping Kubernetes deployment"
 fi
 
 # Section 9: GitHub OIDC app + federated credential
@@ -411,13 +470,13 @@ if bool_true "$SETUP_GITHUB_OIDC"; then
     }" -o none
   fi
 
-  echo "[9/10] GitHub OIDC configured"
+  echo "[10/11] GitHub OIDC configured"
 else
   APP_ID=""
-  echo "[9/10] Skipping GitHub OIDC setup"
+  echo "[10/11] Skipping GitHub OIDC setup"
 fi
 
-# Section 10: Summary
+# Section 11: Summary
 TENANT_ID="$(az account show --query tenantId -o tsv)"
 
 echo
@@ -429,6 +488,7 @@ echo "AKS Cluster    : ${AKS_NAME}"
 echo "ACR            : ${ACR_LOGIN_SERVER}"
 echo "Web App        : https://${WEBAPP_NAME}.azurewebsites.net"
 echo "PostgreSQL     : ${PG_SERVER}.postgres.database.azure.com / ${PG_DATABASE}"
+echo "Cosmos DB      : ${AZURE_COSMOS_ENDPOINT:-not configured} / ${COSMOS_DATABASE_NAME} / ${COSMOS_CONTAINER_NAME}"
 echo "PII Endpoint   : ${PII_ENDPOINT}"
 echo
 
@@ -442,6 +502,7 @@ echo "  AZURE_OPENAI_API_KEY  = <value>"
 echo "  AZURE_OPENAI_CLIENT_SECRET = <optional: Entra client secret for voice token auth>"
 echo "  AZURE_SEARCH_ADMIN_KEY= <value>"
 echo "  PGPASSWORD            = <${PG_READONLY_USER} password>"
+echo "  AZURE_COSMOS_KEY      = <Cosmos DB primary key>"
 echo
 echo "GitHub repository variables to set/update:"
 echo "  AZURE_RESOURCE_GROUP=${RESOURCE_GROUP}"
@@ -472,6 +533,9 @@ echo "  AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=${AZURE_OPENAI_MANAGED_IDENTITY_
 echo "  AZURE_OPENAI_TENANT_ID=${AZURE_OPENAI_TENANT_ID}"
 echo "  AZURE_OPENAI_CLIENT_ID=${AZURE_OPENAI_CLIENT_ID}"
 echo "  AZURE_SEARCH_ENDPOINT=${AZURE_SEARCH_ENDPOINT}"
+echo "  AZURE_COSMOS_ENDPOINT=${AZURE_COSMOS_ENDPOINT:-}"
+echo "  AZURE_COSMOS_DATABASE=${COSMOS_DATABASE_NAME}"
+echo "  AZURE_COSMOS_CONTAINER=${COSMOS_CONTAINER_NAME}"
 echo
 
 echo "Next steps:"

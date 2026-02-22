@@ -25,9 +25,12 @@ from typing import Any, Dict, Generator, Iterable, List, Optional
 
 from concurrent.futures import ThreadPoolExecutor
 
+import re
+
 from af_context_provider import AviationRagContextProvider
 from af_tools import AviationRagTools, build_agent_framework_tools
-from unified_retriever import Citation, UnifiedRetriever
+from pii_filter import PII_HIGH_SEVERITY, PII_LOW_SEVERITY
+from unified_retriever import Citation, UnifiedRetriever, _truncate_context_to_budget, _check_answer_grounding
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +301,7 @@ class AgentFrameworkRuntime:
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
         demo_scenario: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         _t0_total = time.perf_counter()
         sid = session_id or str(uuid.uuid4())
@@ -341,7 +345,7 @@ class AgentFrameworkRuntime:
             return self.retriever.check_pii(query)
 
         def _routing_task():
-            return self.retriever.router.route(query)
+            return self.retriever.router.smart_route(query)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             pii_future = pool.submit(_pii_task)
@@ -359,18 +363,48 @@ class AgentFrameworkRuntime:
         )
 
         if pii_result.has_pii:
-            warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
-            for event in self._emit_text_chunks(warning):
-                yield event
-            yield {
-                "type": "agent_done",
-                "isVerified": False,
-                "route": "BLOCKED",
-                "reasoning": "PII policy blocked request",
-                "sessionId": sid,
-                "framework": self._framework_label,
-            }
-            return
+            pii_tiered = os.getenv("PII_TIERED_MODE", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+            if pii_tiered:
+                high = [e for e in pii_result.entities if e.category in PII_HIGH_SEVERITY]
+                low = [e for e in pii_result.entities if e.category in PII_LOW_SEVERITY]
+                if high:
+                    # High-severity PII → block as before.
+                    warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
+                    for event in self._emit_text_chunks(warning):
+                        yield event
+                    yield {
+                        "type": "agent_done",
+                        "isVerified": False,
+                        "route": "BLOCKED",
+                        "reasoning": "PII policy blocked request (high-severity)",
+                        "sessionId": sid,
+                        "framework": self._framework_label,
+                    }
+                    return
+                elif low and pii_result.redacted_text:
+                    # Low-severity PII → redact and continue.
+                    query = pii_result.redacted_text
+                    yield {
+                        "type": "pii_redacted",
+                        "stage": "pii",
+                        "message": f"Low-severity PII redacted: {', '.join(set(e.category for e in low))}",
+                        "status": "info",
+                        "sessionId": sid,
+                    }
+            else:
+                # Non-tiered mode: block all PII.
+                warning = self.retriever.pii_filter.format_warning(pii_result.entities)  # type: ignore[attr-defined]
+                for event in self._emit_text_chunks(warning):
+                    yield event
+                yield {
+                    "type": "agent_done",
+                    "isVerified": False,
+                    "route": "BLOCKED",
+                    "reasoning": "PII policy blocked request",
+                    "sessionId": sid,
+                    "framework": self._framework_label,
+                }
+                return
 
         if self._af_enabled:
             try:
@@ -386,6 +420,7 @@ class AgentFrameworkRuntime:
                     ask_recommendation=ask_recommendation,
                     demo_scenario=demo_scenario,
                     precomputed_route=precomputed_route,
+                    conversation_history=conversation_history,
                 )
                 return
             except Exception as exc:
@@ -409,6 +444,7 @@ class AgentFrameworkRuntime:
             ask_recommendation=ask_recommendation,
             demo_scenario=demo_scenario,
             precomputed_route=precomputed_route,
+            conversation_history=conversation_history,
         )
         logger.info("perf stage=%s ms=%.1f", "run_stream_total", (time.perf_counter() - _t0_total) * 1000)
 
@@ -425,6 +461,7 @@ class AgentFrameworkRuntime:
         ask_recommendation: bool,
         demo_scenario: Optional[str],
         precomputed_route: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         session = self._get_or_create_session(session_id)
         call_id = str(uuid.uuid4())
@@ -481,16 +518,17 @@ class AgentFrameworkRuntime:
         answer = self._invoke_agent(prompt=prompt, session=session, session_id=session_id)
         if not answer.strip():
             # AF agent returned nothing — use true streaming synthesis.
+            _filter = self.retriever._filter_error_rows
             vector_rows = (
-                list(ctx.source_results.get("VECTOR_REG", []))
-                + list(ctx.source_results.get("VECTOR_OPS", []))
-                + list(ctx.source_results.get("VECTOR_AIRPORT", []))
+                _filter(list(ctx.source_results.get("VECTOR_REG", [])))
+                + _filter(list(ctx.source_results.get("VECTOR_OPS", [])))
+                + _filter(list(ctx.source_results.get("VECTOR_AIRPORT", [])))
             )
-            synthesis_context = {
-                "sql_results": ctx.sql_results[:12],
-                "kql_results": ctx.source_results.get("KQL", [])[:8],
-                "graph_results": ctx.source_results.get("GRAPH", [])[:8],
-                "nosql_results": ctx.source_results.get("NOSQL", [])[:8],
+            synthesis_context: Dict[str, Any] = {
+                "sql_results": _filter(ctx.sql_results[:12]),
+                "kql_results": _filter(ctx.source_results.get("KQL", [])[:8]),
+                "graph_results": _filter(ctx.source_results.get("GRAPH", [])[:8]),
+                "nosql_results": _filter(ctx.source_results.get("NOSQL", [])[:8]),
                 "vector_results": [
                     {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
                     for row in vector_rows[:12]
@@ -499,9 +537,17 @@ class AgentFrameworkRuntime:
                 "coverage_summary": ctx.coverage_summary,
                 "conflict_summary": ctx.conflict_summary,
             }
-            for event in self.retriever._synthesize_answer_stream(query, synthesis_context, ctx.route):
+            budget = int(os.getenv("SYNTHESIS_TOKEN_BUDGET", "6000"))
+            if budget > 0:
+                synthesis_context = _truncate_context_to_budget(synthesis_context, budget)
+            af_answer_parts: List[str] = []
+            for event in self.retriever._synthesize_answer_stream(query, synthesis_context, ctx.route, conversation_history=conversation_history):
+                if event.get("type") == "agent_update" and event.get("content"):
+                    af_answer_parts.append(str(event["content"]))
                 yield event
+            af_answer_text = "".join(af_answer_parts)
         else:
+            af_answer_text = answer
             for event in self._emit_text_chunks(answer):
                 yield event
 
@@ -516,6 +562,8 @@ class AgentFrameworkRuntime:
         else:
             is_verified = len(ctx.citations) > 0
 
+        grounding = _check_answer_grounding(af_answer_text, len(ctx.citations))
+
         yield {
             "type": "agent_done",
             "isVerified": is_verified,
@@ -523,6 +571,7 @@ class AgentFrameworkRuntime:
             "reasoning": ctx.reasoning,
             "sessionId": session_id,
             "framework": self._framework_label,
+            "grounding": grounding,
         }
 
     def _run_with_local_pipeline(
@@ -538,6 +587,7 @@ class AgentFrameworkRuntime:
         ask_recommendation: bool,
         demo_scenario: Optional[str],
         precomputed_route: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         call_id = str(uuid.uuid4())
         yield {
@@ -605,16 +655,17 @@ class AgentFrameworkRuntime:
             },
         }
 
+        _filter = self.retriever._filter_error_rows
         vector_rows = (
-            list(source_results.get("VECTOR_REG", []))
-            + list(source_results.get("VECTOR_OPS", []))
-            + list(source_results.get("VECTOR_AIRPORT", []))
+            _filter(list(source_results.get("VECTOR_REG", [])))
+            + _filter(list(source_results.get("VECTOR_OPS", [])))
+            + _filter(list(source_results.get("VECTOR_AIRPORT", [])))
         )
-        synthesis_context = {
-            "sql_results": sql_results[:12],
-            "kql_results": source_results.get("KQL", [])[:8],
-            "graph_results": source_results.get("GRAPH", [])[:8],
-            "nosql_results": source_results.get("NOSQL", [])[:8],
+        synthesis_context: Dict[str, Any] = {
+            "sql_results": _filter(sql_results[:12]),
+            "kql_results": _filter(source_results.get("KQL", [])[:8]),
+            "graph_results": _filter(source_results.get("GRAPH", [])[:8]),
+            "nosql_results": _filter(source_results.get("NOSQL", [])[:8]),
             "vector_results": [
                 {k: str(v)[:200] for k, v in row.items() if k != "content_vector"}
                 for row in vector_rows[:12]
@@ -623,10 +674,17 @@ class AgentFrameworkRuntime:
             "coverage_summary": coverage_summary,
             "conflict_summary": conflict_summary,
         }
+        budget = int(os.getenv("SYNTHESIS_TOKEN_BUDGET", "6000"))
+        if budget > 0:
+            synthesis_context = _truncate_context_to_budget(synthesis_context, budget)
 
         # True streaming: yield tokens as they arrive from the LLM.
-        for event in self.retriever._synthesize_answer_stream(query, synthesis_context, route):
+        local_answer_parts: List[str] = []
+        for event in self.retriever._synthesize_answer_stream(query, synthesis_context, route, conversation_history=conversation_history):
+            if event.get("type") == "agent_update" and event.get("content"):
+                local_answer_parts.append(str(event["content"]))
             yield event
+        local_answer_text = "".join(local_answer_parts)
 
         if citations_payload:
             citations = [
@@ -649,6 +707,8 @@ class AgentFrameworkRuntime:
         else:
             local_is_verified = len(citations_payload) > 0
 
+        local_grounding = _check_answer_grounding(local_answer_text, len(citations_payload))
+
         yield {
             "type": "agent_done",
             "isVerified": local_is_verified,
@@ -656,6 +716,7 @@ class AgentFrameworkRuntime:
             "reasoning": reasoning,
             "sessionId": session_id,
             "framework": "local-fallback",
+            "grounding": local_grounding,
         }
 
     def _invoke_agent(self, prompt: str, session: Any, session_id: str) -> str:

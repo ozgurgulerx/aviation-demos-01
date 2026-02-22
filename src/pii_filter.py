@@ -39,6 +39,14 @@ PII_CATEGORIES = [
     "IPAddress",
 ]
 
+# Severity tiers for tiered PII handling (3.2).
+PII_HIGH_SEVERITY = {
+    "USSocialSecurityNumber", "CreditCardNumber", "USBankAccountNumber",
+    "InternationalBankingAccountNumber", "USPassportNumber", "USDriversLicenseNumber",
+    "USIndividualTaxpayerIdentification", "SWIFTCode",
+}
+PII_LOW_SEVERITY = {"Person", "PersonType", "PhoneNumber", "Email", "Address", "IPAddress"}
+
 
 @dataclass
 class PiiEntity:

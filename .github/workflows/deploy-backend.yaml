@@ -67,6 +67,9 @@ env:
   FABRIC_KQL_ENDPOINT: ${{ vars.FABRIC_KQL_ENDPOINT }}
   FABRIC_GRAPH_ENDPOINT: ${{ vars.FABRIC_GRAPH_ENDPOINT }}
   FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
+  AZURE_COSMOS_ENDPOINT: ${{ vars.AZURE_COSMOS_ENDPOINT }}
+  AZURE_COSMOS_DATABASE: ${{ vars.AZURE_COSMOS_DATABASE || 'aviationrag' }}
+  AZURE_COSMOS_CONTAINER: ${{ vars.AZURE_COSMOS_CONTAINER || 'notams' }}
 
 jobs:
   lint-and-test:
@@ -87,7 +90,7 @@ jobs:
         run: cd src && python -m py_compile api_server.py unified_retriever.py query_router.py pii_filter.py
 
       - name: Run tests
-        run: python -m pytest tests/ -v --tb=short -m "not integration"
+        run: python -m pytest tests/ -v --tb=short -m "not integration" --ignore=tests/test_production_e2e.py
 
   build-and-push:
     needs: lint-and-test

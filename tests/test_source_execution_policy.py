@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -40,6 +40,7 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         retriever.sql_writer = _Writer()
         retriever.sql_generator = _Writer()
         retriever.use_legacy_sql_generator = False
+        retriever._cosmos_container = None
         return retriever
 
     def test_execute_sql_query_success(self):
@@ -140,9 +141,58 @@ class SourceExecutionPolicyTests(unittest.TestCase):
 
     def test_nosql_blocked_without_endpoint(self):
         retriever = self._build_retriever()
+        retriever._cosmos_container = None
         with patch.object(ur, "FABRIC_NOSQL_ENDPOINT", ""):
             rows, _citations = retriever.query_nosql("notam snapshot")
         self.assertEqual(rows[0].get("error_code"), "source_unavailable")
+
+    def test_nosql_cosmos_returns_docs(self):
+        retriever = self._build_retriever()
+        mock_container = MagicMock()
+        mock_container.query_items.return_value = [
+            {"id": "NOTAM-A0001-26-KJFK", "notam_number": "A0001/26", "icao": "KJFK", "content": "RWY 13R/31L CLSD", "status": "active"},
+            {"id": "NOTAM-A0002-26-KJFK", "notam_number": "A0002/26", "icao": "KJFK", "content": "TWY B CLSD", "status": "active"},
+        ]
+        retriever._cosmos_container = mock_container
+
+        rows, citations = retriever.query_nosql("active NOTAMs for JFK")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["icao"], "KJFK")
+        self.assertGreaterEqual(len(citations), 1)
+        self.assertEqual(citations[0].source_type, "NOSQL")
+        self.assertIn("KJFK", citations[0].title)
+
+    def test_nosql_cosmos_extracts_airports(self):
+        retriever = self._build_retriever()
+        mock_container = MagicMock()
+        mock_container.query_items.return_value = [
+            {"id": "NOTAM-1", "notam_number": "A0001/26", "icao": "KJFK", "content": "test", "status": "active"},
+        ]
+        retriever._cosmos_container = mock_container
+
+        retriever.query_nosql("NOTAMs for JFK and Istanbul")
+        call_kwargs = mock_container.query_items.call_args
+        query_str = call_kwargs.kwargs.get("query") or call_kwargs[1].get("query") or (call_kwargs[0][0] if call_kwargs[0] else "")
+        params = call_kwargs.kwargs.get("parameters") or call_kwargs[1].get("parameters", [])
+        icao_values = [p["value"] for p in params]
+        self.assertIn("KJFK", icao_values)
+
+    def test_nosql_cosmos_error_returns_structured_error(self):
+        retriever = self._build_retriever()
+        mock_container = MagicMock()
+        mock_container.query_items.side_effect = RuntimeError("cosmos connection lost")
+        retriever._cosmos_container = mock_container
+
+        rows, citations = retriever.query_nosql("active NOTAMs")
+        self.assertEqual(rows[0].get("error_code"), "cosmos_runtime_error")
+        self.assertEqual(len(citations), 0)
+
+    def test_source_mode_nosql_live_with_cosmos(self):
+        retriever = self._build_retriever()
+        retriever._cosmos_container = MagicMock()
+        with patch.object(ur, "FABRIC_NOSQL_ENDPOINT", ""):
+            mode = retriever.source_mode("NOSQL")
+        self.assertEqual(mode, "live")
 
     def test_vector_source_blocked_without_search_client(self):
         retriever = self._build_retriever()
@@ -187,6 +237,45 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         self.assertIn("KEWR", airports)
         self.assertNotIn("RISK", airports)
         self.assertNotIn("YORK", airports)
+
+    def test_nosql_cosmos_empty_result(self):
+        retriever = self._build_retriever()
+        mock_container = MagicMock()
+        mock_container.query_items.return_value = []
+        retriever._cosmos_container = mock_container
+
+        rows, citations = retriever.query_nosql("active NOTAMs for JFK")
+        self.assertEqual(len(citations), 0)
+        self.assertTrue(rows)
+        self.assertIn(rows[0].get("error_code"), {"nosql_runtime_error"})
+
+    def test_nosql_cosmos_missing_fields_in_doc(self):
+        retriever = self._build_retriever()
+        mock_container = MagicMock()
+        mock_container.query_items.return_value = [
+            {"id": "doc-1", "icao": "KJFK", "status": "active"},
+        ]
+        retriever._cosmos_container = mock_container
+
+        rows, citations = retriever.query_nosql("NOTAMs for JFK")
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(len(citations), 1)
+        self.assertIn("KJFK", citations[0].title)
+
+    def test_nosql_no_airports_extracted(self):
+        retriever = self._build_retriever()
+        mock_container = MagicMock()
+        mock_container.query_items.return_value = [
+            {"id": "generic-1", "notam_number": "G0001/26", "icao": "ZZZZ", "content": "test", "status": "active"},
+        ]
+        retriever._cosmos_container = mock_container
+
+        rows, citations = retriever.query_nosql("show all active notices")
+        call_kwargs = mock_container.query_items.call_args
+        query_str = call_kwargs.kwargs.get("query") or call_kwargs[1].get("query") or (call_kwargs[0][0] if call_kwargs[0] else "")
+        self.assertIn("LIMIT 30", query_str)
+        self.assertNotIn("@icao", query_str)
+        self.assertTrue(call_kwargs.kwargs.get("enable_cross_partition_query", False))
 
 
 if __name__ == "__main__":

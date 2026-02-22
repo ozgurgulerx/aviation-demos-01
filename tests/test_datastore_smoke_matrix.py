@@ -32,6 +32,11 @@ def _build_mock_retriever() -> UnifiedRetriever:
     retriever.sql_writer = _Writer()
     retriever.sql_generator = _Writer()
     retriever.use_legacy_sql_generator = False
+    retriever._cosmos_container = None
+    retriever._embedding_cache = {}
+    retriever._embedding_cache_order = []
+    retriever._embedding_cache_lock = __import__("threading").Lock()
+    retriever._embedding_cache_size = 256
     return retriever
 
 
