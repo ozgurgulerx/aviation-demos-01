@@ -380,7 +380,9 @@ class UnifiedRetriever:
         if source_norm == "KQL":
             return "live" if FABRIC_KQL_ENDPOINT else "blocked"
         if source_norm == "GRAPH":
-            return "live" if FABRIC_GRAPH_ENDPOINT else "blocked"
+            if FABRIC_GRAPH_ENDPOINT:
+                return "live"
+            return "fallback" if self.sql_available else "blocked"
         if source_norm == "NOSQL":
             return "live" if FABRIC_NOSQL_ENDPOINT else "blocked"
         if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
@@ -1051,7 +1053,14 @@ class UnifiedRetriever:
         stripped = re.sub(r'\blet\s+\w+\s*=\s*[^;]*;', '', stripped)
         if ";" in stripped:
             return "kql_multiple_statements_not_allowed"
+        # After stripping let bindings, block Kusto management commands (dot-commands)
+        # that could leak info or mutate state (e.g. `.show commands`, `.set-or-replace`).
+        if re.search(r'\.\s*(show|set|append|move|rename|replace|enable|disable)\b', stripped, flags=re.IGNORECASE):
+            return "kql_contains_blocked_management_command"
         return None
+
+    # Time columns used by known Kusto tables.
+    _KQL_TIME_COLUMNS = ("time_position", "valid_time_from", "valid_time_to", "timestamp")
 
     def _ensure_kql_window(self, csl: str, window_minutes: int) -> str:
         text = (csl or "").strip()
@@ -1062,12 +1071,13 @@ class UnifiedRetriever:
             return text
         if re.search(r"\bbetween\b.*\bdatetime\b", text, flags=re.IGNORECASE):
             return text
-        # Only append a time filter when "timestamp" appears as a column reference
-        # in a pipe expression (not inside a string literal).
+        # Only append a time filter when a known time column appears as a column
+        # reference in a pipe expression (not inside a string literal).
         stripped = re.sub(r'"[^"]*"', '', text)
         stripped = re.sub(r"'[^']*'", '', stripped)
-        if re.search(r"\btimestamp\b", stripped, flags=re.IGNORECASE):
-            return f"{text}\n| where timestamp > ago({max(1, int(window_minutes))}m)"
+        for col in self._KQL_TIME_COLUMNS:
+            if re.search(rf"\b{col}\b", stripped, flags=re.IGNORECASE):
+                return f"{text}\n| where {col} > ago({max(1, int(window_minutes))}m)"
         return text
 
     def query_kql(self, query: str, window_minutes: int = 60) -> Tuple[List[Dict], List[Citation]]:

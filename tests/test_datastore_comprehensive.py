@@ -526,22 +526,61 @@ class TestKQLValidation(unittest.TestCase):
         )
         self.assertIsNotNone(result, "Bare semicolon between queries should be rejected")
 
-    def test_ensures_window_when_missing(self):
-        csl = self.retriever._ensure_kql_window("weather_obs | take 10", 60)
-        # Should not add window if no timestamp column reference
-        self.assertEqual(csl, "weather_obs | take 10")
+    def test_rejects_dot_show_command(self):
+        """Management dot-commands like .show should be blocked."""
+        result = self.retriever._validate_kql_query('.show database schema')
+        self.assertEqual(result, "kql_contains_blocked_management_command")
+
+    def test_rejects_dot_set_command(self):
+        """Management dot-commands like .set should be blocked."""
+        result = self.retriever._validate_kql_query('.set-or-replace my_table <| opensky_states | take 5')
+        self.assertIsNotNone(result)
+
+    def test_rejects_dot_command_after_let_stripping(self):
+        """Dot-commands hidden after let bindings should still be blocked."""
+        result = self.retriever._validate_kql_query(
+            'let x = 1; .show tables'
+        )
+        self.assertIsNotNone(result, "Dot-command after let should be blocked")
+
+    def test_ensures_window_when_no_time_column(self):
+        csl = self.retriever._ensure_kql_window("some_table | take 10", 60)
+        # Should not add window if no known time column is referenced
+        self.assertEqual(csl, "some_table | take 10")
 
     def test_preserves_existing_ago_window(self):
-        original = "weather_obs | where timestamp > ago(30m)"
+        original = "opensky_states | where time_position > ago(30m)"
         csl = self.retriever._ensure_kql_window(original, 60)
         self.assertEqual(csl, original)
 
-    def test_adds_window_when_timestamp_present(self):
+    def test_adds_window_for_timestamp_column(self):
         csl = self.retriever._ensure_kql_window(
-            "weather_obs | where timestamp > '2024-01-01'",
+            "some_table | where timestamp > '2024-01-01'",
             60
         )
         self.assertIn("ago(60m)", csl)
+        self.assertIn("timestamp", csl)
+
+    def test_adds_window_for_time_position_column(self):
+        csl = self.retriever._ensure_kql_window(
+            "opensky_states | project callsign, time_position, latitude",
+            90
+        )
+        self.assertIn("ago(90m)", csl)
+        self.assertIn("time_position", csl)
+
+    def test_adds_window_for_valid_time_from_column(self):
+        csl = self.retriever._ensure_kql_window(
+            "hazards_airsigmets | where valid_time_from > datetime(2024-01-01)",
+            120
+        )
+        # Already has datetime literal but not ago(), so window is added using valid_time_from
+        self.assertIn("ago(120m)", csl)
+
+    def test_preserves_existing_between_datetime_window(self):
+        original = 'hazards_airsigmets | where valid_time_from between (datetime("2024-01-01") .. datetime("2024-02-01"))'
+        csl = self.retriever._ensure_kql_window(original, 60)
+        self.assertEqual(csl, original)
 
 
 # ====================================================================
@@ -550,21 +589,40 @@ class TestKQLValidation(unittest.TestCase):
 
 
 class TestGraphSourceBehavior(unittest.TestCase):
-    """Test graph source returns unavailable when no live endpoint."""
+    """Test graph source behavior when no live Fabric endpoint is configured.
+
+    With PG fallback enabled, query_graph attempts PostgreSQL when the Fabric
+    endpoint is empty.  The mock PG doesn't have ops_graph_edges, so the
+    fallback reports source_unavailable with a table-not-found message.
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.retriever = _build_retriever()
 
-    def test_graph_blocked_without_endpoint(self):
+    def test_graph_pg_fallback_without_endpoint(self):
+        """Without Fabric endpoint, query_graph falls back to PG which reports
+        ops_graph_edges table not found (mock doesn't have it)."""
         with patch.object(ur, "FABRIC_GRAPH_ENDPOINT", ""):
             rows, citations = self.retriever.query_graph("IST dependency path", hops=2)
             self.assertEqual(rows[0].get("error_code"), "source_unavailable")
+            self.assertIn("ops_graph_edges", rows[0].get("error", ""))
 
-    def test_graph_blocked_unknown_entity(self):
+    def test_graph_pg_fallback_unknown_entity(self):
+        """Even with unknown entities, fallback to PG is attempted."""
         with patch.object(ur, "FABRIC_GRAPH_ENDPOINT", ""):
             rows, citations = self.retriever.query_graph("XYZZY unknown airport", hops=1)
             self.assertEqual(rows[0].get("error_code"), "source_unavailable")
+
+    def test_graph_fallback_when_sql_unavailable(self):
+        """When both Fabric and SQL are unavailable, graph should report source_unavailable."""
+        retriever = _build_retriever()
+        retriever.sql_available = False
+        retriever.sql_unavailable_reason = "test_disabled"
+        with patch.object(ur, "FABRIC_GRAPH_ENDPOINT", ""):
+            rows, citations = retriever.query_graph("IST dependency", hops=1)
+            self.assertEqual(rows[0].get("error_code"), "source_unavailable")
+            self.assertIn("SQL unavailable", rows[0].get("error", ""))
 
 
 # ====================================================================
@@ -725,7 +783,15 @@ class TestSourceModePolicy(unittest.TestCase):
     def test_graph_source_mode_without_endpoint(self):
         with patch.object(ur, "FABRIC_GRAPH_ENDPOINT", ""):
             mode = self.retriever.source_mode("GRAPH")
-            self.assertIn(mode, ("blocked", "live"))
+            # With SQL available (mock PG), mode is "fallback"; without SQL, "blocked"
+            self.assertEqual(mode, "fallback")
+
+    def test_graph_source_mode_blocked_when_no_sql(self):
+        retriever = _build_retriever()
+        retriever.sql_available = False
+        with patch.object(ur, "FABRIC_GRAPH_ENDPOINT", ""):
+            mode = retriever.source_mode("GRAPH")
+            self.assertEqual(mode, "blocked")
 
     def test_nosql_source_mode_without_endpoint(self):
         with patch.object(ur, "FABRIC_NOSQL_ENDPOINT", ""):
