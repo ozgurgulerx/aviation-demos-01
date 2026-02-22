@@ -130,6 +130,7 @@ def upload_documents(
     batch_size: int,
     dry_run: bool,
     embedding_mode: str,
+    start_offset: int = 0,
 ) -> None:
     credential = DefaultAzureCredential()
     openai_client = None
@@ -182,14 +183,22 @@ def upload_documents(
         print("No documents to upload.")
         return
 
-    print(f"Preparing {len(docs)} documents from {docs_path}")
+    # Apply start offset for resumable uploads
+    if start_offset > 0:
+        if start_offset >= len(docs):
+            print(f"Start offset {start_offset} >= total docs {len(docs)}, nothing to do.")
+            return
+        docs = docs[start_offset:]
+        print(f"Resuming from offset {start_offset}, processing {len(docs)} remaining documents")
+    else:
+        print(f"Preparing {len(docs)} documents from {docs_path}")
 
     for idx, doc in enumerate(docs, start=1):
         if embedding_mode == "hash":
             doc["content_vector"] = get_embedding_hash(doc["content"], VECTOR_DIMENSIONS)
         else:
             doc["content_vector"] = get_embedding_azure(openai_client, doc["content"], embedding_model)
-        if idx % 100 == 0:
+        if idx % 1000 == 0:
             print(f"  Embedded {idx}/{len(docs)}")
 
     if dry_run:
@@ -212,7 +221,8 @@ def upload_documents(
 
         uploaded += batch_uploaded
         failed += batch_failed
-        print(f"  Batch {batch_no}: uploaded={batch_uploaded}, failed={batch_failed}")
+        if uploaded % 1000 < batch_size:
+            print(f"  Progress: {uploaded} uploaded, {failed} failed ({batch_no} batches)")
 
     print("Upload complete")
     print(f"  Index: {INDEX_NAME}")
@@ -225,7 +235,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Upload ASRS documents to Azure AI Search")
     parser.add_argument("--data", default="data/processed", help="Directory with processed documents")
     parser.add_argument("--documents-file", default="asrs_documents.jsonl", help="JSONL file containing docs")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Upload batch size")
+    parser.add_argument("--batch-size", type=int, default=500, help="Upload batch size (default 500)")
+    parser.add_argument("--start-offset", type=int, default=0, help="Skip first N docs (for resumable uploads)")
     parser.add_argument("--dry-run", action="store_true", help="Compute embeddings but do not upload")
     parser.add_argument(
         "--embedding-mode",
@@ -238,7 +249,10 @@ def main() -> None:
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
 
-    upload_documents(args.data, args.documents_file, args.batch_size, args.dry_run, args.embedding_mode)
+    upload_documents(
+        args.data, args.documents_file, args.batch_size, args.dry_run,
+        args.embedding_mode, start_offset=args.start_offset,
+    )
 
 
 if __name__ == "__main__":

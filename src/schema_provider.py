@@ -151,10 +151,14 @@ class SchemaProvider:
         return {
             "source": "builtin-default",
             "collected_at": self.retriever._now_iso(),
-            "schema_version": "graph-default-v2",
-            "node_types": ["Airport", "FlightLeg", "Tail", "Intent", "EvidenceType", "Tool"],
-            "edge_types": ["DEPARTS", "ARRIVES", "OPERATES", "REQUIRES", "AUTHORITATIVE_IN", "EXPANDS_TO"],
-            # Aspirational types not yet in data:
-            # node: Runway, Station, Alternate
-            # edge: HAS_RUNWAY, HAS_STATION, HAS_ALTERNATE
+            "schema_version": "graph-default-v3",
+            "node_types": ["Airport", "Runway", "FlightLeg", "Tail", "Crew",
+                           "NOTAM", "Route", "Airline", "Navaid", "Frequency",
+                           "ASRSReport", "Intent", "EvidenceType", "Tool"],
+            "edge_types": ["DEPARTS", "ARRIVES", "OPERATES", "HAS_RUNWAY",
+                           "SERVED_BY_ROUTE", "OPERATED_BY", "HAS_NAVAID",
+                           "HAS_FREQUENCY", "AFFECTS", "AFFECTS_RUNWAY",
+                           "CREWED_BY", "MEL_ON", "REPORTED_AT", "CONNECTS",
+                           "SAME_CITY", "REQUIRES", "AUTHORITATIVE_IN",
+                           "EXPANDS_TO"],
         }

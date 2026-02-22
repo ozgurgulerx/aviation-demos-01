@@ -1343,8 +1343,15 @@ class UnifiedRetriever:
             detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
             return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
 
-    def _query_graph_pg_fallback(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
-        """Fallback: query ops_graph_edges from PostgreSQL with iterative BFS multi-hop traversal."""
+    def _query_graph_pg_fallback(self, query: str, hops: int = 2, edge_types: Optional[List[str]] = None) -> Tuple[List[Dict], List[Citation]]:
+        """Fallback: query ops_graph_edges from PostgreSQL with iterative BFS multi-hop traversal.
+
+        Args:
+            query: Natural language query to extract seed tokens from.
+            hops: Maximum BFS hops (capped at 4).
+            edge_types: Optional list of edge types to filter on (e.g. ["HAS_RUNWAY", "CONNECTS"]).
+                        When provided, only edges of these types are traversed.
+        """
         if not self.sql_available:
             return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable")], []
 
@@ -1354,9 +1361,16 @@ class UnifiedRetriever:
         if "ops_graph_edges" not in table_names:
             return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL")], []
 
+        # Build optional edge-type filter clause.
+        edge_filter_clause = ""
+        if edge_types:
+            safe_types = [t.replace("'", "''").upper() for t in edge_types]
+            type_list = ", ".join(f"'{t}'" for t in safe_types)
+            edge_filter_clause = f" AND edge_type IN ({type_list})"
+
         tokens = self._query_tokens(query)
         if not tokens:
-            sql = "SELECT src_type, src_id, edge_type, dst_type, dst_id FROM ops_graph_edges LIMIT 30"
+            sql = f"SELECT src_type, src_id, edge_type, dst_type, dst_id FROM ops_graph_edges WHERE 1=1{edge_filter_clause} LIMIT 30"
             rows, citations = self.execute_sql_query(sql)
             if rows and not rows[0].get("error_code"):
                 return rows, [Citation(source_type="GRAPH", identifier="graph_pg_fallback", title="Graph edges (PostgreSQL fallback)", content_preview=str(rows)[:120], score=0.8, dataset="ops_graph_edges")]
@@ -1383,7 +1397,7 @@ class UnifiedRetriever:
             sql = (
                 f"SELECT src_type, src_id, edge_type, dst_type, dst_id "
                 f"FROM ops_graph_edges "
-                f"WHERE UPPER(src_id) IN ({placeholders}) OR UPPER(dst_id) IN ({placeholders}) "
+                f"WHERE (UPPER(src_id) IN ({placeholders}) OR UPPER(dst_id) IN ({placeholders})){edge_filter_clause} "
                 f"LIMIT 50"
             )
             rows, _ = self.execute_sql_query(sql)

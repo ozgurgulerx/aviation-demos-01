@@ -117,7 +117,7 @@ jobs:
           CANDIDATES=()
           [ -n "$TARGET" ] && CANDIDATES+=("$TARGET")
           [ -n "$FROM_SERVER" ] && CANDIDATES+=("$FROM_SERVER")
-          CANDIDATES+=("avrag705508acr" "aviationragacr")
+          CANDIDATES+=("avrag705508acr")
 
           UNIQUE=()
           for candidate in "${CANDIDATES[@]}"; do
@@ -199,7 +199,7 @@ jobs:
           CANDIDATES=()
           [ -n "$TARGET" ] && CANDIDATES+=("$TARGET")
           [ -n "$FROM_SERVER" ] && CANDIDATES+=("$FROM_SERVER")
-          CANDIDATES+=("avrag705508acr" "aviationragacr")
+          CANDIDATES+=("avrag705508acr")
 
           UNIQUE=()
           for candidate in "${CANDIDATES[@]}"; do

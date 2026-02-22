@@ -118,6 +118,13 @@ def _wants_nosql(query_l: str) -> bool:
     return any(m in query_l for m in markers)
 
 
+def _wants_analytics(query_l: str) -> bool:
+    markers = ("delay", "on-time", "schedule performance", "bts",
+               "carrier delay", "cancellation rate", "on time performance",
+               "delay cause", "weather delay", "nas delay")
+    return any(m in query_l for m in markers)
+
+
 def build_retrieval_plan(
     request: RetrievalRequest,
     route: str,
@@ -181,6 +188,9 @@ def build_retrieval_plan(
 
         if _wants_nosql(query_l):
             add("NOSQL", "Operational document / NOTAM lookup", 24)
+
+        if _wants_analytics(query_l):
+            add("FABRIC_SQL", "BTS on-time analytics and delay causes", 15)
 
         if request.retrieval_mode == "foundry-iq":
             add("VECTOR_OPS", "Foundry IQ semantic-first context", 15)

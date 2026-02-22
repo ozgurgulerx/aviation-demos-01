@@ -96,7 +96,7 @@ def build_ops_docs(limit: int) -> List[Dict]:
                     source_file=str(row.get("source_file", str(asrs_file))),
                 )
             )
-            if len(docs) >= limit:
+            if limit > 0 and len(docs) >= limit:
                 break
 
     # Add synthetic operational overlays as short docs.
@@ -121,24 +121,33 @@ def build_ops_docs(limit: int) -> List[Dict]:
                         source_file=str(legs_file),
                     )
                 )
-                if len(docs) >= limit:
+                if limit > 0 and len(docs) >= limit:
                     break
 
-    return docs[:limit]
+    return docs[:limit] if limit > 0 else docs
 
 
 def build_reg_docs(limit: int) -> List[Dict]:
     docs: List[Dict] = []
 
-    notam_file = latest("data/h-notam_recent/*/search_location_istanbul.jsonl")
-    if notam_file:
+    # Glob ALL NOTAM JSONL files (not just Istanbul)
+    notam_files = sorted(ROOT.glob("data/h-notam_recent/*/search_location_*.jsonl"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+    seen_notam_ids: set = set()
+    for notam_file in notam_files:
+        if limit > 0 and len(docs) >= limit:
+            break
         for idx, row in enumerate(iter_jsonl(notam_file), start=1):
             fac = str(row.get("facilityDesignator", ""))
             notam_no = str(row.get("notamNumber", ""))
+            doc_id = f"reg_notam_{notam_no or idx}"
+            if doc_id in seen_notam_ids:
+                continue
+            seen_notam_ids.add(doc_id)
             content = str(row.get("icaoMessage", "")) or str(row)
             docs.append(
                 doc_base(
-                    doc_id=f"reg_notam_{notam_no or idx}",
+                    doc_id=doc_id,
                     content=content,
                     title=f"NOTAM {notam_no} {fac}".strip(),
                     source="NOTAM",
@@ -148,11 +157,11 @@ def build_reg_docs(limit: int) -> List[Dict]:
                     source_file=str(notam_file),
                 )
             )
-            if len(docs) >= limit:
+            if limit > 0 and len(docs) >= limit:
                 break
 
     easa_csv = latest("data/d-easa_ads_recent/downloaded_ads_with_metadata.csv")
-    if easa_csv and len(docs) < limit:
+    if easa_csv and (limit <= 0 or len(docs) < limit):
         with easa_csv.open("r", encoding="utf-8", errors="ignore", newline="") as f:
             for idx, row in enumerate(csv.DictReader(f), start=1):
                 class_number = str(row.get("class_number", ""))
@@ -174,10 +183,10 @@ def build_reg_docs(limit: int) -> List[Dict]:
                         source_file=str(easa_csv),
                     )
                 )
-                if len(docs) >= limit:
+                if limit > 0 and len(docs) >= limit:
                     break
 
-    return docs[:limit]
+    return docs[:limit] if limit > 0 else docs
 
 
 def _csv_or_dat(path: Path) -> Iterable[Dict[str, str]]:
@@ -241,23 +250,23 @@ def build_airport_docs(limit: int) -> List[Dict]:
                     source_file=str(source_file),
                 )
             )
-            if len(docs) >= limit:
+            if limit > 0 and len(docs) >= limit:
                 return docs
 
-    return docs[:limit]
+    return docs[:limit] if limit > 0 else docs
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    ap.add_argument("--ops-limit", type=int, default=3000)
-    ap.add_argument("--reg-limit", type=int, default=1200)
-    ap.add_argument("--airport-limit", type=int, default=1500)
+    ap.add_argument("--ops-limit", type=int, default=0, help="Max ops docs (0=unlimited)")
+    ap.add_argument("--reg-limit", type=int, default=0, help="Max regulatory docs (0=unlimited)")
+    ap.add_argument("--airport-limit", type=int, default=0, help="Max airport docs (0=unlimited)")
     args = ap.parse_args()
 
-    ops_docs = build_ops_docs(max(1, args.ops_limit))
-    reg_docs = build_reg_docs(max(1, args.reg_limit))
-    airport_docs = build_airport_docs(max(1, args.airport_limit))
+    ops_docs = build_ops_docs(max(0, args.ops_limit))
+    reg_docs = build_reg_docs(max(0, args.reg_limit))
+    airport_docs = build_airport_docs(max(0, args.airport_limit))
 
     out = args.out_dir
     write_jsonl(out / "ops_narratives_docs.jsonl", ops_docs)
