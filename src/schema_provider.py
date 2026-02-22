@@ -104,23 +104,45 @@ class SchemaProvider:
             except Exception:
                 pass
         # Compact default schema for prompt guidance.
+        # Must match actual Kusto tables created by scripts/10_push_to_kusto.py.
         return {
             "database": database,
             "source": "static-default",
             "collected_at": self.retriever._now_iso(),
-            "schema_version": "static-default-v1",
+            "schema_version": "static-default-v2",
             "tables": [
                 {
-                    "table": "weather_obs",
-                    "columns": ["timestamp", "station_id", "icao", "metar_raw", "wind_kt", "visibility_mi"],
-                },
-                {
-                    "table": "hazards",
-                    "columns": ["timestamp", "hazard_type", "location", "severity", "raw_payload"],
-                },
-                {
                     "table": "opensky_states",
-                    "columns": ["timestamp", "icao24", "callsign", "lat", "lon", "velocity", "origin_country"],
+                    "columns": [
+                        "icao24", "callsign", "origin_country", "time_position",
+                        "last_contact", "longitude", "latitude", "baro_altitude",
+                        "on_ground", "velocity", "true_track", "vertical_rate",
+                        "geo_altitude", "squawk", "position_source",
+                    ],
+                },
+                {
+                    "table": "hazards_airsigmets",
+                    "columns": [
+                        "raw_text", "valid_time_from", "valid_time_to", "points",
+                        "min_ft_msl", "max_ft_msl", "movement_dir_degrees",
+                        "movement_speed_kt", "hazard", "severity", "airsigmet_type",
+                    ],
+                },
+                {
+                    "table": "hazards_gairmets",
+                    "columns": [
+                        "receipt_time", "issue_time", "expire_time", "product",
+                        "tag", "issue_to_valid_hours", "valid_time", "hazard",
+                        "geometry_type", "due_to", "points",
+                    ],
+                },
+                {
+                    "table": "hazards_aireps_raw",
+                    "columns": ["raw_line"],
+                },
+                {
+                    "table": "ops_graph_edges",
+                    "columns": ["src_type", "src_id", "edge_type", "dst_type", "dst_id"],
                 },
             ],
         }

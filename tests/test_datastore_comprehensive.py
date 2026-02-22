@@ -403,9 +403,9 @@ class TestSchemaProvider(unittest.TestCase):
     def test_snapshot_contains_kql_schema(self):
         snap = self.provider.snapshot()
         self.assertIn("kql_schema", snap)
-        # At minimum, the static default has 3 tables
+        # Static default has 5 tables (opensky_states, hazards_airsigmets, hazards_gairmets, hazards_aireps_raw, ops_graph_edges)
         tables = snap["kql_schema"].get("tables", [])
-        self.assertGreaterEqual(len(tables), 1)
+        self.assertGreaterEqual(len(tables), 5)
 
     def test_snapshot_contains_graph_schema(self):
         snap = self.provider.snapshot()
@@ -483,8 +483,48 @@ class TestKQLValidation(unittest.TestCase):
         )
 
     def test_allows_valid_kql(self):
-        result = self.retriever._validate_kql_query("weather_obs | take 10")
+        result = self.retriever._validate_kql_query("opensky_states | take 10")
         self.assertIsNone(result)
+
+    def test_allows_single_let_binding(self):
+        """Single let binding with semicolon should be allowed."""
+        result = self.retriever._validate_kql_query(
+            'let threshold = 100; opensky_states | where velocity > threshold | take 10'
+        )
+        self.assertIsNone(result, f"Single let binding should pass validation, got: {result}")
+
+    def test_allows_multiple_let_bindings(self):
+        """Multiple let bindings (common KQL pattern) should be allowed."""
+        csl = (
+            'let horizon_start = todatetime("2026-02-22T04:56:00Z"); '
+            'let horizon_end = todatetime("2026-02-22T06:26:00Z"); '
+            'hazards_airsigmets '
+            '| where valid_time_from between (horizon_start .. horizon_end) '
+            '| top 40 by valid_time_from desc'
+        )
+        result = self.retriever._validate_kql_query(csl)
+        self.assertIsNone(result, f"Multiple let bindings should pass validation, got: {result}")
+
+    def test_allows_let_with_ago(self):
+        """Let binding using ago() should be allowed."""
+        result = self.retriever._validate_kql_query(
+            'let cutoff = ago(2h); opensky_states | where time_position > cutoff | take 50'
+        )
+        self.assertIsNone(result, f"Let with ago() should pass validation, got: {result}")
+
+    def test_rejects_let_followed_by_malicious_statement(self):
+        """Let binding followed by a malicious command after the query should still be rejected."""
+        result = self.retriever._validate_kql_query(
+            'let x = 1; opensky_states | take 5; .drop table opensky_states'
+        )
+        self.assertIsNotNone(result, "Malicious command after let+query should be rejected")
+
+    def test_rejects_semicolon_injection_disguised_as_let(self):
+        """Injection attempt that tries to look like a let statement should be rejected."""
+        result = self.retriever._validate_kql_query(
+            'opensky_states | take 5; opensky_states | take 100'
+        )
+        self.assertIsNotNone(result, "Bare semicolon between queries should be rejected")
 
     def test_ensures_window_when_missing(self):
         csl = self.retriever._ensure_kql_window("weather_obs | take 10", 60)

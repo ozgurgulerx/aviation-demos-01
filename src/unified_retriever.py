@@ -1044,8 +1044,11 @@ class UnifiedRetriever:
             if re.search(pattern, text, flags=re.IGNORECASE):
                 return f"kql_contains_blocked_operation:{pattern}"
         # Check for semicolons outside of string literals to prevent multi-statement injection.
+        # First strip string literals, then strip legitimate `let <name> = <expr>;` bindings
+        # which require semicolons as delimiters in valid KQL.
         stripped = re.sub(r'"[^"]*"', '', text)
         stripped = re.sub(r"'[^']*'", '', stripped)
+        stripped = re.sub(r'\blet\s+\w+\s*=\s*[^;]*;', '', stripped)
         if ";" in stripped:
             return "kql_multiple_statements_not_allowed"
         return None
@@ -1077,13 +1080,26 @@ class UnifiedRetriever:
                 csl = self._ensure_kql_window(query, window_minutes)
             else:
                 airports = self._extract_airports_from_query(query)
-                if airports:
+                query_lower = (query or "").lower()
+                is_weather_query = any(w in query_lower for w in ("weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm"))
+                if airports and is_weather_query:
+                    # Query hazards_airsigmets for weather-related airport queries.
+                    # Note: hazards_airsigmets has points (lat/lon polygon) not station IDs,
+                    # so we search raw_text for the airport identifiers.
                     values = ",".join(f"'{a}'" for a in airports)
                     csl = (
-                        "weather_obs "
-                        f"| where toupper(station_id) in ({values}) or toupper(icao) in ({values}) "
-                        f"| where timestamp > ago({max(1, int(window_minutes))}m) "
-                        "| top 40 by timestamp desc"
+                        "hazards_airsigmets "
+                        f"| where raw_text has_any ({values}) "
+                        f"| where valid_time_to > ago({max(1, int(window_minutes))}m) "
+                        "| top 40 by valid_time_from desc"
+                    )
+                elif airports:
+                    # Query opensky_states for flight tracking near airports.
+                    values = ",".join(f"'{a}'" for a in airports)
+                    csl = (
+                        "opensky_states "
+                        f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                        "| take 50"
                     )
                 else:
                     tokens = self._query_tokens(query)
@@ -1145,10 +1161,48 @@ class UnifiedRetriever:
             detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
             return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
 
+    def _query_graph_pg_fallback(self, query: str) -> Tuple[List[Dict], List[Citation]]:
+        """Fallback: query ops_graph_edges from PostgreSQL when Fabric endpoint is unavailable."""
+        if not self.sql_available:
+            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable")], []
+
+        # Verify ops_graph_edges table exists in the current schema.
+        schema = self.cached_sql_schema()
+        table_names = {str(t.get("table", "")).lower() for t in schema.get("tables", []) if isinstance(t, dict)}
+        if "ops_graph_edges" not in table_names:
+            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL")], []
+
+        tokens = self._query_tokens(query)
+        if tokens:
+            placeholders = ", ".join(f"'{t}'" for t in tokens)
+            sql = (
+                f"SELECT src_type, src_id, edge_type, dst_type, dst_id "
+                f"FROM ops_graph_edges "
+                f"WHERE UPPER(src_id) IN ({placeholders}) OR UPPER(dst_id) IN ({placeholders}) "
+                f"LIMIT 50"
+            )
+        else:
+            sql = "SELECT src_type, src_id, edge_type, dst_type, dst_id FROM ops_graph_edges LIMIT 30"
+
+        rows, citations = self.execute_sql_query(sql)
+        if rows and not rows[0].get("error_code"):
+            graph_citations = [
+                Citation(
+                    source_type="GRAPH",
+                    identifier="graph_pg_fallback",
+                    title="Graph edges (PostgreSQL fallback)",
+                    content_preview=str(rows)[:120],
+                    score=0.8,
+                    dataset="ops_graph_edges",
+                )
+            ]
+            return rows, graph_citations
+        return rows, citations
+
     def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve graph relationships from Fabric graph endpoint (live only)."""
+        """Retrieve graph relationships from Fabric graph endpoint, with PostgreSQL fallback."""
         if not FABRIC_GRAPH_ENDPOINT:
-            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured")], []
+            return self._query_graph_pg_fallback(query)
 
         if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
             tokens = self._query_tokens(query)

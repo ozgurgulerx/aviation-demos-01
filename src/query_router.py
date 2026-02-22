@@ -21,8 +21,23 @@ ROUTING_PROMPT = """You are a query router for an aviation safety Q&A system wit
 1. **SQL Database (PostgreSQL)**
    - Table asrs_reports(asrs_report_id, event_date, location, aircraft_type, flight_phase, narrative_type, title, report_text, raw_json, ingested_at)
    - Table asrs_ingestion_runs(run_id, started_at, completed_at, status, source_manifest_path, records_seen, records_loaded, records_failed)
-   - Additional tables in demo schema: ourairports_airports, ourairports_runways, ourairports_navaids, ourairports_frequencies, openflights_routes, openflights_airports, openflights_airlines, ops_flight_legs, ops_turnaround_milestones, ops_crew_rosters, ops_mel_techlog_events
+   - Additional tables in demo schema:
+     - ourairports_airports(id, ident, type, name, latitude_deg, longitude_deg, elevation_ft, continent, iso_country, iso_region, municipality, scheduled_service, gps_code, iata_code, local_code, home_link, wikipedia_link, keywords)
+     - ourairports_runways(id, airport_ref, airport_ident, length_ft, width_ft, surface, lighted, closed, le_ident, le_latitude_deg, le_longitude_deg, he_ident, he_latitude_deg, he_longitude_deg)
+     - ourairports_navaids(id, ident, name, type, frequency_khz, latitude_deg, longitude_deg, iso_country, associated_airport)
+     - ourairports_frequencies(id, airport_ref, airport_ident, type, description, frequency_mhz)
+     - openflights_airports(airport_id, name, city, country, iata, icao, latitude, longitude, altitude, timezone, dst, tzdb, type, source)
+     - openflights_airlines(airline_id, name, alias, iata, icao, callsign, country, active)
+     - openflights_routes(airline, airline_id, source_airport, source_airport_id, dest_airport, dest_airport_id, codeshare, stops, equipment)
+     - hazards_airsigmets(raw_text, valid_time_from, valid_time_to, points, min_ft_msl, max_ft_msl, movement_dir_degrees, movement_speed_kt, hazard, severity, airsigmet_type)
+     - hazards_gairmets(receipt_time, issue_time, expire_time, product, tag, issue_to_valid_hours, valid_time, hazard, geometry_type, due_to, points)
+     - ops_flight_legs(flight_id, airline, flight_number, dep_icao, arr_icao, scheduled_dep, scheduled_arr, actual_dep, actual_arr, aircraft_type, registration, status)
+     - ops_turnaround_milestones(flight_id, milestone, scheduled_time, actual_time, station)
+     - ops_crew_rosters(crew_id, name, role, flight_id, duty_start, duty_end, base)
+     - ops_mel_techlog_events(event_id, registration, ata_chapter, description, opened_date, closed_date, mel_category, status)
+     - ops_graph_edges(src_type, src_id, edge_type, dst_type, dst_id)
    - Best for: counts, rankings, exact filters, timelines, grouped metrics, runway data, route networks, operational stats
+   - IMPORTANT: Use exact column names listed above. Do NOT guess column names.
 
 2. **Semantic Indexes** (vector search with reranking)
    - idx_ops_narratives: ASRS narrative documents — incident reports, near-miss narratives, safety observations
