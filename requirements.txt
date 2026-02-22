@@ -15,3 +15,6 @@ gunicorn>=21.2.0
 agent-framework>=1.0.0b260212
 opentelemetry-sdk>=1.26.0
 azure-monitor-opentelemetry-exporter>=1.0.0b35
+
+# Testing
+pytest>=7.0.0

@@ -50,3 +50,14 @@ coverage/
 
 # Local development docs
 .claude/
+
+# Presentation & documentation artifacts
+artifacts/
+documentation/
+
+# Data files (raw data, databases — too large for git)
+data/
+!data/.gitkeep
+
+# TypeScript build info
+src/tsconfig.tsbuildinfo
