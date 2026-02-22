@@ -334,16 +334,15 @@ class TestGraphSchema(unittest.TestCase):
 
         provider = SchemaProvider(_StubRetriever())  # type: ignore[arg-type]
         schema = provider._graph_schema()
-        self.assertEqual(schema["schema_version"], "graph-default-v2")
+        self.assertEqual(schema["schema_version"], "graph-default-v3")
         self.assertIn("Airport", schema["node_types"])
         self.assertIn("FlightLeg", schema["node_types"])
         self.assertIn("Tail", schema["node_types"])
+        self.assertIn("Runway", schema["node_types"])
         self.assertIn("DEPARTS", schema["edge_types"])
         self.assertIn("ARRIVES", schema["edge_types"])
         self.assertIn("OPERATES", schema["edge_types"])
-        # Aspirational types should NOT be in the active lists.
-        self.assertNotIn("Runway", schema["node_types"])
-        self.assertNotIn("HAS_RUNWAY", schema["edge_types"])
+        self.assertIn("HAS_RUNWAY", schema["edge_types"])
 
 
 if __name__ == "__main__":
