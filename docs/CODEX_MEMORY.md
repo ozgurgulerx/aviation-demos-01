@@ -161,3 +161,8 @@ Current tracked status:
   - Why: Prevent premature proxy aborts during backend cold-start and long-running retrieval/synthesis calls.
   - Sources: `src/app/api/chat/route.ts`, `.github/workflows/deploy-frontend.yaml`, `.github/workflows/deploy-backend.yaml`, `scripts/render-k8s-manifests.sh`, `Dockerfile.backend`.
   - Changed-from: Previous defaults were `BACKEND_REQUEST_TIMEOUT_MS=45000`, `CHAT_STREAM_TIMEOUT_MS=180000`, `GUNICORN_MAX_REQUESTS=200`, `GUNICORN_MAX_REQUESTS_JITTER=50`; workflow did not sync frontend timeout settings.
+- 2026-02-23: Restored ACR configurability in backend deploy workflow.
+  - Decision: Reinstated repository variable overrides for `AZURE_CONTAINER_REGISTRY_NAME` and `AZURE_CONTAINER_REGISTRY` in `.github/workflows/deploy-backend.yaml`, keeping safe defaults.
+  - Why: Avoid deployment failures in environments that use a non-default ACR while preserving strict ACR target validation.
+  - Sources: `.github/workflows/deploy-backend.yaml`, `tests/test_deployment_pipelines.py`.
+  - Changed-from: Hard-coded `aviationragacr` / `aviationragacr.azurecr.io`.
