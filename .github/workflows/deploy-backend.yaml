@@ -27,6 +27,8 @@ env:
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
   AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || 'rg-aviation-rag' }}
   K8S_NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
+  EXPECTED_AKS_RESOURCE_ID: ${{ vars.EXPECTED_AKS_RESOURCE_ID || '' }}
+  EXPECTED_ACR_RESOURCE_ID: ${{ vars.EXPECTED_ACR_RESOURCE_ID || '' }}
 
   AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
   AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION || '2024-10-21' }}
@@ -93,9 +95,11 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short -m "not integration" --ignore=tests/test_production_e2e.py
 
-  build-and-push:
+  build_and_push:
     needs: lint-and-test
     runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.build_image.outputs.image_ref }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -107,77 +111,59 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Resolve ACR name
+      - name: Validate Azure account target
         run: |
-          TARGET="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
-          REGISTRY_SERVER="${{ env.AZURE_CONTAINER_REGISTRY }}"
-          FROM_SERVER="${REGISTRY_SERVER%%.*}"
+          actual_subscription="$(az account show --query id -o tsv)"
+          actual_tenant="$(az account show --query tenantId -o tsv)"
 
-          CANDIDATES=()
-          [ -n "$TARGET" ] && CANDIDATES+=("$TARGET")
-          [ -n "$FROM_SERVER" ] && CANDIDATES+=("$FROM_SERVER")
-          CANDIDATES+=("avrag705508acr")
-          CANDIDATES+=("aviationragacr")
-
-          UNIQUE=()
-          for candidate in "${CANDIDATES[@]}"; do
-            [ -n "$candidate" ] || continue
-            skip=0
-            for existing in "${UNIQUE[@]}"; do
-              if [ "$existing" = "$candidate" ]; then
-                skip=1
-                break
-              fi
-            done
-            [ "$skip" -eq 1 ] || UNIQUE+=("$candidate")
-          done
-
-          SELECTED=""
-          for candidate in "${UNIQUE[@]}"; do
-            if az acr show --name "$candidate" >/dev/null 2>&1; then
-              SELECTED="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$SELECTED" ]; then
-            echo "::error::Unable to resolve an accessible ACR from candidates: ${UNIQUE[*]}"
-            echo "::group::ACRs visible to current Azure context"
-            az acr list --query '[].name' -o tsv || true
-            echo "::endgroup::"
+          if [ "$actual_subscription" != "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]; then
+            echo "::error::Azure subscription mismatch. Expected '${{ secrets.AZURE_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
             exit 1
           fi
 
-          if [ "$SELECTED" != "$TARGET" ]; then
-            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Using '$SELECTED'."
+          if [ "$actual_tenant" != "${{ secrets.AZURE_TENANT_ID }}" ]; then
+            echo "::error::Azure tenant mismatch. Expected '${{ secrets.AZURE_TENANT_ID }}' but got '$actual_tenant'."
+            exit 1
           fi
 
-          echo "Using ACR target: $SELECTED"
-          echo "AZURE_CONTAINER_REGISTRY_NAME=$SELECTED" >> "$GITHUB_ENV"
+          echo "Azure target context verified: subscription=$actual_subscription tenant=$actual_tenant"
+
+      - name: Validate ACR target
+        run: |
+          ACR_NAME="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+          EXPECTED_LOGIN_SERVER="${{ env.AZURE_CONTAINER_REGISTRY }}"
+          ACR_ID="$(az acr show --name "$ACR_NAME" --query id -o tsv)"
+          LOGIN_SERVER=$(az acr show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query loginServer -o tsv)
+          if [ -z "$ACR_ID" ] || [ -z "$LOGIN_SERVER" ]; then
+            echo "::error::Unable to resolve ACR target '$ACR_NAME'."
+            exit 1
+          fi
+
+          if [ "$LOGIN_SERVER" != "$EXPECTED_LOGIN_SERVER" ]; then
+            echo "::error::ACR login server mismatch. Expected '$EXPECTED_LOGIN_SERVER' but got '$LOGIN_SERVER'."
+            exit 1
+          fi
+
+          if [ -n "${{ env.EXPECTED_ACR_RESOURCE_ID }}" ] && [ "$ACR_ID" != "${{ env.EXPECTED_ACR_RESOURCE_ID }}" ]; then
+            echo "::error::ACR resource ID mismatch. Expected '${{ env.EXPECTED_ACR_RESOURCE_ID }}' but got '$ACR_ID'."
+            exit 1
+          fi
+
+          echo "ACR target verified: id=$ACR_ID loginServer=$LOGIN_SERVER"
 
       - name: Login to Azure Container Registry
         run: az acr login --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
 
-      - name: Resolve ACR login server
-        run: |
-          LOGIN_SERVER=$(az acr show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query loginServer -o tsv)
-          if [ -z "$LOGIN_SERVER" ]; then
-            echo "::error::Unable to resolve login server for ACR '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'"
-            exit 1
-          fi
-          echo "Resolved ACR login server: $LOGIN_SERVER"
-          if [ "${{ env.AZURE_CONTAINER_REGISTRY }}" != "$LOGIN_SERVER" ]; then
-            echo "::warning::Overriding AZURE_CONTAINER_REGISTRY='${{ env.AZURE_CONTAINER_REGISTRY }}' with '$LOGIN_SERVER'"
-          fi
-          echo "AZURE_CONTAINER_REGISTRY=$LOGIN_SERVER" >> "$GITHUB_ENV"
-
       - name: Build and push Docker image
+        id: build_image
         run: |
-          docker build -f Dockerfile.backend -t "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" .
-          docker push "${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          IMAGE_REF="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker build -f Dockerfile.backend -t "$IMAGE_REF" .
+          docker push "$IMAGE_REF"
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
 
   deploy:
-    needs: build-and-push
+    needs: build_and_push
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -190,53 +176,22 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Resolve ACR name
+      - name: Validate Azure account target
         run: |
-          TARGET="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
-          REGISTRY_SERVER="${{ env.AZURE_CONTAINER_REGISTRY }}"
-          FROM_SERVER="${REGISTRY_SERVER%%.*}"
+          actual_subscription="$(az account show --query id -o tsv)"
+          actual_tenant="$(az account show --query tenantId -o tsv)"
 
-          CANDIDATES=()
-          [ -n "$TARGET" ] && CANDIDATES+=("$TARGET")
-          [ -n "$FROM_SERVER" ] && CANDIDATES+=("$FROM_SERVER")
-          CANDIDATES+=("avrag705508acr")
-          CANDIDATES+=("aviationragacr")
-
-          UNIQUE=()
-          for candidate in "${CANDIDATES[@]}"; do
-            [ -n "$candidate" ] || continue
-            skip=0
-            for existing in "${UNIQUE[@]}"; do
-              if [ "$existing" = "$candidate" ]; then
-                skip=1
-                break
-              fi
-            done
-            [ "$skip" -eq 1 ] || UNIQUE+=("$candidate")
-          done
-
-          SELECTED=""
-          for candidate in "${UNIQUE[@]}"; do
-            if az acr show --name "$candidate" >/dev/null 2>&1; then
-              SELECTED="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$SELECTED" ]; then
-            echo "::error::Unable to resolve an accessible ACR from candidates: ${UNIQUE[*]}"
-            echo "::group::ACRs visible to current Azure context"
-            az acr list --query '[].name' -o tsv || true
-            echo "::endgroup::"
+          if [ "$actual_subscription" != "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]; then
+            echo "::error::Azure subscription mismatch. Expected '${{ secrets.AZURE_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
             exit 1
           fi
 
-          if [ "$SELECTED" != "$TARGET" ]; then
-            echo "::warning::Configured AZURE_CONTAINER_REGISTRY_NAME '$TARGET' not found. Using '$SELECTED'."
+          if [ "$actual_tenant" != "${{ secrets.AZURE_TENANT_ID }}" ]; then
+            echo "::error::Azure tenant mismatch. Expected '${{ secrets.AZURE_TENANT_ID }}' but got '$actual_tenant'."
+            exit 1
           fi
 
-          echo "Using ACR target: $SELECTED"
-          echo "AZURE_CONTAINER_REGISTRY_NAME=$SELECTED" >> "$GITHUB_ENV"
+          echo "Azure target context verified: subscription=$actual_subscription tenant=$actual_tenant"
 
       - name: Validate required runtime variables
         run: |
@@ -248,18 +203,43 @@ jobs:
             fi
           done
 
-      - name: Resolve ACR login server
+      - name: Validate ACR target
         run: |
+          ACR_NAME="${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+          EXPECTED_LOGIN_SERVER="${{ env.AZURE_CONTAINER_REGISTRY }}"
+          ACR_ID="$(az acr show --name "$ACR_NAME" --query id -o tsv)"
           LOGIN_SERVER=$(az acr show --name "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" --query loginServer -o tsv)
-          if [ -z "$LOGIN_SERVER" ]; then
-            echo "::error::Unable to resolve login server for ACR '${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'"
+          if [ -z "$ACR_ID" ] || [ -z "$LOGIN_SERVER" ]; then
+            echo "::error::Unable to resolve ACR target '$ACR_NAME'."
             exit 1
           fi
-          echo "Resolved ACR login server: $LOGIN_SERVER"
-          if [ "${{ env.AZURE_CONTAINER_REGISTRY }}" != "$LOGIN_SERVER" ]; then
-            echo "::warning::Overriding AZURE_CONTAINER_REGISTRY='${{ env.AZURE_CONTAINER_REGISTRY }}' with '$LOGIN_SERVER'"
+
+          if [ "$LOGIN_SERVER" != "$EXPECTED_LOGIN_SERVER" ]; then
+            echo "::error::ACR login server mismatch. Expected '$EXPECTED_LOGIN_SERVER' but got '$LOGIN_SERVER'."
+            exit 1
           fi
-          echo "AZURE_CONTAINER_REGISTRY=$LOGIN_SERVER" >> "$GITHUB_ENV"
+
+          if [ -n "${{ env.EXPECTED_ACR_RESOURCE_ID }}" ] && [ "$ACR_ID" != "${{ env.EXPECTED_ACR_RESOURCE_ID }}" ]; then
+            echo "::error::ACR resource ID mismatch. Expected '${{ env.EXPECTED_ACR_RESOURCE_ID }}' but got '$ACR_ID'."
+            exit 1
+          fi
+
+          echo "ACR target verified: id=$ACR_ID loginServer=$LOGIN_SERVER"
+
+      - name: Validate AKS target
+        run: |
+          AKS_ID="$(az aks show --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --query id -o tsv)"
+          if [ -z "$AKS_ID" ]; then
+            echo "::error::Unable to resolve AKS cluster '${{ env.AKS_CLUSTER }}' in resource group '${{ env.AKS_RESOURCE_GROUP }}'."
+            exit 1
+          fi
+
+          if [ -n "${{ env.EXPECTED_AKS_RESOURCE_ID }}" ] && [ "$AKS_ID" != "${{ env.EXPECTED_AKS_RESOURCE_ID }}" ]; then
+            echo "::error::AKS resource ID mismatch. Expected '${{ env.EXPECTED_AKS_RESOURCE_ID }}' but got '$AKS_ID'."
+            exit 1
+          fi
+
+          echo "AKS target verified: id=$AKS_ID"
 
       - name: Get AKS credentials
         run: az aks get-credentials --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --overwrite-existing
@@ -272,11 +252,16 @@ jobs:
             local status
 
             set +e
-            output="$(az aks check-acr --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --acr "${acr_name}" 2>&1)"
+            output="$(timeout 120 az aks check-acr --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --acr "${acr_name}" 2>&1)"
             status=$?
             set -e
 
             echo "$output"
+
+            if [ "$status" -eq 124 ]; then
+              echo "::warning::az aks check-acr timed out after 120s."
+              return 1
+            fi
 
             if [ "$status" -ne 0 ]; then
               return 1
@@ -340,6 +325,18 @@ jobs:
           kubectl apply -f /tmp/k8s-rendered/backend-configmap.yaml
           kubectl apply -f /tmp/k8s-rendered/backend-deployment.yaml
 
+      - name: Enforce deployment image from build job
+        run: |
+          expected_image="${{ needs.build_and_push.outputs.image_ref }}"
+          if [ -z "$expected_image" ]; then
+            echo "::error::Build output image_ref is empty."
+            exit 1
+          fi
+
+          kubectl set image deployment/aviation-rag-backend \
+            backend="$expected_image" \
+            --namespace="${{ env.K8S_NAMESPACE }}"
+
       - name: Configure backend image pull auth
         run: |
           if [ "${USE_IMAGE_PULL_SECRET:-false}" = "true" ]; then
@@ -390,7 +387,11 @@ jobs:
           timeout_seconds=900
           poll_interval=15
           deadline=$(( $(date +%s) + timeout_seconds ))
-          expected_image="${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          expected_image="${{ needs.build_and_push.outputs.image_ref }}"
+          if [ -z "$expected_image" ]; then
+            echo "::error::Build output image_ref is empty."
+            exit 1
+          fi
           tracked_generation="$(kubectl get deploy -n "${{ env.K8S_NAMESPACE }}" aviation-rag-backend -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
           drift_reapply_attempts=0
           max_drift_reapply_attempts=3
@@ -523,7 +524,18 @@ jobs:
 
       - name: Verify deployment
         run: |
+          expected_image="${{ needs.build_and_push.outputs.image_ref }}"
+          if [ -z "$expected_image" ]; then
+            echo "::error::Build output image_ref is empty."
+            exit 1
+          fi
+
           echo "Checking pod status..."
           kubectl get pods -n "${{ env.K8S_NAMESPACE }}" -l app=aviation-rag-backend
           echo "Checking service..."
           kubectl get svc -n "${{ env.K8S_NAMESPACE }}"
+          actual_image="$(kubectl get deploy aviation-rag-backend -n "${{ env.K8S_NAMESPACE }}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="backend")].image}')"
+          if [ "$actual_image" != "$expected_image" ]; then
+            echo "::error::Deployment image mismatch. Expected '$expected_image' but found '$actual_image'."
+            exit 1
+          fi

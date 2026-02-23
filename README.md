@@ -89,7 +89,7 @@ Use `scripts/provision-azure.sh` to provision runtime infrastructure (frontend, 
 SUBSCRIPTION_ID="<target-subscription-id>" \
 RESOURCE_GROUP="rg-aviation-rag" \
 LOCATION="westeurope" \
-ACR_NAME="aviationragacr" \
+ACR_NAME="avrag705508acr" \
 ACR_RESOURCE_GROUP="rg-aviation-rag" \
 AZURE_OPENAI_ENDPOINT="https://<openai-account>.openai.azure.com/" \
 AZURE_SEARCH_ENDPOINT="https://<search-account>.search.windows.net" \
@@ -108,6 +108,8 @@ PG_SERVER_RG="<postgres-resource-group>" \
 - `AKS_NAMESPACE`
 - `AZURE_CONTAINER_REGISTRY_NAME`
 - `AZURE_CONTAINER_REGISTRY`
+- `EXPECTED_AKS_RESOURCE_ID` (optional, recommended for strict target enforcement)
+- `EXPECTED_ACR_RESOURCE_ID` (optional, recommended for strict target enforcement)
 - `BACKEND_URL`
 - `PII_ENDPOINT`
 - `PII_CONTAINER_ENDPOINT`
@@ -145,6 +147,12 @@ PG_SERVER_RG="<postgres-resource-group>" \
 - `FABRIC_BEARER_TOKEN` (optional)
 
 Detailed cutover steps are documented in [docs/RUNTIME_CUTOVER_RUNBOOK.md](docs/RUNTIME_CUTOVER_RUNBOOK.md).
+
+Before running manual `kubectl` checks, sync local context to the deploy target:
+
+```bash
+./scripts/aks/use-deploy-target-context.sh
+```
 
 ### Retrieval Profiles and Source Hints
 

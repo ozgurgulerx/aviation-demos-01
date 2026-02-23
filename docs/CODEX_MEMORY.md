@@ -36,7 +36,7 @@ Default runtime naming and layout:
 - Region: `westeurope`
 - VNet: `vnet-aviation-rag`
 - AKS/App runtime: `aks-aviation-rag`
-- Registry: `aviationragacr`
+- Registry: `avrag705508acr`
 - Namespace: `aviation-rag`
 - Databases:
   - PostgreSQL server: `aviationragpg`

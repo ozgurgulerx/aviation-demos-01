@@ -15,6 +15,8 @@ Data platform migration is handled separately.
 
 - Confirm target login and subscription:
   - `az account show --query "{user:user.name,tenantId:tenantId,id:id}" -o table`
+- Align local kubectl context with deploy target before any verification:
+  - `./scripts/aks/use-deploy-target-context.sh`
 - Freeze deploys to `main` during migration window.
 - Prepare GitHub secrets (target values):
   - `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
@@ -36,7 +38,7 @@ Example:
 SUBSCRIPTION_ID="<target-subscription-id>" \
 RESOURCE_GROUP="rg-aviation-rag" \
 LOCATION="westeurope" \
-ACR_NAME="aviationragacr" \
+ACR_NAME="avrag705508acr" \
 ACR_RESOURCE_GROUP="rg-aviation-rag" \
 PG_SERVER_RG="<postgres-rg>" \
 PG_SERVER="<postgres-server>" \

@@ -118,6 +118,12 @@ Always verify Azure CLI context before provisioning/deploying:
 az account show --query "{user:user.name,tenantId:tenantId,name:name,id:id}" -o table
 ```
 
+Always sync local kubectl context to the deploy target before validation:
+
+```bash
+./scripts/aks/use-deploy-target-context.sh
+```
+
 ## Azure OpenAI Configuration
 
 - **Endpoint:** `https://swedencentral.api.cognitive.microsoft.com/` (Sweden Central regional Cognitive Services endpoint)
