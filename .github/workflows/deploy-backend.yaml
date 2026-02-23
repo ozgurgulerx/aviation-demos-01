@@ -63,8 +63,8 @@ env:
   GUNICORN_TIMEOUT_SECONDS: ${{ vars.GUNICORN_TIMEOUT_SECONDS || '240' }}
   GUNICORN_GRACEFUL_TIMEOUT_SECONDS: ${{ vars.GUNICORN_GRACEFUL_TIMEOUT_SECONDS || '30' }}
   GUNICORN_KEEPALIVE_SECONDS: ${{ vars.GUNICORN_KEEPALIVE_SECONDS || '5' }}
-  GUNICORN_MAX_REQUESTS: ${{ vars.GUNICORN_MAX_REQUESTS || '200' }}
-  GUNICORN_MAX_REQUESTS_JITTER: ${{ vars.GUNICORN_MAX_REQUESTS_JITTER || '50' }}
+  GUNICORN_MAX_REQUESTS: ${{ vars.GUNICORN_MAX_REQUESTS || '1000' }}
+  GUNICORN_MAX_REQUESTS_JITTER: ${{ vars.GUNICORN_MAX_REQUESTS_JITTER || '200' }}
   FABRIC_KQL_ENDPOINT: ${{ vars.FABRIC_KQL_ENDPOINT }}
   FABRIC_GRAPH_ENDPOINT: ${{ vars.FABRIC_GRAPH_ENDPOINT }}
   FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
@@ -283,10 +283,14 @@ jobs:
           attach_output=""
           attach_status=0
           set +e
-          attach_output="$(az aks update --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --attach-acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" 2>&1)"
+          attach_output="$(timeout 180 az aks update --resource-group "${{ env.AKS_RESOURCE_GROUP }}" --name "${{ env.AKS_CLUSTER }}" --attach-acr "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}" 2>&1)"
           attach_status=$?
           set -e
           echo "$attach_output"
+
+          if [ "$attach_status" -eq 124 ]; then
+            echo "::warning::az aks update --attach-acr timed out after 180s."
+          fi
 
           echo "Re-checking AKS to ACR image pull permissions..."
           if [ "$attach_status" -eq 0 ] && check_acr_access "${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"; then
