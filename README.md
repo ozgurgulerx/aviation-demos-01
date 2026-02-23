@@ -111,6 +111,8 @@ PG_SERVER_RG="<postgres-resource-group>" \
 - `EXPECTED_AKS_RESOURCE_ID` (optional, recommended for strict target enforcement)
 - `EXPECTED_ACR_RESOURCE_ID` (optional, recommended for strict target enforcement)
 - `BACKEND_URL`
+- `BACKEND_REQUEST_TIMEOUT_MS` (optional, default `180000`)
+- `CHAT_STREAM_TIMEOUT_MS` (optional, default `240000`)
 - `PII_ENDPOINT`
 - `PII_CONTAINER_ENDPOINT`
 - `PG_SERVER_NAME`

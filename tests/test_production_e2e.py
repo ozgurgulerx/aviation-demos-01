@@ -16,6 +16,7 @@ Default endpoint: http://20.240.76.230
 
 import argparse
 import json
+import os
 import sys
 import time
 import threading
@@ -23,7 +24,7 @@ import urllib.request
 import urllib.error
 from collections import defaultdict
 
-DEFAULT_ENDPOINT = "http://20.240.76.230"
+DEFAULT_ENDPOINT = os.getenv("BACKEND_URL", "http://20.240.76.230")
 
 # Sources where 401 / source_unavailable is a known limitation (not a test failure)
 KNOWN_401_SOURCES = {"KQL"}
