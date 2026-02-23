@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -224,6 +225,49 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         )
         self.assertEqual(rows[0].get("error_code"), "semantic_runtime_error")
 
+    def test_fabric_sql_falls_back_to_rest_when_tds_capability_missing(self):
+        retriever = self._build_retriever()
+        retriever._post_json = MagicMock(return_value=[{"airport": "JFK", "carrier": "AA"}])
+        retriever._fabric_sql_tds_capability = MagicMock(
+            return_value={"ok": False, "detail": "pyodbc_unavailable:No module named 'pyodbc'"}
+        )
+        with patch.object(ur, "FABRIC_SQL_ENDPOINT", "https://fabric.example/sql"), patch.dict(
+            os.environ,
+            {"FABRIC_SQL_SERVER": "warehouse.example.fabric.microsoft.com", "FABRIC_SQL_DATABASE": "wh"},
+            clear=False,
+        ):
+            rows, citations = retriever.query_fabric_sql("top delay causes for JFK")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("airport"), "JFK")
+        self.assertGreaterEqual(len(citations), 1)
+
+    def test_fabric_sql_returns_source_unavailable_when_tds_missing_and_no_rest(self):
+        retriever = self._build_retriever()
+        retriever._fabric_sql_tds_capability = MagicMock(
+            return_value={"ok": False, "detail": "pyodbc_unavailable:No module named 'pyodbc'"}
+        )
+        with patch.object(ur, "FABRIC_SQL_ENDPOINT", ""), patch.dict(
+            os.environ,
+            {"FABRIC_SQL_SERVER": "warehouse.example.fabric.microsoft.com", "FABRIC_SQL_DATABASE": "wh"},
+            clear=False,
+        ):
+            rows, citations = retriever.query_fabric_sql("top delay causes for JFK")
+        self.assertEqual(rows[0].get("error_code"), "source_unavailable")
+        self.assertIn("TDS unavailable", rows[0].get("error", ""))
+        self.assertEqual(len(citations), 0)
+
+    def test_source_mode_blocks_fabric_sql_without_tds_or_rest(self):
+        retriever = self._build_retriever()
+        retriever._fabric_sql_tds_capability = MagicMock(
+            return_value={"ok": False, "detail": "pyodbc_unavailable", "server_configured": True}
+        )
+        with patch.object(ur, "FABRIC_SQL_ENDPOINT", ""), patch.dict(
+            os.environ,
+            {"FABRIC_SQL_SERVER": "warehouse.example.fabric.microsoft.com", "FABRIC_SQL_DATABASE": "wh"},
+            clear=False,
+        ):
+            self.assertEqual(retriever.source_mode("FABRIC_SQL"), "blocked")
+
     def test_unknown_source_returns_error(self):
         retriever = self._build_retriever()
         rows, _citations, _sql = retriever.retrieve_source("UNKNOWN", "x")
@@ -276,6 +320,55 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         self.assertIn("LIMIT 30", query_str)
         self.assertNotIn("@icao", query_str)
         self.assertTrue(call_kwargs.kwargs.get("enable_cross_partition_query", False))
+
+    def test_guardrail_mismatch_blocks_all_sources(self):
+        retriever = self._build_retriever()
+        with patch.dict(
+            os.environ,
+            {
+                "EXPECTED_RUNTIME_TENANT_ID": ur.GUARDRAIL_TENANT_ID,
+                "AZURE_TENANT_ID": "00000000-0000-0000-0000-000000000000",
+            },
+            clear=False,
+        ):
+            self.assertEqual(retriever.source_mode("SQL"), "blocked")
+            cap = retriever.source_capability("SQL", refresh=False)
+            self.assertEqual(cap.get("status"), "unavailable")
+            self.assertEqual(cap.get("reason_code"), "tenant_guardrail_mismatch")
+
+    def test_guardrail_missing_runtime_value_blocks_all_sources(self):
+        retriever = self._build_retriever()
+        with patch.dict(
+            os.environ,
+            {
+                "EXPECTED_RUNTIME_TENANT_ID": ur.GUARDRAIL_TENANT_ID,
+                "AZURE_TENANT_ID": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(retriever.source_mode("SQL"), "blocked")
+            cap = retriever.source_capability("SQL", refresh=False)
+            self.assertEqual(cap.get("status"), "unavailable")
+            self.assertEqual(cap.get("reason_code"), "tenant_guardrail_mismatch")
+            self.assertIn("missing_runtime_identity_value", str(retriever._identity_guardrail_report))
+
+    def test_preflight_includes_guardrail_and_capability_sections(self):
+        retriever = self._build_retriever()
+        with patch.dict(
+            os.environ,
+            {
+                "EXPECTED_RUNTIME_TENANT_ID": ur.GUARDRAIL_TENANT_ID,
+                "AZURE_TENANT_ID": ur.GUARDRAIL_TENANT_ID,
+            },
+            clear=False,
+        ):
+            payload = retriever.fabric_preflight()
+
+        self.assertIn("identity_guardrail", payload)
+        self.assertIn("source_capabilities", payload)
+        self.assertIn("baseline_sources", payload)
+        self.assertIn("baseline_unavailable_sources", payload)
+        self.assertTrue(any(c.get("source") == "SQL" for c in payload["source_capabilities"]))
 
 
 if __name__ == "__main__":
