@@ -17,6 +17,21 @@ from pg_mock import MockPool, patch_pg_pool  # noqa: E402
 
 
 class SourceExecutionPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _set_runtime_identity_defaults() -> None:
+        os.environ.setdefault(
+            "AZURE_ACCOUNT_UPN",
+            os.getenv("EXPECTED_RUNTIME_ACCOUNT_UPN", ur.GUARDRAIL_ACCOUNT_UPN),
+        )
+        os.environ.setdefault(
+            "AZURE_TENANT_ID",
+            os.getenv("EXPECTED_RUNTIME_TENANT_ID", ur.GUARDRAIL_TENANT_ID),
+        )
+        os.environ.setdefault(
+            "AZURE_SUBSCRIPTION_ID",
+            os.getenv("EXPECTED_RUNTIME_SUBSCRIPTION_ID", ur.GUARDRAIL_SUBSCRIPTION_ID),
+        )
+
     def _fake_jwt(self, ttl_seconds: int) -> str:
         header = base64.urlsafe_b64encode(json.dumps({"alg": "none", "typ": "JWT"}).encode("utf-8")).decode("utf-8").rstrip("=")
         payload = base64.urlsafe_b64encode(
@@ -25,6 +40,8 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         return f"{header}.{payload}.sig"
 
     def _build_retriever(self) -> UnifiedRetriever:
+        self._set_runtime_identity_defaults()
+
         class _Writer:
             def __init__(self, sql: str = "SELECT id, title FROM asrs_reports LIMIT 1", should_raise: bool = False):
                 self.sql = sql

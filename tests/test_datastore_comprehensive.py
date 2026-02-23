@@ -40,7 +40,23 @@ from query_router import QueryRouter  # noqa: E402
 from pg_mock import patch_pg_pool  # noqa: E402
 
 
+def _set_runtime_identity_defaults() -> None:
+    os.environ.setdefault(
+        "AZURE_ACCOUNT_UPN",
+        os.getenv("EXPECTED_RUNTIME_ACCOUNT_UPN", ur.GUARDRAIL_ACCOUNT_UPN),
+    )
+    os.environ.setdefault(
+        "AZURE_TENANT_ID",
+        os.getenv("EXPECTED_RUNTIME_TENANT_ID", ur.GUARDRAIL_TENANT_ID),
+    )
+    os.environ.setdefault(
+        "AZURE_SUBSCRIPTION_ID",
+        os.getenv("EXPECTED_RUNTIME_SUBSCRIPTION_ID", ur.GUARDRAIL_SUBSCRIPTION_ID),
+    )
+
+
 def _build_retriever() -> UnifiedRetriever:
+    _set_runtime_identity_defaults()
     retriever = object.__new__(UnifiedRetriever)
     patch_pg_pool(retriever)
     retriever.search_clients = {}
