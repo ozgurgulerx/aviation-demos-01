@@ -249,10 +249,17 @@ export const DATA_SOURCE_BLUEPRINT: DataSourceBlueprint[] = [
   },
   {
     id: "SQL",
-    label: "Ops relational state",
-    datastore: "Fabric Warehouse (SQL)",
+    label: "ASRS reports & airport ops",
+    datastore: "Azure PostgreSQL (SQL)",
     retrievalMode: "Deterministic SQL joins",
     rationale: "Used where auditable KPI logic and constraint joins are required.",
+  },
+  {
+    id: "FABRIC_SQL",
+    label: "BTS delay analytics",
+    datastore: "Fabric SQL Warehouse",
+    retrievalMode: "Deterministic T-SQL joins",
+    rationale: "Used for BTS on-time performance, delay causes, and schedule statistics.",
   },
   {
     id: "GRAPH",

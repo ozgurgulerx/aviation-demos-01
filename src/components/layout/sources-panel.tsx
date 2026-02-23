@@ -196,6 +196,11 @@ export function SourcesPanel({
                               </motion.div>
                               <div className="min-w-0">
                                 <span className="block truncate font-medium text-foreground">{visual.longLabel}</span>
+                                {visual.description && (
+                                  <span className="block truncate text-[10px] text-muted-foreground">
+                                    {visual.description}
+                                  </span>
+                                )}
                                 {visual.isFabric && (
                                   <span className="text-[10px] font-semibold uppercase tracking-[0.09em] text-primary">
                                     Fabric datastore
@@ -318,7 +323,7 @@ function getSourceTone(sourceId: string): SourceTone {
     };
   }
 
-  if (source === "POSTGRES") {
+  if (source === "SQL") {
     return {
       accentBar: "bg-teal-500/80",
       queryCard: "border-teal-500/45 bg-teal-500/[0.08]",
