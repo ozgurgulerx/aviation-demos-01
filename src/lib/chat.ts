@@ -131,6 +131,9 @@ export interface StreamEvent {
   };
   degradedSources?: string[];
   failedRequiredSources?: string[];
+  requiredSourcesSatisfied?: boolean;
+  missingRequiredSources?: string[];
+  sourcePolicy?: "include" | "exact";
   fatalSourceCount?: number;
   failurePolicy?: "graceful" | "strict";
   partial?: boolean;

@@ -1,66 +1,118 @@
-# Codex Workspace Memory Entry
+# Codex Workspace Operating Contract
 
-Use `docs/CODEX_MEMORY.md` as the primary memory file for this repository.
+Last reviewed: 2026-02-23
 
-When working on tenant, infrastructure, or Fabric tasks, load these files early:
+## Purpose and Scope
 
-- `docs/CODEX_MEMORY.md`
-- `README.md`
-- `CLAUDE.md`
-- `docs/ARCHITECTURE.md`
-- `docs/RUNTIME_CUTOVER_RUNBOOK.md`
-- `scripts/provision-azure.sh`
-- `k8s/backend-configmap.yaml`
-- `k8s/backend-deployment.yaml`
-- `k8s/backend-service.yaml`
-- `docs/FABRIC_SERVICE_PRINCIPAL_SETUP.md`
-- `docs/FDPO_FABRIC_CURRENT_STATUS.md`
-- `scripts/fabric/bootstrap-sp.sh`
-- `scripts/fabric/validate-sp-access.sh`
-- `src/unified_retriever.py`
-- `src/api_server.py`
-- `src/app/api/fabric/preflight/route.ts`
+`AGENTS.md` is the stable behavior contract for agents working in this repo.
 
-Do not store secrets in memory files. Only keep non-secret identity, tenant, and infra context.
+- Keep this file policy-focused and low-churn.
+- Keep volatile runtime facts (deployment names, endpoint values, current status, rotation dates) in `docs/CODEX_MEMORY.md`.
+- Do not store secrets in either file.
+
+## Primary Memory File
+
+Use `docs/CODEX_MEMORY.md` as the primary memory file for non-secret tenant, infrastructure, runtime, and Fabric context.
+Use `docs/CODEX_MEMORY_TEMPLATE.md` as the canonical structure for future memory refactors/new memory files.
+
+## Instruction Precedence
+
+Within repository context, resolve instruction conflicts in this order:
+
+1. Explicit user instruction in the active conversation.
+2. `AGENTS.md` policy rules.
+3. Task-specific docs (`README.md`, `CLAUDE.md`, runbooks, architecture docs).
+4. `docs/CODEX_MEMORY.md` factual memory.
+5. Current code/config/manifests as final implementation truth.
+
+When sources conflict, call out the mismatch and proceed using the highest-precedence source.
+
+## Required Context Load Order
+
+For tenant, infrastructure, voice runtime, or Fabric tasks, load these files early and in this order:
+
+1. `AGENTS.md`
+2. `docs/CODEX_MEMORY.md`
+3. `README.md`
+4. `CLAUDE.md`
+5. `docs/ARCHITECTURE.md`
+6. `docs/RUNTIME_CUTOVER_RUNBOOK.md`
+7. `scripts/provision-azure.sh`
+8. `k8s/backend-configmap.yaml`
+9. `k8s/backend-deployment.yaml`
+10. `k8s/backend-service.yaml`
+11. `docs/FABRIC_SERVICE_PRINCIPAL_SETUP.md`
+12. `docs/FDPO_FABRIC_CURRENT_STATUS.md`
+13. `scripts/fabric/bootstrap-sp.sh`
+14. `scripts/fabric/validate-sp-access.sh`
+15. `src/unified_retriever.py`
+16. `src/api_server.py`
+17. `src/app/api/fabric/preflight/route.ts`
+
+## Freshness and Drift Rules
+
+Use `docs/CODEX_MEMORY.md` freshness metadata before acting on memory:
+
+- Runtime facts are stale after 7 days.
+- Infrastructure topology facts are stale after 30 days.
+
+If stale data or contradictions are detected:
+
+1. Block risky execution until verification is completed.
+2. Verify against repo truth (manifests, scripts, code, env defaults) and/or command output.
+3. State the resolved value and source in the response.
+4. Update or propose updates to `docs/CODEX_MEMORY.md`.
+
+## Conflict Resolution Protocol
+
+When values differ across docs or code:
+
+1. List conflicting values with file paths.
+2. Pick value by precedence rules.
+3. Mark whether the decision is temporary or final.
+4. Add a memory update note in `docs/CODEX_MEMORY.md` decision log.
+
+## Decision Log and Memory Update Rules
+
+For non-trivial tenant/infra/fabric/runtime decisions, add an entry to the decision log in `docs/CODEX_MEMORY.md` with:
+
+- Date (`YYYY-MM-DD`)
+- Decision
+- Why
+- Source files or command used for verification
+- Changed-from value (when applicable)
+
+Whenever runtime context changes are verified:
+
+- Update `Last updated` in `docs/CODEX_MEMORY.md`.
+- Update relevant section freshness markers.
+- Keep only non-secret values.
+
+## Regression-Prevention Preflight
+
+Before finalizing tenant/infra/fabric/runtime changes, confirm:
+
+1. Tenant/subscription/account alignment across docs and code.
+2. Deployment and env var name consistency across manifests/routes/backend defaults.
+3. Endpoint and API-version consistency between frontend and backend paths.
+4. Role scope assumptions are explicit and non-secret.
+
+If any preflight check fails, stop and surface the blocker.
 
 ## Local Change Policy
 
 Treat unexpected local tracked/untracked source changes as intentional by default and include them in the working set unless the user explicitly says to exclude them.
 
-## Foundry Voice Runtime Context (2026-02-20)
+## Memory Hygiene Rules
 
-- Foundry subscription: `a20bc194-9787-44ee-9c7f-7c3130e651b6`.
-- Foundry account: `ai-eastus2hubozguler527669401205` (`rg-openai`, `eastus2`).
-- Foundry project workspace: `ai-eastus2hubozguler527-project`.
+Do:
 
-Deployed model targets for this repo:
+- Keep stable identifiers and validated non-secret topology.
+- Keep concise context plus source pointers.
+- Prefer dated entries over undated notes.
 
-- Chat: `aviation-chat-gpt5-mini` -> `gpt-5-mini`.
-- Voice/TTS: `aviation-voice-tts` -> `gpt-4o-mini-tts`.
-- Voice realtime/audio support: `aviation-voice-gpt4o-audio` -> `gpt-4o-audio-preview`.
+Do not:
 
-Runtime defaults expected:
-
-- Backend model env default: `AZURE_OPENAI_DEPLOYMENT_NAME=aviation-chat-gpt5-mini`.
-- Frontend voice route env defaults:
-  - `AZURE_OPENAI_ENDPOINT=https://ai-eastus2hubozguler527669401205.cognitiveservices.azure.com/`
-  - `AZURE_OPENAI_VOICE_DEPLOYMENT_NAME=aviation-voice-tts`
-  - `AZURE_OPENAI_VOICE_MODEL=gpt-4o-mini-tts`
-  - `AZURE_OPENAI_VOICE_API_VERSION=2025-03-01-preview`
-  - `AZURE_OPENAI_AUTH_MODE=token`
-  - `AZURE_OPENAI_VOICE_TURKISH=alloy`
-  - `AZURE_OPENAI_VOICE_ENGLISH=alloy`
-
-Token-auth identity context (non-secret):
-
-- Entra app display name: `aviation-rag-openai-voice-sp`
-- Client ID: `6e36ed48-f9eb-4e4b-afac-e17f13141df5`
-- Minimum required role assignment scope: Foundry account resource (`Microsoft.CognitiveServices/accounts/ai-eastus2hubozguler527669401205`)
-- Assigned roles currently include:
-  - `Cognitive Services OpenAI User`
-  - `Cognitive Services User`
-  - `Cognitive Services OpenAI Contributor`
-
-Operational note:
-
-- Tenant policy enforces short client-secret lifetime. Treat voice SP secret as 30-day rotation cadence; next rotation target is on/before `2026-03-22`.
+- Store secrets, tokens, passwords, keys, or connection strings.
+- Mix one-off transient observations into stable policy sections.
+- Keep stale values without freshness dates.

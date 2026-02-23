@@ -26,11 +26,16 @@ from contracts.agentic_plan import ToolCall
 from evidence_verifier import EvidenceVerifier
 from intent_graph_provider import IntentGraphProvider
 from plan_executor import PlanExecutor
-from retrieval_plan import RetrievalRequest, RetrievalPlan, SourcePlan, build_retrieval_plan
+from retrieval_plan import (
+    RetrievalPlan,
+    RetrievalRequest,
+    SourcePlan,
+    build_retrieval_plan,
+)
 from schema_provider import SchemaProvider
 from unified_retriever import Citation, UnifiedRetriever
 from opentelemetry import trace as _otel_trace
-from shared_utils import utc_now as _utc_now, env_bool as _env_bool, env_int as _env_int
+from shared_utils import utc_now as _utc_now, env_bool as _env_bool, env_int as _env_int, canon_tool as _canon_tool
 
 _cp_tracer = _otel_trace.get_tracer("aviation-rag-backend", "0.1.0")
 
@@ -116,6 +121,7 @@ class AviationRagContextProvider:
         forced_route: Optional[str] = None,
         query_profile: str = "pilot-brief",
         required_sources: Optional[List[str]] = None,
+        source_policy: str = "include",
         freshness_sla_minutes: Optional[int] = None,
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
@@ -130,6 +136,7 @@ class AviationRagContextProvider:
                 forced_route=forced_route,
                 query_profile=query_profile,
                 required_sources=required_sources,
+                source_policy=source_policy,
                 freshness_sla_minutes=freshness_sla_minutes,
                 explain_retrieval=explain_retrieval,
                 risk_mode=risk_mode,
@@ -145,6 +152,7 @@ class AviationRagContextProvider:
         forced_route: Optional[str] = None,
         query_profile: str = "pilot-brief",
         required_sources: Optional[List[str]] = None,
+        source_policy: str = "include",
         freshness_sla_minutes: Optional[int] = None,
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
@@ -158,6 +166,7 @@ class AviationRagContextProvider:
                     query=query,
                     query_profile=query_profile,
                     required_sources=required_sources or [],
+                    source_policy=source_policy,
                     freshness_sla_minutes=freshness_sla_minutes,
                     explain_retrieval=explain_retrieval,
                     risk_mode=risk_mode,
@@ -176,6 +185,7 @@ class AviationRagContextProvider:
             forced_route=forced_route,
             query_profile=query_profile,
             required_sources=required_sources,
+            source_policy=source_policy,
             freshness_sla_minutes=freshness_sla_minutes,
             explain_retrieval=explain_retrieval,
             additional_reasoning=fallback_note,
@@ -190,6 +200,7 @@ class AviationRagContextProvider:
         forced_route: Optional[str],
         query_profile: str,
         required_sources: Optional[List[str]],
+        source_policy: str,
         freshness_sla_minutes: Optional[int],
         explain_retrieval: bool,
         additional_reasoning: str,
@@ -205,6 +216,7 @@ class AviationRagContextProvider:
             retrieval_mode=retrieval_mode,
             query_profile=query_profile,
             required_sources=list(required_sources or []),
+            source_policy=source_policy,
             freshness_sla_minutes=freshness_sla_minutes,
             explain_retrieval=explain_retrieval,
             forced_route=forced_route,
@@ -252,7 +264,7 @@ class AviationRagContextProvider:
             reconciled_items=reconciled_items[:80],
             coverage_summary=coverage_summary,
             conflict_summary=conflict_summary,
-            retrieval_plan=retrieval_plan.to_event_payload(),
+            retrieval_plan={**retrieval_plan.to_event_payload(), "source_policy": source_policy},
             source_traces=source_traces,
             reasoning=f"{retrieval_plan.reasoning}; {additional_reasoning}",
         )
@@ -262,6 +274,7 @@ class AviationRagContextProvider:
         query: str,
         query_profile: str,
         required_sources: List[str],
+        source_policy: str,
         freshness_sla_minutes: Optional[int],
         explain_retrieval: bool,
         risk_mode: str,
@@ -300,6 +313,8 @@ class AviationRagContextProvider:
             schemas=schemas,
             required_sources=required_sources,
         )
+        if (source_policy or "include").strip().lower() == "exact":
+            plan = self._enforce_exact_source_policy(plan, required_sources, query=query)
         execution = self.plan_executor.execute(query, plan, schemas, on_trace=on_trace)
         verification = self.evidence_verifier.verify(
             plan=plan,
@@ -374,7 +389,15 @@ class AviationRagContextProvider:
             "route": route,
             "reasoning": reasoning,
             "profile": query_profile,
+            "source_policy": source_policy,
+            "planner_model": getattr(self.orchestrator, "model", ""),
             "graph_source": intent_graph.source,
+            "graph_policy": "optional_enrichment",
+            "graph_budget": {
+                "timeout_seconds": getattr(self.retriever, "_graph_timeout_seconds", 0),
+                "max_retries": getattr(self.retriever, "_graph_max_retries", 0),
+                "retry_backoff_seconds": getattr(self.retriever, "_graph_retry_backoff_seconds", 0),
+            },
             "steps": [
                 {
                     "source": call.tool,
@@ -416,6 +439,82 @@ class AviationRagContextProvider:
             reasoning=reasoning,
             agentic_plan=plan.to_dict(),
         )
+
+    def _enforce_exact_source_policy(
+        self,
+        plan: "AgenticPlan",
+        required_sources: List[str],
+        query: str,
+    ) -> "AgenticPlan":
+        required: List[str] = []
+        for raw in required_sources:
+            src = _canon_tool(str(raw))
+            if src and src not in required:
+                required.append(src)
+        if not required:
+            plan.warnings.append("source_policy_exact_requested_without_required_sources")
+            return plan
+
+        required_set = set(required)
+        kept: List[ToolCall] = []
+        kept_ids: set[str] = set()
+        for call in plan.tool_calls:
+            tool = _canon_tool(call.tool)
+            if tool and tool in required_set:
+                kept.append(
+                    ToolCall(
+                        id=call.id,
+                        tool=tool,
+                        operation=call.operation or "lookup",
+                        depends_on=list(call.depends_on or []),
+                        query=call.query or query,
+                        params=dict(call.params or {}),
+                    )
+                )
+                kept_ids.add(call.id)
+
+        dropped_dependency_count = 0
+        for call in kept:
+            original_depends = list(call.depends_on or [])
+            filtered = [dep for dep in original_depends if dep in kept_ids]
+            dropped_dependency_count += max(0, len(original_depends) - len(filtered))
+            call.depends_on = filtered
+
+        if not kept:
+            for idx, src in enumerate(required, start=1):
+                kept.append(
+                    ToolCall(
+                        id=f"exact_forced_{idx}",
+                        tool=src,
+                        operation="lookup",
+                        depends_on=[],
+                        query=query,
+                        params={"forced": True, "source_policy": "exact"},
+                    )
+                )
+        else:
+            present = {_canon_tool(call.tool) for call in kept}
+            for src in required:
+                if src in present:
+                    continue
+                kept.append(
+                    ToolCall(
+                        id=f"exact_missing_{len(kept) + 1}",
+                        tool=src,
+                        operation="lookup",
+                        depends_on=[],
+                        query=query,
+                        params={"forced": True, "source_policy": "exact"},
+                    )
+                )
+
+        plan.tool_calls = kept
+        if dropped_dependency_count:
+            plan.warnings.append(f"source_policy_exact_dropped_dependencies:{dropped_dependency_count}")
+        plan.warnings.append(
+            "source_policy_exact_applied:" + ",".join(required)
+        )
+        return plan
 
     def _execute_plan(
         self,

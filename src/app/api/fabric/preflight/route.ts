@@ -1,9 +1,20 @@
 import { NextResponse } from "next/server";
 
 const PYTHON_API_URL =
-  process.env.BACKEND_URL || process.env.PYTHON_API_URL || "http://localhost:5001";
+  process.env.BACKEND_URL ||
+  process.env.PYTHON_API_URL ||
+  (process.env.NODE_ENV === "development" ? "http://localhost:5001" : "");
 
 export async function GET() {
+  if (!PYTHON_API_URL) {
+    return NextResponse.json(
+      {
+        overall_status: "fail",
+        error: "Backend URL is not configured. Set BACKEND_URL or PYTHON_API_URL.",
+      },
+      { status: 200 }
+    );
+  }
   try {
     const response = await fetch(`${PYTHON_API_URL}/api/fabric/preflight`, {
       method: "GET",

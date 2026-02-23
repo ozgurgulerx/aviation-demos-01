@@ -69,6 +69,8 @@ RULES:
 - For regulatory/compliance queries ("NOTAM", "airworthiness", "directive", "EASA"), include VECTOR_REG and/or NOSQL.
 - For airport operational details ("runway", "gate", "turnaround", "airport info"), include VECTOR_AIRPORT.
 - For delay/performance analytics ("delay", "on-time", "cancellation rate"), include FABRIC_SQL.
+- Use GRAPH as optional enrichment for dependency/impact/entity-expansion questions.
+- Do not make GRAPH mandatory for final answer generation unless explicitly required by source policy.
 - Select 2-4 complementary sources per query. Do NOT rely on a single source.
 - Always pair a structured source (SQL/KQL/FABRIC_SQL) with a semantic source (VECTOR_*) when the query mixes metrics and context.
 
@@ -91,9 +93,10 @@ class AgenticOrchestrator:
     def __init__(self):
         self.client = _init_client()
         self.model = (
-            os.getenv("AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME")
-            or os.getenv("AZURE_OPENAI_REASONING_DEPLOYMENT_NAME")
-            or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-mini")
+            (os.getenv("AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME", "") or "").strip()
+            or (os.getenv("AZURE_OPENAI_REASONING_DEPLOYMENT_NAME", "") or "").strip()
+            or (os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "") or "").strip()
+            or "gpt-5-nano"
         )
         self.reasoning_effort = (os.getenv("AZURE_OPENAI_REASONING_EFFORT", "low") or "low").strip().lower()
 
@@ -437,24 +440,30 @@ class AgenticOrchestrator:
         if any(m in query_l for m in (
             "summarize", "similar", "narrative", "what happened",
             "examples", "lessons", "incident", "bird strike",
+            "describe", "asrs", "safety report", "failure scenario",
+            "engine failure", "hydraulic", "scenario",
         )):
             enrichments.append(("VECTOR_OPS", "semantic_lookup", "Query mentions narrative/similarity"))
         # Regulatory -> VECTOR_REG
         if any(m in query_l for m in (
             "airworthiness", "notam", "easa", "compliance",
             "directive", "sop", "bulletin", "regulatory",
+            "ad ", "faa ad",
         )):
             enrichments.append(("VECTOR_REG", "semantic_lookup", "Query mentions regulatory content"))
         # Airport ops -> VECTOR_AIRPORT
         if any(m in query_l for m in (
             "runway", "gate", "turnaround", "airport info",
-            "station info", "facility",
+            "station info", "facility", "airport configuration",
+            "ltfm", "ltba", "ltfj", "sabiha", "istanbul airport",
         )):
             enrichments.append(("VECTOR_AIRPORT", "semantic_lookup", "Query mentions airport operations"))
         # Delay analytics -> FABRIC_SQL
         if any(m in query_l for m in (
             "delay", "on-time", "cancellation", "schedule performance",
-            "bts", "carrier performance",
+            "bts", "carrier performance", "on time",
+            "average delay", "carrier delay", "weather delay",
+            "nas delay", "delay cause",
         )):
             enrichments.append(("FABRIC_SQL", "sql_lookup", "Query mentions delay/performance analytics"))
 

@@ -23,6 +23,7 @@ except ImportError:
 from flask_cors import CORS
 from af_runtime import AgentFrameworkRuntime
 from af_streaming import to_sse
+from shared_utils import validate_source_policy_request
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ def chat():
     conversation_id = data.get("conversation_id")
     query_profile = data.get("query_profile", "pilot-brief")
     required_sources = data.get("required_sources") or []
+    source_policy = data.get("source_policy", "include")
     freshness_sla_minutes = data.get("freshness_sla_minutes")
     explain_retrieval = bool(data.get("explain_retrieval", False))
     risk_mode = data.get("risk_mode", "standard")
@@ -106,6 +108,7 @@ def chat():
                 retrieval_mode=retrieval_mode,
                 query_profile=query_profile,
                 required_sources=required_sources,
+                source_policy=source_policy,
                 freshness_sla_minutes=freshness_sla_minutes,
                 explain_retrieval=explain_retrieval,
                 risk_mode=risk_mode,
@@ -155,6 +158,19 @@ def query():
         conversation_id = data.get("conversation_id")
         query_profile = data.get("query_profile", "pilot-brief")
         required_sources = data.get("required_sources") or []
+        source_policy = data.get("source_policy", "include")
+        source_policy_validation = validate_source_policy_request(required_sources, source_policy)
+        if source_policy_validation.get("is_exact") and not source_policy_validation.get("is_valid"):
+            return jsonify(
+                {
+                    "error": source_policy_validation.get("error_message") or "Invalid exact source policy request.",
+                    "error_code": source_policy_validation.get("error_code", "exact_required_sources_invalid"),
+                    "required_sources_raw": list(source_policy_validation.get("required_sources_raw", [])),
+                    "required_sources_normalized": list(source_policy_validation.get("required_sources_normalized", [])),
+                    "invalid_required_sources": list(source_policy_validation.get("invalid_required_sources", [])),
+                    "source_policy": source_policy_validation.get("source_policy", "exact"),
+                }
+            ), 400
         freshness_sla_minutes = data.get("freshness_sla_minutes")
         explain_retrieval = bool(data.get("explain_retrieval", False))
         risk_mode = data.get("risk_mode", "standard")
@@ -168,6 +184,7 @@ def query():
             retrieval_mode=retrieval_mode,
             query_profile=query_profile,
             required_sources=required_sources,
+            source_policy=source_policy,
             freshness_sla_minutes=freshness_sla_minutes,
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,

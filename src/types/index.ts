@@ -136,6 +136,9 @@ export interface TelemetryEvent {
   errorCode?: string;
   degradedSources?: string[];
   failedRequiredSources?: string[];
+  requiredSourcesSatisfied?: boolean;
+  missingRequiredSources?: string[];
+  sourcePolicy?: "include" | "exact";
   fatalSourceCount?: number;
   failurePolicy?: "graceful" | "strict";
   partial?: boolean;

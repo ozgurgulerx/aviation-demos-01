@@ -5,10 +5,48 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from retrieval_plan import RetrievalRequest, build_retrieval_plan
+from retrieval_plan import ExactPolicyValidationError, RetrievalRequest, build_retrieval_plan
+from shared_utils import validate_source_policy_request
 
 
 class RetrievalPlanTests(unittest.TestCase):
+    def test_exact_policy_invalid_sources_raises_validation_error(self):
+        req = RetrievalRequest(
+            query="Give me a brief",
+            required_sources=["SQLL"],  # typo
+            source_policy="exact",
+        )
+        with self.assertRaises(ExactPolicyValidationError):
+            build_retrieval_plan(req, route="HYBRID", route_reasoning="test")
+
+    def test_exact_policy_empty_required_sources_raises_validation_error(self):
+        req = RetrievalRequest(
+            query="Give me a brief",
+            required_sources=[],
+            source_policy="exact",
+        )
+        with self.assertRaises(ExactPolicyValidationError):
+            build_retrieval_plan(req, route="HYBRID", route_reasoning="test")
+
+    def test_exact_policy_honors_aliases(self):
+        req = RetrievalRequest(
+            query="Give me a brief",
+            required_sources=["FabricGraph", "fabricsql"],
+            source_policy="exact",
+        )
+        plan = build_retrieval_plan(req, route="HYBRID", route_reasoning="test")
+        self.assertEqual([s.source for s in plan.steps], ["GRAPH", "FABRIC_SQL"])
+
+    def test_validate_source_policy_request_exact(self):
+        valid = validate_source_policy_request(["sql", "graph"], "exact")
+        self.assertTrue(valid["is_valid"])
+        self.assertEqual(valid["required_sources_normalized"], ["SQL", "GRAPH"])
+
+        invalid = validate_source_policy_request(["sql", "bogus"], "exact")
+        self.assertFalse(invalid["is_valid"])
+        self.assertEqual(invalid["error_code"], "exact_required_sources_invalid")
+        self.assertIn("bogus", invalid["invalid_required_sources"])
+
     def test_plan_includes_realtime_and_graph_sources(self):
         req = RetrievalRequest(
             query="Live LTFM disruption impact dependencies in last 30 minutes",

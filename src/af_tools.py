@@ -57,6 +57,7 @@ class AviationRagTools:
         retrieval_mode: str = "code-rag",
         query_profile: str = "pilot-brief",
         required_sources: Optional[List[str]] = None,
+        source_policy: str = "include",
         freshness_sla_minutes: Optional[int] = None,
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
@@ -69,6 +70,7 @@ class AviationRagTools:
             retrieval_mode=retrieval_mode,
             query_profile=query_profile,
             required_sources=required_sources or [],
+            source_policy=source_policy,
             freshness_sla_minutes=freshness_sla_minutes,
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
@@ -79,6 +81,7 @@ class AviationRagTools:
         return {
             "route": ctx.route,
             "reasoning": ctx.reasoning,
+            "source_policy": source_policy,
             "context_text": ctx.context_text,
             "sql_query": ctx.sql_query,
             "sql_results": ctx.sql_results,

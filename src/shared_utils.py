@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -227,3 +227,58 @@ def canon_tool(raw: str) -> str:
     value = (raw or "").strip().upper()
     mapped = TOOL_ALIASES.get(value, value)
     return mapped if mapped in KNOWN_TOOLS else ""
+
+
+VALID_SOURCE_POLICIES: set[str] = {"include", "exact"}
+
+
+def normalize_source_policy(value: str) -> str:
+    policy = (value or "include").strip().lower()
+    return policy if policy in VALID_SOURCE_POLICIES else "include"
+
+
+def normalize_required_sources(required_sources: List[str]) -> Tuple[List[str], List[str]]:
+    canonical: List[str] = []
+    invalid: List[str] = []
+    seen: set[str] = set()
+    for raw in required_sources or []:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        src = canon_tool(token)
+        if not src:
+            invalid.append(token)
+            continue
+        if src in seen:
+            continue
+        seen.add(src)
+        canonical.append(src)
+    return canonical, invalid
+
+
+def validate_source_policy_request(required_sources: List[str], source_policy: str) -> Dict[str, Any]:
+    normalized_policy = normalize_source_policy(source_policy)
+    raw_values = [str(item or "").strip() for item in (required_sources or []) if str(item or "").strip()]
+    normalized_sources, invalid_sources = normalize_required_sources(raw_values)
+    is_exact = normalized_policy == "exact"
+    is_valid = (not is_exact) or (bool(normalized_sources) and not invalid_sources)
+    error_code = ""
+    error_message = ""
+    if not is_valid:
+        error_code = "exact_required_sources_invalid"
+        if not normalized_sources and not invalid_sources:
+            error_message = "source_policy=exact requires at least one valid required source."
+        elif invalid_sources:
+            error_message = "source_policy=exact contains unknown required source values."
+        else:
+            error_message = "Invalid exact source policy request."
+    return {
+        "source_policy": normalized_policy,
+        "required_sources_raw": raw_values,
+        "required_sources_normalized": normalized_sources,
+        "invalid_required_sources": invalid_sources,
+        "is_exact": is_exact,
+        "is_valid": is_valid,
+        "error_code": error_code,
+        "error_message": error_message,
+    }

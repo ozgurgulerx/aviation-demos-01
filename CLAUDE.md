@@ -34,20 +34,61 @@ Dockerfile.frontend           # Node 20-alpine, standalone, port 3001
 .github/workflows/            # deploy-backend, deploy-frontend, infra-health-check, migrate-database
 ```
 
-## Development Commands
+## Cloud Endpoints (Testing Target)
+
+All development and testing targets the live Azure deployment — **not** local dev servers.
+
+- **Frontend**: `https://aviation-rag-frontend-705508.azurewebsites.net`
+  - Health: `GET /api/health`
+  - Chat: `POST /api/chat` (SSE proxy to backend)
+  - PII: `POST /api/pii`
+- **Backend**: AKS cluster `aks-aviation-rag`, namespace `aviation-rag`
+  - Pod: `aviation-rag-backend` (gunicorn, port 5001)
+  - External LB: `http://20.240.76.230` (only reachable from within Azure VNet)
+  - Health: `GET /health`
+  - Chat: `POST /api/chat`
+  - Query: `POST /api/query`
+
+### Deploying Changes
 
 ```bash
-# Frontend (Next.js dev server)
-cd src && npm install && npm run dev                  # http://localhost:3001
+# Frontend — rebuild and deploy to App Service
+cd src && npm run build
+az webapp deploy --name aviation-rag-frontend-705508 --resource-group rg-aviation-rag --type zip --src-path <zip>
 
-# Backend (Flask dev server)
-cd src && python api_server.py                        # http://localhost:5001
+# Backend — rebuild container and update AKS
+docker build -f Dockerfile.backend -t <acr>.azurecr.io/aviation-rag-backend:latest .
+docker push <acr>.azurecr.io/aviation-rag-backend:latest
+kubectl rollout restart deployment/aviation-rag-backend -n aviation-rag
 
+# Check backend pod status / logs
+kubectl get pods -n aviation-rag
+kubectl logs deployment/aviation-rag-backend -n aviation-rag --tail=50
+
+# Check frontend App Service logs
+az webapp log tail --name aviation-rag-frontend-705508 --resource-group rg-aviation-rag
+```
+
+### Testing Against Cloud
+
+```bash
+# Frontend health
+curl -s https://aviation-rag-frontend-705508.azurewebsites.net/api/health
+
+# End-to-end chat (through frontend proxy to backend)
+curl -s -X POST https://aviation-rag-frontend-705508.azurewebsites.net/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"What are the most common incident types?"}'
+
+# Backend logs (real-time)
+kubectl logs -f deployment/aviation-rag-backend -n aviation-rag
+```
+
+### Other Commands
+
+```bash
 # Lint
 cd src && npx next lint
-
-# PII container (local Docker)
-./scripts/start-pii-container.sh                      # http://localhost:5000
 
 # Provision Azure infrastructure (idempotent)
 ./scripts/provision-azure.sh

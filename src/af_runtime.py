@@ -33,6 +33,8 @@ from opentelemetry import trace, metrics as otel_metrics
 from af_context_provider import AviationRagContextProvider
 from af_tools import AviationRagTools, build_agent_framework_tools
 from pii_filter import PII_HIGH_SEVERITY, PII_LOW_SEVERITY
+from shared_utils import normalize_source_policy, validate_source_policy_request
+from retrieval_plan import ExactPolicyValidationError
 from unified_retriever import Citation, UnifiedRetriever, _truncate_context_to_budget, _check_answer_grounding
 
 logger = logging.getLogger(__name__)
@@ -328,6 +330,7 @@ class AgentFrameworkRuntime:
         retrieval_mode: str = "code-rag",
         query_profile: str = "pilot-brief",
         required_sources: Optional[List[str]] = None,
+        source_policy: str = "include",
         freshness_sla_minutes: Optional[int] = None,
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
@@ -340,6 +343,10 @@ class AgentFrameworkRuntime:
         sid = session_id or str(uuid.uuid4())
         _resolved_route = "UNKNOWN"
         failure_policy = self._normalize_failure_policy(failure_policy)
+        source_policy = self._normalize_source_policy(source_policy)
+        required_sources = list(required_sources or [])
+        source_policy_validation = validate_source_policy_request(required_sources, source_policy)
+        required_sources = list(source_policy_validation.get("required_sources_normalized", []))
 
         yield {
             "type": "agent_update",
@@ -348,6 +355,33 @@ class AgentFrameworkRuntime:
             "sessionId": sid,
             "framework": self._framework_label,
         }
+
+        if source_policy_validation.get("is_exact") and not source_policy_validation.get("is_valid"):
+            error_payload = {
+                "type": "agent_error",
+                "error_code": source_policy_validation.get("error_code", "exact_required_sources_invalid"),
+                "message": source_policy_validation.get("error_message") or "Invalid exact source policy request.",
+                "route": "VALIDATION_ERROR",
+                "sessionId": sid,
+                "framework": self._framework_label,
+                "required_sources_raw": list(source_policy_validation.get("required_sources_raw", [])),
+                "required_sources_normalized": list(source_policy_validation.get("required_sources_normalized", [])),
+                "invalid_required_sources": list(source_policy_validation.get("invalid_required_sources", [])),
+                "sourcePolicy": source_policy,
+                "requiredSourcesSatisfied": False,
+                "failedRequiredSources": list(source_policy_validation.get("required_sources_raw", [])),
+                "missingRequiredSources": list(source_policy_validation.get("required_sources_raw", [])),
+                "partial": False,
+            }
+            yield error_payload
+            yield {
+                "type": "done",
+                "route": "VALIDATION_ERROR",
+                "isVerified": False,
+                "sourcePolicy": source_policy,
+                "error_code": error_payload["error_code"],
+            }
+            return
 
         if demo_scenario:
             query = self._apply_demo_scenario(query, demo_scenario)
@@ -483,7 +517,8 @@ class AgentFrameworkRuntime:
                         sid,
                         retrieval_mode,
                         query_profile=query_profile,
-                        required_sources=required_sources or [],
+                        required_sources=required_sources,
+                        source_policy=source_policy,
                         freshness_sla_minutes=freshness_sla_minutes,
                         explain_retrieval=explain_retrieval,
                         risk_mode=risk_mode,
@@ -518,7 +553,8 @@ class AgentFrameworkRuntime:
                 sid,
                 retrieval_mode,
                 query_profile=query_profile,
-                required_sources=required_sources or [],
+                required_sources=required_sources,
+                source_policy=source_policy,
                 freshness_sla_minutes=freshness_sla_minutes,
                 explain_retrieval=explain_retrieval,
                 risk_mode=risk_mode,
@@ -544,6 +580,7 @@ class AgentFrameworkRuntime:
         retrieval_mode: str,
         query_profile: str,
         required_sources: List[str],
+        source_policy: str,
         freshness_sla_minutes: Optional[int],
         explain_retrieval: bool,
         risk_mode: str,
@@ -574,6 +611,7 @@ class AgentFrameworkRuntime:
                 "retrieval_mode": retrieval_mode,
                 "query_profile": query_profile,
                 "required_sources": required_sources,
+                "source_policy": source_policy,
                 "freshness_sla_minutes": freshness_sla_minutes,
                 "explain_retrieval": explain_retrieval,
                 "risk_mode": risk_mode,
@@ -595,6 +633,7 @@ class AgentFrameworkRuntime:
                     retrieval_mode=retrieval_mode,
                     query_profile=query_profile,
                     required_sources=required_sources,
+                    source_policy=source_policy,
                     freshness_sla_minutes=freshness_sla_minutes,
                     explain_retrieval=explain_retrieval,
                     risk_mode=risk_mode,
@@ -603,6 +642,8 @@ class AgentFrameworkRuntime:
                     on_trace=trace_queue.put,
                 )
                 ctx_holder.append(ctx)
+            except ExactPolicyValidationError as exc:
+                exc_holder.append(exc)
             except Exception as exc:
                 exc_holder.append(exc)
             finally:
@@ -626,6 +667,25 @@ class AgentFrameworkRuntime:
 
         ctx_thread.join()
         if exc_holder:
+            if isinstance(exc_holder[0], ExactPolicyValidationError):
+                exact_error = exc_holder[0]
+                yield {
+                    "type": "agent_error",
+                    "error_code": "exact_required_sources_invalid",
+                    "message": str(exact_error),
+                    "route": "VALIDATION_ERROR",
+                    "sessionId": session_id,
+                    "framework": self._framework_label,
+                    "required_sources_raw": list(getattr(exact_error, "required_sources_raw", [])),
+                    "required_sources_normalized": list(getattr(exact_error, "required_sources_normalized", [])),
+                    "invalid_required_sources": list(getattr(exact_error, "invalid_required_sources", [])),
+                    "sourcePolicy": source_policy,
+                    "requiredSourcesSatisfied": False,
+                    "failedRequiredSources": list(getattr(exact_error, "required_sources_raw", [])),
+                    "missingRequiredSources": list(getattr(exact_error, "required_sources_raw", [])),
+                    "partial": False,
+                }
+                return
             raise exc_holder[0]
         ctx = ctx_holder[0]
 
@@ -721,6 +781,7 @@ class AgentFrameworkRuntime:
             ctx.source_results,
             required_sources=required_sources,
         )
+        required_sources_satisfied = len(failed_required_sources) == 0
         if failure_policy == "strict" and degraded_sources:
             detail = ", ".join(degraded_sources)
             yield {
@@ -731,7 +792,10 @@ class AgentFrameworkRuntime:
                 "framework": self._framework_label,
                 "degradedSources": degraded_sources,
                 "failedRequiredSources": failed_required_sources,
+                "requiredSourcesSatisfied": required_sources_satisfied,
+                "missingRequiredSources": failed_required_sources,
                 "failurePolicy": failure_policy,
+                "sourcePolicy": source_policy,
             }
             return
 
@@ -746,8 +810,11 @@ class AgentFrameworkRuntime:
                 "grounding": grounding,
                 "degradedSources": degraded_sources,
                 "failedRequiredSources": failed_required_sources,
+                "requiredSourcesSatisfied": required_sources_satisfied,
+                "missingRequiredSources": failed_required_sources,
                 "fatalSourceCount": len(degraded_sources),
                 "failurePolicy": failure_policy,
+                "sourcePolicy": source_policy,
                 "partial": True,
             }
 
@@ -761,8 +828,11 @@ class AgentFrameworkRuntime:
             "grounding": grounding,
             "degradedSources": degraded_sources,
             "failedRequiredSources": failed_required_sources,
+            "requiredSourcesSatisfied": required_sources_satisfied,
+            "missingRequiredSources": failed_required_sources,
             "fatalSourceCount": len(degraded_sources),
             "failurePolicy": failure_policy,
+            "sourcePolicy": source_policy,
             "partial": bool(degraded_sources),
         }
 
@@ -773,6 +843,7 @@ class AgentFrameworkRuntime:
         retrieval_mode: str,
         query_profile: str,
         required_sources: List[str],
+        source_policy: str,
         freshness_sla_minutes: Optional[int],
         explain_retrieval: bool,
         risk_mode: str,
@@ -802,6 +873,7 @@ class AgentFrameworkRuntime:
                 "retrieval_mode": retrieval_mode,
                 "query_profile": query_profile,
                 "required_sources": required_sources,
+                "source_policy": source_policy,
                 "freshness_sla_minutes": freshness_sla_minutes,
                 "explain_retrieval": explain_retrieval,
                 "risk_mode": risk_mode,
@@ -823,6 +895,7 @@ class AgentFrameworkRuntime:
                     retrieval_mode=retrieval_mode,
                     query_profile=query_profile,
                     required_sources=required_sources,
+                    source_policy=source_policy,
                     freshness_sla_minutes=freshness_sla_minutes,
                     explain_retrieval=explain_retrieval,
                     risk_mode=risk_mode,
@@ -969,6 +1042,7 @@ class AgentFrameworkRuntime:
             source_results,
             required_sources=required_sources,
         )
+        required_sources_satisfied = len(failed_required_sources) == 0
         if failure_policy == "strict" and degraded_sources:
             detail = ", ".join(degraded_sources)
             yield {
@@ -979,7 +1053,10 @@ class AgentFrameworkRuntime:
                 "framework": "local-fallback",
                 "degradedSources": degraded_sources,
                 "failedRequiredSources": failed_required_sources,
+                "requiredSourcesSatisfied": required_sources_satisfied,
+                "missingRequiredSources": failed_required_sources,
                 "failurePolicy": failure_policy,
+                "sourcePolicy": source_policy,
             }
             return
 
@@ -994,8 +1071,11 @@ class AgentFrameworkRuntime:
                 "grounding": local_grounding,
                 "degradedSources": degraded_sources,
                 "failedRequiredSources": failed_required_sources,
+                "requiredSourcesSatisfied": required_sources_satisfied,
+                "missingRequiredSources": failed_required_sources,
                 "fatalSourceCount": len(degraded_sources),
                 "failurePolicy": failure_policy,
+                "sourcePolicy": source_policy,
                 "partial": True,
             }
 
@@ -1009,8 +1089,11 @@ class AgentFrameworkRuntime:
             "grounding": local_grounding,
             "degradedSources": degraded_sources,
             "failedRequiredSources": failed_required_sources,
+            "requiredSourcesSatisfied": required_sources_satisfied,
+            "missingRequiredSources": failed_required_sources,
             "fatalSourceCount": len(degraded_sources),
             "failurePolicy": failure_policy,
+            "sourcePolicy": source_policy,
             "partial": bool(degraded_sources),
         }
 
@@ -1020,6 +1103,10 @@ class AgentFrameworkRuntime:
         if normalized in {"strict", "graceful"}:
             return normalized
         return "graceful"
+
+    @staticmethod
+    def _normalize_source_policy(value: str) -> str:
+        return normalize_source_policy(value)
 
     def _summarize_source_outcomes(
         self,
@@ -1261,6 +1348,7 @@ class AgentFrameworkRuntime:
         retrieval_mode: str = "code-rag",
         query_profile: str = "pilot-brief",
         required_sources: Optional[List[str]] = None,
+        source_policy: str = "include",
         freshness_sla_minutes: Optional[int] = None,
         explain_retrieval: bool = False,
         risk_mode: str = "standard",
@@ -1280,6 +1368,7 @@ class AgentFrameworkRuntime:
             retrieval_mode=retrieval_mode,
             query_profile=query_profile,
             required_sources=required_sources,
+            source_policy=source_policy,
             freshness_sla_minutes=freshness_sla_minutes,
             explain_retrieval=explain_retrieval,
             risk_mode=risk_mode,
@@ -1296,10 +1385,19 @@ class AgentFrameworkRuntime:
             elif event.get("type") in {"agent_error", "error"}:
                 terminal_error = {
                     "message": event.get("message") or event.get("error") or "Agent runtime error",
+                    "errorCode": event.get("error_code") or event.get("errorCode") or "",
                     "route": event.get("route", "ERROR"),
                     "degradedSources": list(event.get("degradedSources", [])),
                     "failedRequiredSources": list(event.get("failedRequiredSources", [])),
+                    "requiredSourcesSatisfied": bool(
+                        event.get("requiredSourcesSatisfied", len(list(event.get("failedRequiredSources", []))) == 0)
+                    ),
+                    "missingRequiredSources": list(event.get("missingRequiredSources", [])),
+                    "sourcePolicy": event.get("sourcePolicy", self._normalize_source_policy(source_policy)),
                     "partial": bool(event.get("partial", False)),
+                    "required_sources_raw": list(event.get("required_sources_raw", [])),
+                    "required_sources_normalized": list(event.get("required_sources_normalized", [])),
+                    "invalid_required_sources": list(event.get("invalid_required_sources", [])),
                 }
             elif event.get("type") in {"agent_done", "agent_partial_done"}:
                 metadata = event
@@ -1315,9 +1413,16 @@ class AgentFrameworkRuntime:
                 "is_verified": False,
                 "degraded_sources": list(terminal_error.get("degradedSources", [])),
                 "failed_required_sources": list(terminal_error.get("failedRequiredSources", [])),
+                "required_sources_satisfied": bool(terminal_error.get("requiredSourcesSatisfied", False)),
+                "missing_required_sources": list(terminal_error.get("missingRequiredSources", [])),
+                "source_policy": str(terminal_error.get("sourcePolicy", self._normalize_source_policy(source_policy))),
                 "partial": bool(terminal_error.get("partial", False)),
                 "status": "error",
                 "error": terminal_error.get("message", "Agent runtime error"),
+                "error_code": terminal_error.get("errorCode", ""),
+                "required_sources_raw": list(terminal_error.get("required_sources_raw", [])),
+                "required_sources_normalized": list(terminal_error.get("required_sources_normalized", [])),
+                "invalid_required_sources": list(terminal_error.get("invalid_required_sources", [])),
             }
 
         return {
@@ -1330,5 +1435,12 @@ class AgentFrameworkRuntime:
             "is_verified": bool(metadata.get("isVerified")),
             "degraded_sources": list(metadata.get("degradedSources", [])),
             "failed_required_sources": list(metadata.get("failedRequiredSources", [])),
+            "required_sources_satisfied": bool(
+                metadata.get("requiredSourcesSatisfied", len(list(metadata.get("failedRequiredSources", []))) == 0)
+            ),
+            "missing_required_sources": list(
+                metadata.get("missingRequiredSources", list(metadata.get("failedRequiredSources", [])))
+            ),
+            "source_policy": str(metadata.get("sourcePolicy", self._normalize_source_policy(source_policy))),
             "partial": bool(metadata.get("partial", False)),
         }

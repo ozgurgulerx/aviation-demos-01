@@ -63,12 +63,31 @@ FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_SQL_ENDPOINT = os.getenv("FABRIC_SQL_ENDPOINT")
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
+FABRIC_GRAPH_DATABASE = os.getenv("FABRIC_GRAPH_DATABASE", "").strip()
 FABRIC_SQL_DATABASE = os.getenv("FABRIC_SQL_DATABASE", "").strip()
 
 AZURE_COSMOS_ENDPOINT = os.getenv("AZURE_COSMOS_ENDPOINT", "").strip()
 AZURE_COSMOS_KEY = os.getenv("AZURE_COSMOS_KEY", "").strip()
 AZURE_COSMOS_DATABASE = os.getenv("AZURE_COSMOS_DATABASE", "aviationrag").strip()
 AZURE_COSMOS_CONTAINER = os.getenv("AZURE_COSMOS_CONTAINER", "notams").strip()
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(str(raw).strip()) if raw is not None else default
+    except Exception:
+        value = default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(str(raw).strip()) if raw is not None else default
+    except Exception:
+        value = default
+    return max(minimum, value)
 
 
 def _get_fabric_bearer_token() -> str:
@@ -365,6 +384,16 @@ class UnifiedRetriever:
         elif not _COSMOS_SDK_AVAILABLE and AZURE_COSMOS_ENDPOINT:
             logger.warning("azure-cosmos SDK not installed; Cosmos NOSQL retrieval unavailable")
 
+        # Graph retrieval resilience controls.
+        self._graph_timeout_seconds = _env_float("GRAPH_TIMEOUT_SECONDS", 12.0, minimum=1.0)
+        self._graph_max_retries = _env_int("GRAPH_MAX_RETRIES", 2, minimum=0)
+        self._graph_retry_backoff_seconds = _env_float("GRAPH_RETRY_BACKOFF_SECONDS", 0.75, minimum=0.0)
+        self._graph_cb_fail_threshold = _env_int("GRAPH_CIRCUIT_BREAKER_FAIL_THRESHOLD", 4, minimum=1)
+        self._graph_cb_open_seconds = _env_float("GRAPH_CIRCUIT_BREAKER_OPEN_SECONDS", 45.0, minimum=1.0)
+        self._graph_circuit_lock = threading.Lock()
+        self._graph_circuit_failures = 0
+        self._graph_circuit_open_until = 0.0
+
     @staticmethod
     def _filter_error_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Remove error/error_code rows from result lists before synthesis."""
@@ -436,7 +465,13 @@ class UnifiedRetriever:
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def _post_json(self, endpoint: str, payload: Any, token_scope: str = None) -> Any:
+    def _post_json(
+        self,
+        endpoint: str,
+        payload: Any,
+        token_scope: str = None,
+        timeout_seconds: float = 30.0,
+    ) -> Any:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -444,7 +479,7 @@ class UnifiedRetriever:
         if token:
             req.add_header("Authorization", f"Bearer {token}")
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_seconds))) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
                 if not raw:
                     return {}
@@ -499,8 +534,14 @@ class UnifiedRetriever:
             return []
         return self._extract_airports_from_query(sql_query)
 
-    def _kusto_rows(self, endpoint: str, csl: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        db_name = FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "").strip()
+    def _kusto_rows(
+        self,
+        endpoint: str,
+        csl: str,
+        database: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        db_name = (database or FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "")).strip()
         if not db_name:
             return [], "missing_fabric_kql_database"
 
@@ -511,7 +552,12 @@ class UnifiedRetriever:
         # Kusto REST v1 endpoint: POST to {cluster}/v1/rest/query
         kql_endpoint = endpoint.rstrip("/") + "/v1/rest/query"
 
-        response = self._post_json(kql_endpoint, {"db": db_name, "csl": csl}, token_scope=kusto_scope)
+        response = self._post_json(
+            kql_endpoint,
+            {"db": db_name, "csl": csl},
+            token_scope=kusto_scope,
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else 30.0,
+        )
         if isinstance(response, dict) and response.get("error"):
             return [], str(response.get("error"))
 
@@ -547,6 +593,195 @@ class UnifiedRetriever:
             return [], "kusto_primary_result_not_found"
 
         return [], "unexpected_kusto_response_type"
+
+    def _graph_database(self) -> str:
+        return (FABRIC_GRAPH_DATABASE or FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "")).strip()
+
+    def _graph_retryable_error(self, detail: Optional[str]) -> bool:
+        text = str(detail or "").strip().lower()
+        if not text:
+            return False
+        if text in {"missing_fabric_kql_database", "missing_fabric_graph_database"}:
+            return False
+        if text.startswith("http_"):
+            try:
+                code = int(text.split("_", 1)[1])
+            except Exception:
+                return False
+            return code == 429 or code >= 500
+        if any(token in text for token in ("timeout", "timed out", "temporar", "refused", "reset", "unreach", "connection", "service unavailable", "gateway")):
+            return True
+        return text in {"unexpected_kusto_response_type", "kusto_primary_result_not_found"}
+
+    def _graph_retry_sleep(self, attempt_number: int) -> None:
+        if self._graph_retry_backoff_seconds <= 0:
+            return
+        sleep_seconds = min(8.0, self._graph_retry_backoff_seconds * (2 ** max(0, attempt_number - 1)))
+        time.sleep(sleep_seconds)
+
+    def _graph_circuit_snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        with self._graph_circuit_lock:
+            is_open = self._graph_circuit_open_until > now
+            remaining = max(0.0, self._graph_circuit_open_until - now)
+            failures = self._graph_circuit_failures
+        return {
+            "graph_circuit_open": is_open,
+            "graph_circuit_remaining_seconds": round(remaining, 2),
+            "graph_circuit_failures": failures,
+            "graph_circuit_threshold": self._graph_cb_fail_threshold,
+        }
+
+    def _graph_circuit_is_open(self) -> bool:
+        now = time.time()
+        with self._graph_circuit_lock:
+            if self._graph_circuit_open_until <= now:
+                if self._graph_circuit_open_until > 0:
+                    self._graph_circuit_open_until = 0.0
+                    self._graph_circuit_failures = 0
+                return False
+            return True
+
+    def _graph_circuit_record_success(self) -> None:
+        with self._graph_circuit_lock:
+            self._graph_circuit_failures = 0
+            self._graph_circuit_open_until = 0.0
+
+    def _graph_circuit_record_failure(self) -> None:
+        now = time.time()
+        with self._graph_circuit_lock:
+            self._graph_circuit_failures += 1
+            if self._graph_circuit_failures >= self._graph_cb_fail_threshold:
+                self._graph_circuit_open_until = max(self._graph_circuit_open_until, now + self._graph_cb_open_seconds)
+
+    def _annotate_graph_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        graph_path: str,
+        fallback_used: bool,
+        retry_attempts: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            item["graph_path"] = graph_path
+            item["fallback_used"] = bool(fallback_used)
+            item["retry_attempts"] = int(retry_attempts)
+            if extra:
+                item.update(extra)
+            out.append(item)
+        return out
+
+    def _query_graph_live(self, query: str, hops: int = 2, probe: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str], int, Dict[str, Any]]:
+        max_attempts = 1 + max(0, self._graph_max_retries)
+        attempts = 0
+
+        if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
+            tokens = [] if probe else self._query_tokens(query)
+            if probe:
+                csl = "ops_graph_edges | take 1"
+            elif tokens:
+                values = ",".join(f"'{t}'" for t in tokens)
+                csl = f"ops_graph_edges | where src_id in~ ({values}) or dst_id in~ ({values}) | take 50"
+            else:
+                csl = "ops_graph_edges | take 30"
+
+            db_name = self._graph_database()
+            if not db_name:
+                return [], "missing_fabric_graph_database", 0, {"graph_path": "fabric_graph_live_kusto", "csl": csl}
+
+            last_error: Optional[str] = None
+            for attempt in range(1, max_attempts + 1):
+                attempts = attempt
+                rows, error = self._kusto_rows(
+                    FABRIC_GRAPH_ENDPOINT,
+                    csl,
+                    database=db_name,
+                    timeout_seconds=self._graph_timeout_seconds,
+                )
+                if rows:
+                    return rows, None, attempts, {"graph_path": "fabric_graph_live_kusto", "csl": csl}
+                if not error:
+                    return [], "graph_query_returned_no_rows", attempts, {"graph_path": "fabric_graph_live_kusto", "csl": csl}
+                if error == "kusto_tables_empty":
+                    return [], "graph_query_returned_no_rows", attempts, {"graph_path": "fabric_graph_live_kusto", "csl": csl}
+                last_error = error
+                if attempt < max_attempts and self._graph_retryable_error(error):
+                    self._graph_retry_sleep(attempt)
+                    continue
+                break
+            return [], last_error or "graph_query_returned_no_rows", attempts, {"graph_path": "fabric_graph_live_kusto", "csl": csl}
+
+        payload = {"query": "graph preflight probe", "hops": 1} if probe else {"query": query, "hops": hops}
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            attempts = attempt
+            response = self._post_json(
+                FABRIC_GRAPH_ENDPOINT,
+                payload,
+                timeout_seconds=self._graph_timeout_seconds,
+            )
+            if isinstance(response, dict) and "error" not in response:
+                paths = response.get("paths", [])
+                if paths:
+                    return paths, None, attempts, {"graph_path": "fabric_graph_live_http"}
+                return [], "graph_query_returned_no_rows", attempts, {"graph_path": "fabric_graph_live_http"}
+            detail = str(response.get("error")) if isinstance(response, dict) else "graph_endpoint_query_failed"
+            last_error = detail
+            if attempt < max_attempts and self._graph_retryable_error(detail):
+                self._graph_retry_sleep(attempt)
+                continue
+            break
+        return [], last_error or "graph_endpoint_query_failed", attempts, {"graph_path": "fabric_graph_live_http"}
+
+    def _probe_graph_query(self) -> Dict[str, Any]:
+        if not FABRIC_GRAPH_ENDPOINT:
+            return {
+                "status": "warn",
+                "detail": "graph_endpoint_not_configured",
+                "mode": self.source_mode("GRAPH"),
+                "graph_path": "pg_fallback_no_endpoint",
+                "retry_attempts": 0,
+            }
+
+        if self._graph_circuit_is_open():
+            snapshot = self._graph_circuit_snapshot()
+            return {
+                "status": "warn",
+                "detail": "graph_circuit_open_probe_skipped",
+                "mode": self.source_mode("GRAPH"),
+                "graph_path": "pg_fallback_circuit_open",
+                "retry_attempts": 0,
+                **snapshot,
+            }
+
+        rows, error, attempts, meta = self._query_graph_live("graph preflight probe", hops=1, probe=True)
+        if rows:
+            return {
+                "status": "pass",
+                "detail": f"rows={len(rows)}",
+                "mode": self.source_mode("GRAPH"),
+                "retry_attempts": attempts,
+                **meta,
+            }
+        if error == "graph_query_returned_no_rows":
+            return {
+                "status": "pass",
+                "detail": error,
+                "mode": self.source_mode("GRAPH"),
+                "retry_attempts": attempts,
+                **meta,
+            }
+        return {
+            "status": "fail",
+            "detail": error or "graph_probe_failed",
+            "mode": self.source_mode("GRAPH"),
+            "retry_attempts": attempts,
+            **meta,
+        }
 
     def _source_error_row(
         self, source: str, code: str, detail: str, extra: Optional[Dict[str, Any]] = None
@@ -684,6 +919,35 @@ class UnifiedRetriever:
                     "endpoint": endpoint if endpoint else "",
                 }
             )
+
+        graph_query_probe = self._probe_graph_query()
+        checks.append(
+            {
+                "name": "fabric_graph_query_probe",
+                "status": graph_query_probe.get("status", "fail"),
+                "detail": graph_query_probe.get("detail", "graph_probe_failed"),
+                "mode": graph_query_probe.get("mode", self.source_mode("GRAPH")),
+                "graph_path": graph_query_probe.get("graph_path", ""),
+                "retry_attempts": graph_query_probe.get("retry_attempts", 0),
+                "graph_circuit_open": graph_query_probe.get("graph_circuit_open", False),
+                "graph_circuit_remaining_seconds": graph_query_probe.get("graph_circuit_remaining_seconds", 0),
+            }
+        )
+
+        graph_circuit = self._graph_circuit_snapshot()
+        checks.append(
+            {
+                "name": "graph_circuit_breaker_state",
+                "status": "warn" if graph_circuit.get("graph_circuit_open") else "pass",
+                "detail": (
+                    f"open_for={graph_circuit.get('graph_circuit_remaining_seconds', 0)}s"
+                    if graph_circuit.get("graph_circuit_open")
+                    else "closed"
+                ),
+                "mode": self.source_mode("GRAPH"),
+                **graph_circuit,
+            }
+        )
 
         # Cosmos DB health check
         if self._cosmos_container is not None:
@@ -1414,7 +1678,13 @@ class UnifiedRetriever:
             detail = str(response.get("error")) if isinstance(response, dict) else "kql_endpoint_query_failed"
             return [self._source_error_row("KQL", "kql_runtime_error", detail)], []
 
-    def _query_graph_pg_fallback(self, query: str, hops: int = 2, edge_types: Optional[List[str]] = None) -> Tuple[List[Dict], List[Citation]]:
+    def _query_graph_pg_fallback(
+        self,
+        query: str,
+        hops: int = 2,
+        edge_types: Optional[List[str]] = None,
+        unavailable_detail: Optional[str] = None,
+    ) -> Tuple[List[Dict], List[Citation]]:
         """Fallback: query ops_graph_edges from PostgreSQL with iterative BFS multi-hop traversal.
 
         Args:
@@ -1424,13 +1694,13 @@ class UnifiedRetriever:
                         When provided, only edges of these types are traversed.
         """
         if not self.sql_available:
-            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable")], []
+            return [self._source_unavailable_row("GRAPH", unavailable_detail or "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable")], []
 
         # Verify ops_graph_edges table exists in the current schema.
         schema = self.cached_sql_schema()
         table_names = {str(t.get("table", "")).lower() for t in schema.get("tables", []) if isinstance(t, dict)}
         if "ops_graph_edges" not in table_names:
-            return [self._source_unavailable_row("GRAPH", "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL")], []
+            return [self._source_unavailable_row("GRAPH", unavailable_detail or "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL")], []
 
         # Build optional edge-type filter clause.
         edge_filter_clause = ""
@@ -1498,45 +1768,90 @@ class UnifiedRetriever:
     def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve graph relationships from Fabric graph endpoint, with PostgreSQL fallback."""
         if not FABRIC_GRAPH_ENDPOINT:
-            return self._query_graph_pg_fallback(query, hops=hops)
+            rows, citations = self._query_graph_pg_fallback(
+                query,
+                hops=hops,
+                unavailable_detail="FABRIC_GRAPH_ENDPOINT not configured; using PostgreSQL fallback",
+            )
+            return self._annotate_graph_rows(rows, "pg_fallback_no_endpoint", True, 0), citations
 
-        if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
-            tokens = self._query_tokens(query)
-            if tokens:
-                values = ",".join(f"'{t}'" for t in tokens)
-                csl = f"ops_graph_edges | where src_id in~ ({values}) or dst_id in~ ({values}) | take 50"
-            else:
-                csl = "ops_graph_edges | take 30"
+        if self._graph_circuit_is_open():
+            snapshot = self._graph_circuit_snapshot()
+            rows, citations = self._query_graph_pg_fallback(
+                query,
+                hops=hops,
+                unavailable_detail="Graph live path skipped because circuit breaker is open",
+            )
+            return self._annotate_graph_rows(
+                rows,
+                "pg_fallback_circuit_open",
+                True,
+                0,
+                extra=snapshot,
+            ), citations
 
-            paths, _error = self._kusto_rows(FABRIC_GRAPH_ENDPOINT, csl)
-            if paths:
-                citation = Citation(
-                    source_type="GRAPH",
-                    identifier="fabric_graph_live",
-                    title="Fabric graph traversal",
-                    content_preview=str(paths)[:120],
-                    score=1.0,
-                    dataset="fabric-graph",
-                )
-                return paths, [citation]
-            return [self._source_error_row("GRAPH", "graph_runtime_error", _error or "graph_query_returned_no_rows", {"csl": csl})], []
+        paths, live_error, retry_attempts, live_meta = self._query_graph_live(query, hops=hops)
+        if paths:
+            self._graph_circuit_record_success()
+            graph_path = str(live_meta.get("graph_path", "fabric_graph_live"))
+            enriched = self._annotate_graph_rows(
+                paths,
+                graph_path,
+                False,
+                retry_attempts,
+                extra={"graph_live_error": ""},
+            )
+            citation = Citation(
+                source_type="GRAPH",
+                identifier="fabric_graph_live",
+                title="Fabric graph traversal",
+                content_preview=str(paths)[:120],
+                score=1.0,
+                dataset="fabric-graph",
+            )
+            return enriched, [citation]
+
+        if live_error and live_error != "graph_query_returned_no_rows":
+            self._graph_circuit_record_failure()
         else:
-            payload = {"query": query, "hops": hops}
-            response = self._post_json(FABRIC_GRAPH_ENDPOINT, payload)
-            if isinstance(response, dict) and "error" not in response:
-                paths = response.get("paths", [])
-                if paths:
-                    citation = Citation(
-                        source_type="GRAPH",
-                        identifier="fabric_graph_live",
-                        title="Fabric graph traversal",
-                        content_preview=str(paths)[:120],
-                        score=1.0,
-                        dataset="fabric-graph",
-                    )
-                    return paths, [citation]
-            detail = str(response.get("error")) if isinstance(response, dict) else "graph_endpoint_query_failed"
-            return [self._source_error_row("GRAPH", "graph_runtime_error", detail)], []
+            # Empty result sets should not open the circuit.
+            self._graph_circuit_record_success()
+
+        fallback_path = "pg_fallback_live_error" if live_error and live_error != "graph_query_returned_no_rows" else "pg_fallback_live_empty"
+        fallback_rows, fallback_citations = self._query_graph_pg_fallback(
+            query,
+            hops=hops,
+            unavailable_detail=f"Fabric graph live query failed ({live_error or 'unknown_error'}) and SQL fallback unavailable",
+        )
+        snapshot = self._graph_circuit_snapshot()
+        fallback_enriched = self._annotate_graph_rows(
+            fallback_rows,
+            fallback_path,
+            True,
+            retry_attempts,
+            extra={
+                "graph_live_error": live_error or "graph_query_returned_no_rows",
+                **snapshot,
+            },
+        )
+        if fallback_enriched:
+            return fallback_enriched, fallback_citations
+
+        return [
+            self._source_error_row(
+                "GRAPH",
+                "graph_runtime_error",
+                live_error or "graph_query_returned_no_rows",
+                {
+                    "graph_path": "live_graph_error_no_fallback",
+                    "fallback_used": False,
+                    "retry_attempts": retry_attempts,
+                    "graph_live_error": live_error or "graph_query_returned_no_rows",
+                    **live_meta,
+                    **snapshot,
+                },
+            )
+        ], []
 
     def _query_cosmos_notams(self, query: str) -> Tuple[List[Dict], List[Citation]]:
         """Query NOTAM documents from Cosmos DB for NoSQL."""

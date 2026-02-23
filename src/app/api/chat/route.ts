@@ -12,6 +12,7 @@ const RequestSchema = z.object({
   conversationId: z.string().optional(),
   queryProfile: z.string().optional().default("pilot-brief"),
   requiredSources: z.array(z.string()).optional().default([]),
+  sourcePolicy: z.enum(["include", "exact"]).optional().default("include"),
   freshnessSlaMinutes: z.number().int().positive().optional(),
   explainRetrieval: z.boolean().optional().default(false),
   riskMode: z.enum(["standard", "strict"]).optional().default("standard"),
@@ -20,8 +21,8 @@ const RequestSchema = z.object({
   demoScenario: z.string().optional(),
 });
 
-const PYTHON_API_URL =
-  process.env.BACKEND_URL || process.env.PYTHON_API_URL || "http://localhost:5001";
+const DEV_BACKEND_FALLBACK = process.env.NODE_ENV === "development" ? "http://localhost:5001" : "";
+const PYTHON_API_URL = process.env.BACKEND_URL || process.env.PYTHON_API_URL || DEV_BACKEND_FALLBACK;
 const BACKEND_REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_REQUEST_TIMEOUT_MS || "45000");
 const CHAT_STREAM_TIMEOUT_MS = Number(process.env.CHAT_STREAM_TIMEOUT_MS || "180000");
 
@@ -101,6 +102,7 @@ export async function POST(request: NextRequest) {
       conversationId,
       queryProfile,
       requiredSources,
+      sourcePolicy,
       freshnessSlaMinutes,
       explainRetrieval,
       riskMode,
@@ -108,6 +110,12 @@ export async function POST(request: NextRequest) {
       askRecommendation,
       demoScenario,
     } = parsed.data;
+    if (!PYTHON_API_URL) {
+      return new Response(
+        JSON.stringify({ error: "Backend URL is not configured. Set BACKEND_URL or PYTHON_API_URL." }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
     const lastUserMessage = messages.filter((m) => m.role === "user").pop();
     if (!lastUserMessage) {
       return new Response(
@@ -132,6 +140,7 @@ export async function POST(request: NextRequest) {
           conversation_id: conversationId,
           query_profile: queryProfile,
           required_sources: requiredSources,
+          source_policy: sourcePolicy,
           freshness_sla_minutes: freshnessSlaMinutes,
           explain_retrieval: explainRetrieval,
           risk_mode: riskMode,

@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from shared_utils import canon_tool, normalize_source_policy, validate_source_policy_request
+
 
 VALID_SOURCES = {
     "SQL",
@@ -20,12 +22,38 @@ VALID_SOURCES = {
     "FABRIC_SQL",
 }
 
-
 def _norm_source(value: str) -> Optional[str]:
-    src = value.strip().upper()
-    if src in VALID_SOURCES:
-        return src
-    return None
+    src = canon_tool(value)
+    return src if src in VALID_SOURCES else None
+
+
+def _norm_source_policy(value: str) -> str:
+    return normalize_source_policy(value)
+
+
+class ExactPolicyValidationError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        required_sources_raw: Optional[List[str]] = None,
+        required_sources_normalized: Optional[List[str]] = None,
+        invalid_required_sources: Optional[List[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.required_sources_raw = list(required_sources_raw or [])
+        self.required_sources_normalized = list(required_sources_normalized or [])
+        self.invalid_required_sources = list(invalid_required_sources or [])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error_code": "exact_required_sources_invalid",
+            "message": str(self),
+            "required_sources_raw": self.required_sources_raw,
+            "required_sources_normalized": self.required_sources_normalized,
+            "invalid_required_sources": self.invalid_required_sources,
+            "source_policy": "exact",
+        }
 
 
 @dataclass
@@ -34,6 +62,7 @@ class RetrievalRequest:
     retrieval_mode: str = "code-rag"
     query_profile: str = "pilot-brief"
     required_sources: List[str] = field(default_factory=list)
+    source_policy: str = "include"
     freshness_sla_minutes: Optional[int] = None
     explain_retrieval: bool = False
     forced_route: Optional[str] = None
@@ -133,6 +162,7 @@ def build_retrieval_plan(
 ) -> RetrievalPlan:
     query_l = request.query.lower()
     profile = (request.query_profile or "pilot-brief").strip().lower()
+    source_policy = _norm_source_policy(request.source_policy)
 
     steps: List[SourcePlan] = []
 
@@ -147,6 +177,26 @@ def build_retrieval_plan(
                 params=params or {},
             )
         )
+
+    # Exact source policy runs only requested sources, in request order.
+    if source_policy == "exact":
+        validation = validate_source_policy_request(request.required_sources, source_policy)
+        if not validation["is_valid"]:
+            raise ExactPolicyValidationError(
+                validation["error_message"] or "Invalid exact source policy request.",
+                required_sources_raw=validation["required_sources_raw"],
+                required_sources_normalized=validation["required_sources_normalized"],
+                invalid_required_sources=validation["invalid_required_sources"],
+            )
+        for idx, src in enumerate(validation["required_sources_normalized"]):
+            add(src, "Required by request (exact source policy)", 1 + idx)
+        reasoning = route_reasoning
+        if request.explain_retrieval:
+            reasoning = (
+                f"{route_reasoning}; profile={profile}; source_policy=exact;"
+                f" sources={','.join(s.source for s in sorted(steps, key=lambda x: x.priority))}"
+            )
+        return RetrievalPlan(route=route, reasoning=reasoning, profile=profile, steps=steps)
 
     # When the router provides an explicit source list, use it as primary.
     if router_sources:
@@ -208,6 +258,9 @@ def build_retrieval_plan(
 
     reasoning = route_reasoning
     if request.explain_retrieval:
-        reasoning = f"{route_reasoning}; profile={profile}; sources={','.join(s.source for s in sorted(steps, key=lambda x: x.priority))}"
+        reasoning = (
+            f"{route_reasoning}; profile={profile}; source_policy={source_policy};"
+            f" sources={','.join(s.source for s in sorted(steps, key=lambda x: x.priority))}"
+        )
 
     return RetrievalPlan(route=route, reasoning=reasoning, profile=profile, steps=steps)

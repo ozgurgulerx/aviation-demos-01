@@ -825,7 +825,8 @@ class TestResult:
 # Test runner
 # ---------------------------------------------------------------------------
 
-def run_test(backend: str, tc: TestCase, verbose: bool = False, timeout: int = 90) -> TestResult:
+def run_test(backend: str, tc: TestCase, verbose: bool = False, timeout: int = 90,
+             skip_routing: bool = False) -> TestResult:
     """Execute a single test case against the backend SSE endpoint."""
     result = TestResult(
         test_id=tc.id,
@@ -862,6 +863,11 @@ def run_test(backend: str, tc: TestCase, verbose: bool = False, timeout: int = 9
     except requests.exceptions.ConnectionError as exc:
         result.status = "ERROR"
         result.detail = f"Connection error: {exc}"
+        result.elapsed_ms = (time.perf_counter() - t0) * 1000
+        return result
+    except (requests.exceptions.ChunkedEncodingError, Exception) as exc:
+        result.status = "ERROR"
+        result.detail = f"Stream error: {type(exc).__name__}: {str(exc)[:150]}"
         result.elapsed_ms = (time.perf_counter() - t0) * 1000
         return result
 
@@ -925,6 +931,11 @@ def run_test(backend: str, tc: TestCase, verbose: bool = False, timeout: int = 9
 
     # Routing tests: check expected_route via the retrieval_plan event
     if tc.category == "routing" and tc.expected_route:
+        # In AGENTIC mode, routing tests are meaningless (LLM picks sources, not heuristic)
+        if skip_routing or result.actual_route == "AGENTIC":
+            result.status = "SKIP"
+            result.detail = f"route={result.actual_route or '?'} (AGENTIC mode — routing test skipped)"
+            return result
         if result.actual_route:
             if result.actual_route == tc.expected_route:
                 result.status = "PASS"
@@ -1107,6 +1118,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=90, help="Per-request timeout in seconds")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="Print test matrix with local heuristic predictions without hitting backend")
+    parser.add_argument("--skip-routing", action="store_true", dest="skip_routing",
+                        help="Skip routing tests (R*) — useful when backend uses AGENTIC orchestrator")
     args = parser.parse_args()
 
     # Filter tests
@@ -1142,6 +1155,7 @@ def main():
     fail_count = 0
     warn_count = 0
     error_count = 0
+    skip_count = 0
 
     for idx, tc in enumerate(tests_to_run, 1):
         print(f"[{idx}/{total}] {tc.id}: {tc.description}")
@@ -1151,7 +1165,8 @@ def main():
             if tc.expected_route:
                 print(f"    Expected route: {tc.expected_route}")
 
-        result = run_test(args.backend, tc, verbose=args.verbose, timeout=args.timeout)
+        result = run_test(args.backend, tc, verbose=args.verbose, timeout=args.timeout,
+                          skip_routing=args.skip_routing)
         results.append(result)
 
         icon = {"PASS": "+", "FAIL": "x", "WARN": "~", "ERROR": "!", "SKIP": "-"}.get(result.status, "?")
@@ -1169,6 +1184,8 @@ def main():
             fail_count += 1
         elif result.status == "WARN":
             warn_count += 1
+        elif result.status == "SKIP":
+            skip_count += 1
         else:
             error_count += 1
 
@@ -1178,6 +1195,7 @@ def main():
     print("=" * 70)
     print(f"  Total: {total}")
     print(f"  PASS:  {pass_count}")
+    print(f"  SKIP:  {skip_count}")
     print(f"  WARN:  {warn_count}")
     print(f"  FAIL:  {fail_count}")
     print(f"  ERROR: {error_count}")
@@ -1195,7 +1213,11 @@ def main():
             f = sum(1 for r in cat_results if r.status == "FAIL")
             w = sum(1 for r in cat_results if r.status == "WARN")
             e = sum(1 for r in cat_results if r.status == "ERROR")
-            print(f"  {cat:<20} {len(cat_results):3d} total | {p} pass | {w} warn | {f} fail | {e} error")
+            sk = sum(1 for r in cat_results if r.status == "SKIP")
+            parts = f"{len(cat_results):3d} total | {p} pass | {w} warn | {f} fail | {e} error"
+            if sk:
+                parts += f" | {sk} skip"
+            print(f"  {cat:<20} {parts}")
         print()
 
     # Source coverage matrix
