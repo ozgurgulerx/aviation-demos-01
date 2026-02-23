@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import base64
+import time
+import urllib.parse
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -22,9 +25,110 @@ logger = logging.getLogger(__name__)
 import shared_utils  # noqa: F401  — ensures load_dotenv() runs
 
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT", "").strip()
+_FABRIC_DEFAULT_SCOPE = "https://api.fabric.microsoft.com/.default"
+_fabric_token_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _allow_static_fabric_bearer() -> bool:
+    return os.getenv("ALLOW_STATIC_FABRIC_BEARER", "false").strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+
+def _token_min_ttl_seconds() -> int:
+    raw = os.getenv("FABRIC_TOKEN_MIN_TTL_SECONDS", "120").strip()
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 120
+
+
+def _token_ttl_seconds(token: str) -> int | None:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8", errors="ignore"))
+        exp = int(claims.get("exp", 0))
+        return exp - int(time.time())
+    except Exception:
+        return None
+
+
+def _scope_for_graph_endpoint() -> str:
+    endpoint = (FABRIC_GRAPH_ENDPOINT or "").strip()
+    parsed = urllib.parse.urlparse(endpoint)
+    host = str(parsed.hostname or "").lower()
+    if parsed.scheme and parsed.hostname and "kusto.fabric.microsoft.com" in host:
+        return f"{parsed.scheme}://{parsed.hostname}/.default"
+    return _FABRIC_DEFAULT_SCOPE
+
+
 def _get_fabric_bearer_token() -> str:
-    """Re-read bearer token from env on each call so rotated tokens take effect."""
-    return os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+    """Acquire refreshable Fabric token; allow static bearer only when explicitly enabled."""
+    min_ttl = _token_min_ttl_seconds()
+    refresh_buffer = max(30, min_ttl)
+    scope = _scope_for_graph_endpoint()
+    client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
+    client_secret = os.getenv("FABRIC_CLIENT_SECRET", "").strip()
+    tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
+    if client_id and client_secret and tenant_id:
+        cache_entry = _fabric_token_cache.get(scope, {})
+        cached = str(cache_entry.get("token", "") or "")
+        expires_at = float(cache_entry.get("expires_at", 0) or 0)
+
+        def _cached_token_is_fresh() -> bool:
+            if not cached:
+                return False
+            now = time.time()
+            if now >= (expires_at - refresh_buffer):
+                return False
+            ttl = _token_ttl_seconds(cached)
+            return ttl is None or ttl >= min_ttl
+
+        if _cached_token_is_fresh():
+            return cached
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": scope,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(token_url, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read())
+            token = str(payload.get("access_token", "") or "")
+            ttl = _token_ttl_seconds(token)
+            if token and (ttl is None or ttl >= min_ttl):
+                expires_in = int(payload.get("expires_in", 3600))
+                _fabric_token_cache[scope] = {
+                    "token": token,
+                    "expires_at": time.time() + expires_in,
+                }
+                return token
+        except Exception:
+            logger.warning("Intent graph SP token acquisition failed", exc_info=True)
+            if _cached_token_is_fresh():
+                return cached
+            if cached:
+                logger.warning("Intent graph cached SP token is stale; ignoring cached fallback")
+                _fabric_token_cache.pop(scope, None)
+
+    static = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+    if static and _allow_static_fabric_bearer():
+        ttl = _token_ttl_seconds(static)
+        if ttl is None or ttl >= min_ttl:
+            return static
+    return ""
 INTENT_GRAPH_JSON_PATH = os.getenv("INTENT_GRAPH_JSON_PATH", "").strip()
 
 ROOT = Path(__file__).resolve().parents[1]
