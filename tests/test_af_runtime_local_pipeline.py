@@ -179,6 +179,11 @@ class AgentFrameworkRuntimeLocalPipelineTests(unittest.TestCase):
         self.assertIn("could not produce a full synthesized brief", streamed_text.lower())
         self.assertIsNone(done_event)
 
+        partial_done = next((e for e in events if e.get("type") == "agent_partial_done"), None)
+        self.assertIsNotNone(partial_done)
+        self.assertTrue(partial_done.get("partial"))
+        self.assertFalse(partial_done.get("isVerified"))
+
     def test_local_pipeline_propagates_llm_refusal_as_terminal_error(self):
         runtime = self._build_runtime_with_refusal_synthesis()
 
@@ -212,6 +217,11 @@ class AgentFrameworkRuntimeLocalPipelineTests(unittest.TestCase):
         self.assertIsNotNone(synthesis_error)
         self.assertEqual(synthesis_error.get("terminal_reason"), "llm_refusal")
         self.assertIsNone(done_event)
+
+        partial_done = next((e for e in events if e.get("type") == "agent_partial_done"), None)
+        self.assertIsNotNone(partial_done)
+        self.assertTrue(partial_done.get("partial"))
+        self.assertFalse(partial_done.get("isVerified"))
 
     def test_local_pipeline_sanitizes_internal_synthesis_errors(self):
         runtime = self._build_runtime_with_internal_synthesis_error()

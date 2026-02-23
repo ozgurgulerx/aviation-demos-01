@@ -792,6 +792,17 @@ class AgentFrameworkRuntime:
                     failOpen=True,
                     route=ctx.route,
                 )
+                yield self._build_partial_done_event(
+                    route=ctx.route,
+                    reasoning=ctx.reasoning,
+                    session_id=session_id,
+                    framework=self._framework_label,
+                    degraded_sources=degraded_sources,
+                    failed_required_sources=failed_required_sources,
+                    required_sources_satisfied=required_sources_satisfied,
+                    failure_policy=failure_policy,
+                    source_policy=source_policy,
+                )
                 return
         else:
             af_answer_text = answer
@@ -833,6 +844,17 @@ class AgentFrameworkRuntime:
                 message=EMPTY_SYNTHESIS_ERROR,
                 error_code="empty_synthesis_output",
                 terminal_reason="empty_synthesis_output",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
+            yield self._build_partial_done_event(
+                route=ctx.route,
+                reasoning=ctx.reasoning,
+                session_id=session_id,
+                framework=self._framework_label,
                 degraded_sources=degraded_sources,
                 failed_required_sources=failed_required_sources,
                 required_sources_satisfied=required_sources_satisfied,
@@ -1140,6 +1162,17 @@ class AgentFrameworkRuntime:
                 failOpen=True,
                 route=route,
             )
+            yield self._build_partial_done_event(
+                route=route,
+                reasoning=reasoning,
+                session_id=session_id,
+                framework="local-fallback",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
             return
 
         if citations_payload:
@@ -1187,6 +1220,17 @@ class AgentFrameworkRuntime:
                 message=EMPTY_SYNTHESIS_ERROR,
                 error_code="empty_synthesis_output",
                 terminal_reason="empty_synthesis_output",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
+            yield self._build_partial_done_event(
+                route=route,
+                reasoning=reasoning,
+                session_id=session_id,
+                framework="local-fallback",
                 degraded_sources=degraded_sources,
                 failed_required_sources=failed_required_sources,
                 required_sources_satisfied=required_sources_satisfied,
@@ -1356,6 +1400,36 @@ class AgentFrameworkRuntime:
             "failurePolicy": failure_policy,
             "sourcePolicy": source_policy,
             "partial": False,
+        }
+
+    @staticmethod
+    def _build_partial_done_event(
+        *,
+        route: str,
+        reasoning: str,
+        session_id: str,
+        framework: str,
+        degraded_sources: List[str],
+        failed_required_sources: List[str],
+        required_sources_satisfied: bool,
+        failure_policy: str,
+        source_policy: str,
+    ) -> Dict[str, Any]:
+        return {
+            "type": "agent_partial_done",
+            "isVerified": False,
+            "route": route,
+            "reasoning": reasoning,
+            "sessionId": session_id,
+            "framework": framework,
+            "degradedSources": degraded_sources,
+            "failedRequiredSources": failed_required_sources,
+            "requiredSourcesSatisfied": required_sources_satisfied,
+            "missingRequiredSources": failed_required_sources,
+            "fatalSourceCount": len(degraded_sources),
+            "failurePolicy": failure_policy,
+            "sourcePolicy": source_policy,
+            "partial": True,
         }
 
     def _normalize_synthesis_error_event(
@@ -1729,7 +1803,7 @@ class AgentFrameworkRuntime:
             elif event.get("type") in {"agent_done", "agent_partial_done"}:
                 metadata = event
 
-        if terminal_error and not metadata:
+        if terminal_error:
             return {
                 "answer": "".join(answer_parts).strip(),
                 "citations": citations,

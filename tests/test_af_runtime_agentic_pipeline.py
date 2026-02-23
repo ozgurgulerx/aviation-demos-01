@@ -85,6 +85,11 @@ class AgentFrameworkRuntimeAgenticPipelineTests(unittest.TestCase):
         self.assertIn("could not produce a full synthesized brief", streamed_text.lower())
         self.assertIsNone(done_event)
 
+        partial_done = next((e for e in events if e.get("type") == "agent_partial_done"), None)
+        self.assertIsNotNone(partial_done)
+        self.assertTrue(partial_done.get("partial"))
+        self.assertFalse(partial_done.get("isVerified"))
+
 
 if __name__ == "__main__":
     unittest.main()
