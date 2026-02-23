@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -564,6 +565,9 @@ class AviationRagContextProvider:
                 if tool == "KQL" and self._is_airport_only_kql_call(call.query or query):
                     plan.warnings.append("tool_pruned_unmappable_airport_kql:KQL")
                     continue
+                if tool == "FABRIC_SQL" and self._is_short_horizon_departure_risk_query(call.query or query):
+                    plan.warnings.append("tool_pruned_short_horizon_departure_risk_fabric_sql:FABRIC_SQL")
+                    continue
 
             kept.append(call)
             kept_ids.add(call.id)
@@ -598,6 +602,22 @@ class AviationRagContextProvider:
         if "callsign" in lower or "icao24" in lower:
             return False
         return True
+
+    def _is_short_horizon_departure_risk_query(self, query: str) -> bool:
+        text = str(query or "")
+        lower = text.lower()
+        airports = self.retriever._extract_airports_from_query(text)
+        if len(airports) < 2:
+            return False
+
+        horizon_pattern = re.compile(
+            r"\bnext[-\s]?\d{1,3}\s*(?:[-\s]?minute(?:s)?|[-\s]?min|m)\b",
+            flags=re.IGNORECASE,
+        )
+        has_short_horizon = bool(horizon_pattern.search(text))
+        has_departure_risk = ("departure" in lower and "risk" in lower) or ("flight risk" in lower)
+        has_compare = any(token in lower for token in ("compare", "across", "versus", "vs"))
+        return has_short_horizon and has_departure_risk and has_compare
 
     def _execute_plan(
         self,

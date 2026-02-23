@@ -92,6 +92,34 @@ class _StillBrokenSQLWriter:
         return "SELECT still_bad FROM demo.ourairports_runways LIMIT 5"
 
 
+class _KqlFallbackRetriever(_DummyRetriever):
+    def prepare_kql_query(self, query: str, window_minutes: int = 120):
+        return query, {"query_rewritten": False}
+
+    def query_kql(self, query: str, window_minutes: int = 120, kql_schema=None):
+        normalized = str(query or "").strip().lower()
+        if "invalid_generated_kql" in normalized or "invalid_retry_kql" in normalized:
+            return [
+                {
+                    "error": "kql_unknown_columns:airport,total_risk",
+                    "error_code": "kql_validation_failed",
+                }
+            ], []
+        if "compare next-90-minute flight risk across saw, ayt, adb" in normalized:
+            return [
+                {
+                    "error": "airport identifiers cannot be mapped to opensky_states without explicit callsign or icao24 values",
+                    "error_code": "kql_unmappable_airport_filter",
+                }
+            ], []
+        return [{"status": "unexpected_query_path"}], []
+
+
+class _RetryBrokenKQLWriter:
+    def generate(self, **_kwargs):
+        return "invalid_retry_kql | project airport, total_risk"
+
+
 class PlanExecutorTests(unittest.TestCase):
     def test_execute_preserves_multiple_calls_same_source(self):
         retriever = _DummyRetriever()
@@ -222,6 +250,41 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertEqual(
             done_events[0].get("rewrite_reason"),
             "sql_regenerated_after_validation_failed+heuristic_fallback",
+        )
+
+    def test_kql_validation_failure_regeneration_falls_back_to_natural_language_query(self):
+        retriever = _KqlFallbackRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        executor.kql_writer = _RetryBrokenKQLWriter()  # type: ignore[assignment]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_kql_fallback",
+                    tool="KQL",
+                    operation="lookup",
+                    query="invalid_generated_kql | project airport, total_risk",
+                    params={"evidence_type": "Hazards"},
+                )
+            ]
+        )
+
+        result = executor.execute(
+            user_query="compare next-90-minute flight risk across SAW, AYT, ADB",
+            plan=plan,
+            schemas={"kql_schema": {"tables": []}},
+        )
+
+        self.assertIn("KQL", result.source_results)
+        rows = result.source_results["KQL"]
+        self.assertEqual(rows[0].get("error_code"), "kql_unmappable_airport_filter")
+        done_events = [
+            e for e in result.source_traces
+            if e.get("type") == "source_call_done" and e.get("source") == "KQL"
+        ]
+        self.assertTrue(done_events)
+        self.assertEqual(
+            done_events[0].get("rewrite_reason"),
+            "kql_regenerated_then_nl_fallback",
         )
 
 

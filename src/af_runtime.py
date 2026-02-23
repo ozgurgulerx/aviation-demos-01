@@ -775,6 +775,16 @@ class AgentFrameworkRuntime:
                 yield event
             af_answer_text = "".join(af_answer_parts)
             if synthesis_terminal_error:
+                if not af_answer_text.strip():
+                    for event in self._emit_no_answer_fallback_text(
+                        route=ctx.route,
+                        degraded_sources=degraded_sources,
+                        failed_required_sources=failed_required_sources,
+                        required_sources_satisfied=required_sources_satisfied,
+                        failure_policy=failure_policy,
+                        source_policy=source_policy,
+                    ):
+                        yield event
                 yield self._reasoning_stage_event(
                     "evidence_check_complete",
                     "Evidence verification complete",
@@ -800,6 +810,15 @@ class AgentFrameworkRuntime:
             is_verified = len(ctx.citations) > 0
 
         if not af_answer_text.strip():
+            for event in self._emit_no_answer_fallback_text(
+                route=ctx.route,
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            ):
+                yield event
             yield self._reasoning_stage_event(
                 "evidence_check_complete",
                 "Evidence verification complete",
@@ -1104,6 +1123,16 @@ class AgentFrameworkRuntime:
             yield event
         local_answer_text = "".join(local_answer_parts)
         if synthesis_terminal_error:
+            if not local_answer_text.strip():
+                for event in self._emit_no_answer_fallback_text(
+                    route=route,
+                    degraded_sources=degraded_sources,
+                    failed_required_sources=failed_required_sources,
+                    required_sources_satisfied=required_sources_satisfied,
+                    failure_policy=failure_policy,
+                    source_policy=source_policy,
+                ):
+                    yield event
             yield self._reasoning_stage_event(
                 "evidence_check_complete",
                 "Evidence verification complete",
@@ -1135,6 +1164,15 @@ class AgentFrameworkRuntime:
             local_is_verified = len(citations_payload) > 0
 
         if not local_answer_text.strip():
+            for event in self._emit_no_answer_fallback_text(
+                route=route,
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            ):
+                yield event
             yield self._reasoning_stage_event(
                 "evidence_check_complete",
                 "Evidence verification complete",
@@ -1388,6 +1426,58 @@ class AgentFrameworkRuntime:
         if any(token in lowered for token in sensitive_tokens):
             return "An internal error occurred while preparing the response."
         return text
+
+    def _emit_no_answer_fallback_text(
+        self,
+        *,
+        route: str,
+        degraded_sources: List[str],
+        failed_required_sources: List[str],
+        required_sources_satisfied: bool,
+        failure_policy: str,
+        source_policy: str,
+    ) -> Generator[Dict[str, Any], None, None]:
+        message = self._build_no_answer_fallback_text(
+            route=route,
+            degraded_sources=degraded_sources,
+            failed_required_sources=failed_required_sources,
+            required_sources_satisfied=required_sources_satisfied,
+            failure_policy=failure_policy,
+            source_policy=source_policy,
+        )
+        for event in self._emit_text_chunks(message):
+            yield event
+
+    @staticmethod
+    def _build_no_answer_fallback_text(
+        *,
+        route: str,
+        degraded_sources: List[str],
+        failed_required_sources: List[str],
+        required_sources_satisfied: bool,
+        failure_policy: str,
+        source_policy: str,
+    ) -> str:
+        route_label = str(route or "UNKNOWN")
+        failure_label = str(failure_policy or "graceful")
+        policy_label = str(source_policy or "include")
+
+        lines = [
+            "I could not produce a full synthesized brief from the retrieved evidence.",
+            f"Status: partial fail-open (route={route_label}, failurePolicy={failure_label}, sourcePolicy={policy_label}).",
+        ]
+        if degraded_sources:
+            lines.append("Degraded sources: " + ", ".join(sorted(set(str(s) for s in degraded_sources if s))) + ".")
+        if failed_required_sources:
+            lines.append(
+                "Required sources still failing: "
+                + ", ".join(sorted(set(str(s) for s in failed_required_sources if s)))
+                + "."
+            )
+        elif required_sources_satisfied:
+            lines.append("At least one call succeeded for each required source.")
+        lines.append("Retry with a narrower source scope or rerun shortly to refresh live evidence.")
+        return " ".join(line for line in lines if line)
 
     def _call_with_common_kwargs(self, fn: Any, prompt: str, session: Any, session_id: str) -> Any:
         attempts = (

@@ -380,6 +380,7 @@ class PlanExecutor:
         if source == "KQL":
             kql_query = call.query
             kql_schema = schemas.get("kql_schema", {})
+            call.params = dict(call.params or {})
             if not kql_query or not self._looks_like_kql(kql_query):
                 try:
                     kql_query = self._get_kql_writer().generate(
@@ -430,6 +431,7 @@ class PlanExecutor:
                 and original_kql
                 and self._looks_like_kql(original_kql)
             ):
+                use_nl_fallback = False
                 try:
                     regenerated = self._get_kql_writer().generate(
                         user_query=user_query,
@@ -446,13 +448,15 @@ class PlanExecutor:
                         kql_schema=kql_schema,
                     )
                     retry_error = retry_rows[0].get("error_code") if retry_rows and isinstance(retry_rows[0], dict) else ""
-                    if retry_error != "kql_validation_failed":
+                    if retry_error not in {"kql_validation_failed", "kql_runtime_error"}:
                         rows, citations = retry_rows, retry_citations
                         kql_query = regenerated
                         reason = "regenerated_after_validation_failed"
                         if regen_meta.get("query_rewritten"):
                             reason = f"{reason}+{regen_meta.get('rewrite_reason')}"
                         call.params["__runtime_rewrite_reason"] = reason
+                    else:
+                        use_nl_fallback = True
                 except Exception as exc:
                     rows.append(
                         {
@@ -460,6 +464,16 @@ class PlanExecutor:
                             "detail": str(exc),
                         }
                     )
+                    use_nl_fallback = True
+
+                if use_nl_fallback:
+                    rows, citations = self.retriever.query_kql(
+                        user_query,
+                        window_minutes=window,
+                        kql_schema=kql_schema,
+                    )
+                    kql_query = user_query
+                    call.params["__runtime_rewrite_reason"] = "kql_regenerated_then_nl_fallback"
             return rows, citations, kql_query
 
         if source == "GRAPH":

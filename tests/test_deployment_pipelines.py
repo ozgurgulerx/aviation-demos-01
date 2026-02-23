@@ -1049,6 +1049,21 @@ class TestDeploymentSafety:
             # These should NOT appear as keys in the configmap
             assert f"  {secret_var}:" not in cm_raw or "PGPASSWORD" not in cm_raw
 
+    def test_runtime_identity_envs_are_not_wired_to_expected_guardrail_values(self):
+        cm_raw = _read(os.path.join(K8S_DIR, "backend-configmap.yaml"))
+        assert 'AZURE_ACCOUNT_UPN: "${AZURE_ACCOUNT_UPN}"' in cm_raw
+        assert 'AZURE_TENANT_ID: "${AZURE_TENANT_ID}"' in cm_raw
+        assert 'AZURE_SUBSCRIPTION_ID: "${AZURE_SUBSCRIPTION_ID}"' in cm_raw
+        assert 'AZURE_ACCOUNT_UPN: "${EXPECTED_RUNTIME_ACCOUNT_UPN}"' not in cm_raw
+        assert 'AZURE_TENANT_ID: "${EXPECTED_RUNTIME_TENANT_ID}"' not in cm_raw
+        assert 'AZURE_SUBSCRIPTION_ID: "${EXPECTED_RUNTIME_SUBSCRIPTION_ID}"' not in cm_raw
+
+    def test_render_script_does_not_default_runtime_identity_from_expected_values(self):
+        content = _read(os.path.join(SCRIPTS_DIR, "render-k8s-manifests.sh"))
+        assert ': "${AZURE_ACCOUNT_UPN:=${EXPECTED_RUNTIME_ACCOUNT_UPN}}"' not in content
+        assert ': "${AZURE_TENANT_ID:=${EXPECTED_RUNTIME_TENANT_ID}}"' not in content
+        assert ': "${AZURE_SUBSCRIPTION_ID:=${EXPECTED_RUNTIME_SUBSCRIPTION_ID}}"' not in content
+
     def test_provision_script_has_strict_mode(self):
         content = _read(os.path.join(SCRIPTS_DIR, "provision-azure.sh"))
         assert "set -euo pipefail" in content

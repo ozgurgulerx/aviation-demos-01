@@ -174,6 +174,55 @@ class AgenticExactSourcePolicyTests(unittest.TestCase):
         self.assertEqual(len(out.tool_calls), 0)
         self.assertIn("tool_pruned_unmappable_airport_kql:KQL", out.warnings)
 
+    def test_non_exact_policy_prunes_fabric_sql_for_short_horizon_departure_risk_compare(self):
+        provider = self._provider()
+        provider.retriever = _FakeRetriever(
+            [
+                {"source": "FABRIC_SQL", "status": "healthy", "reason_code": "ready"},
+            ]
+        )
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(id="call_fabric_sql", tool="FABRIC_SQL", operation="lookup", depends_on=[]),
+            ]
+        )
+
+        out = provider._prune_non_viable_tool_calls(
+            plan=plan,
+            required_sources=[],
+            source_policy="include",
+            query="compare next-90-minute departure risk across SAW, AYT, ADB",
+        )
+
+        self.assertEqual(len(out.tool_calls), 0)
+        self.assertIn(
+            "tool_pruned_short_horizon_departure_risk_fabric_sql:FABRIC_SQL",
+            out.warnings,
+        )
+
+    def test_non_exact_policy_keeps_required_fabric_sql_for_short_horizon_departure_risk_compare(self):
+        provider = self._provider()
+        provider.retriever = _FakeRetriever(
+            [
+                {"source": "FABRIC_SQL", "status": "healthy", "reason_code": "ready"},
+            ]
+        )
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(id="call_fabric_sql", tool="FABRIC_SQL", operation="lookup", depends_on=[]),
+            ]
+        )
+
+        out = provider._prune_non_viable_tool_calls(
+            plan=plan,
+            required_sources=["FABRIC_SQL"],
+            source_policy="include",
+            query="compare next-90-minute departure risk across SAW, AYT, ADB",
+        )
+
+        self.assertEqual(len(out.tool_calls), 1)
+        self.assertEqual(out.tool_calls[0].tool, "FABRIC_SQL")
+
 
 if __name__ == "__main__":
     unittest.main()

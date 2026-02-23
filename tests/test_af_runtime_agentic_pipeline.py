@@ -74,9 +74,15 @@ class AgentFrameworkRuntimeAgenticPipelineTests(unittest.TestCase):
             None,
         )
         done_event = next((event for event in events if event.get("type") == "agent_done"), None)
+        streamed_text = "".join(
+            str(event.get("content", ""))
+            for event in events
+            if event.get("type") == "agent_update" and event.get("content")
+        )
 
         self.assertIsNotNone(synthesis_error)
         self.assertIn("without answer text", str(synthesis_error.get("message", "")).lower())
+        self.assertIn("could not produce a full synthesized brief", streamed_text.lower())
         self.assertIsNone(done_event)
 
 
