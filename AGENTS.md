@@ -99,6 +99,13 @@ Before finalizing tenant/infra/fabric/runtime changes, confirm:
 
 If any preflight check fails, stop and surface the blocker.
 
+## Subscription Guardrail
+
+For any Azure action in this repository, use only the subscription tied to `admin@MngEnvMCAP705508.onmicrosoft.com`.
+
+- Treat any other subscription as out of policy unless the active user conversation explicitly overrides this rule.
+- If docs, memory, scripts, CLI context, or environment values conflict with this guardrail, stop and surface the mismatch before proceeding.
+
 ## Local Change Policy
 
 Treat unexpected local tracked/untracked source changes as intentional by default and include them in the working set unless the user explicitly says to exclude them.

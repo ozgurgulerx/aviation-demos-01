@@ -119,8 +119,28 @@ export function TimelinePanel({
             const pulse = subtlePulse(source.status === "querying", !!reducedMotion);
             const sourceSnapshot = sourceSnapshots[source.source];
             const hasPreview = !!sourceSnapshot && sourceSnapshot.rowsPreview.length > 0;
+            const canOpenDetails = hasPreview || source.status === "error";
             return (
-              <motion.div key={source.source} animate={pulse} className="rounded-full">
+              <motion.div
+                key={source.source}
+                animate={pulse}
+                className={canOpenDetails ? "cursor-pointer rounded-full" : "rounded-full"}
+                onClick={() => {
+                  if (canOpenDetails) {
+                    setSelectedSource(source.source);
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (!canOpenDetails) return;
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelectedSource(source.source);
+                  }
+                }}
+                role={canOpenDetails ? "button" : undefined}
+                tabIndex={canOpenDetails ? 0 : undefined}
+                aria-label={canOpenDetails ? `Open ${visual.shortLabel} source details` : undefined}
+              >
                 <Badge
                   variant={
                     source.status === "ready"
@@ -154,7 +174,7 @@ export function TimelinePanel({
                     </span>
                   )}
                   <AnimatePresence mode="popLayout" initial={false}>
-                    {source.rowCount > 0 && (
+                    {(source.rowCount > 0 || canOpenDetails) && (
                       <motion.button
                         key={`${source.source}-${source.rowCount}`}
                         type="button"
@@ -163,7 +183,8 @@ export function TimelinePanel({
                         exit={reducedMotion ? { opacity: 1, y: 0 } : { opacity: 0, y: -4 }}
                         transition={{ duration: reducedMotion ? 0 : motionTokens.micro }}
                         className="rounded border border-border/70 bg-background/70 px-1.5 font-mono text-[10px] hover:bg-background disabled:cursor-not-allowed disabled:opacity-55"
-                        onClick={() => {
+                        onClick={(event) => {
+                          event.stopPropagation();
                           if (hasPreview || source.status === "error") {
                             setSelectedSource(source.source);
                           }
@@ -171,7 +192,11 @@ export function TimelinePanel({
                         disabled={!hasPreview && source.status !== "error"}
                         title={hasPreview ? "View retrieved rows" : source.status === "error" ? "View error details" : "No row preview available for this source call"}
                       >
-                        {source.rowCount} rows
+                        {source.rowCount > 0
+                          ? `${source.rowCount} rows`
+                          : source.status === "error"
+                            ? "error"
+                            : "preview"}
                       </motion.button>
                     )}
                   </AnimatePresence>
