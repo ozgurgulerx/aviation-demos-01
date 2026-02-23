@@ -14,11 +14,13 @@ Last updated: 2026-02-23
 ## Identity and tenant context
 
 - Primary admin identity: `admin@MngEnvMCAP705508.onmicrosoft.com` (user-provided)
-- Tenant IDs/domains used:
-  - `16b3c013-d300-468d-ac64-7eda0820b6d3` (`fdpo.onmicrosoft.com`) from `docs/FDPO_FABRIC_CURRENT_STATUS.md`
-  - One MTC tenant is referenced in `docs/FABRIC_SERVICE_PRINCIPAL_SETUP.md` for Fabric service principal bootstrap
+- Hard guardrail tenant/domain:
+  - Tenant ID: `52095a81-130f-4b06-83f1-9859b2c73de6`
+  - Domain: `MngEnvMCAP705508.onmicrosoft.com`
 - Subscription(s) in scope:
-  - Foundry subscription: `a20bc194-9787-44ee-9c7f-7c3130e651b6` (`MCAPS-Hybrid-REQ-102171-2024-ozgurguler`)
+  - Runtime/deploy subscription: `6a539906-6ce2-4e3b-84ee-89f701de18d8` (`ME-MngEnvMCAP705508-ozgurguler-1`)
+- Out-of-policy context:
+  - Any tenant/subscription outside the hard guardrail above must be treated as drift and blocked.
 - Notes:
   - This file stores non-secret memory only.
 
@@ -36,7 +38,8 @@ Default runtime naming and layout:
 - Region: `westeurope`
 - VNet: `vnet-aviation-rag`
 - AKS/App runtime: `aks-aviation-rag`
-- Registry: `aviationragacr`
+- AKS node architecture (verified 2026-02-23): `amd64`
+- Registry: `avrag705508acr`
 - Namespace: `aviation-rag`
 - Databases:
   - PostgreSQL server: `aviationragpg`
@@ -52,33 +55,28 @@ Network defaults:
   - Private endpoint subnet: `10.0.5.0/24`
 - Service CIDR: `10.1.0.0/16`
 
-## Azure AI Foundry context (active project wiring)
+## Azure OpenAI and search runtime context
 
-- Foundry subscription: `a20bc194-9787-44ee-9c7f-7c3130e651b6` (`MCAPS-Hybrid-REQ-102171-2024-ozgurguler`)
-- Foundry account: `ai-eastus2hubozguler527669401205` (`rg-openai`, `eastus2`)
-- Foundry project resource: `ai-eastus2hubozguler527-project`
-- Project endpoint: `https://ai-eastus2hubozguler527669401205.services.ai.azure.com/api/projects/ai-eastus2hubozguler527-project`
-
-Deployments currently used:
-
-- Chat: `aviation-chat-gpt5-mini` -> `gpt-5-mini` (`2025-08-07`), `GlobalStandard`, capacity `50`
-- Voice/TTS: `aviation-voice-tts` -> `gpt-4o-mini-tts` (`2025-12-15`), `GlobalStandard`, capacity `20`
-- Realtime/audio: `aviation-voice-gpt4o-audio` -> `gpt-4o-audio-preview` (`2024-12-17`), `GlobalStandard`, capacity `20`
-- Embeddings (if applicable): not separately tracked in this file
+- Subscription: `6a539906-6ce2-4e3b-84ee-89f701de18d8` (`ME-MngEnvMCAP705508-ozgurguler-1`)
+- Azure OpenAI account: `aoaiaviation705508` (`rg-openai`, `swedencentral`)
+- Azure OpenAI endpoint: `https://swedencentral.api.cognitive.microsoft.com/`
+- Azure AI Search service: `aisearchozguler` (`rg-openai`, `swedencentral`)
+- Azure AI Search endpoint: `https://aisearchozguler.search.windows.net`
+- Out-of-policy (historical only): `ai-eastus2hubozguler527669401205` and the corresponding Foundry project endpoint are not in the guardrail tenant/subscription and must not be used for runtime/deploy.
 
 Runtime defaults expected:
 
-- Backend env defaults:
-  - `AZURE_OPENAI_DEPLOYMENT_NAME=aviation-chat-gpt5-mini`
-- Frontend env defaults:
-  - `AZURE_OPENAI_ENDPOINT=https://ai-eastus2hubozguler527669401205.cognitiveservices.azure.com/`
+- Backend:
+  - `AZURE_OPENAI_DEPLOYMENT_NAME=gpt-5-nano`
+  - `AZURE_SEARCH_ENDPOINT=https://aisearchozguler.search.windows.net`
+- Frontend:
+  - `AZURE_OPENAI_ENDPOINT=https://swedencentral.api.cognitive.microsoft.com/`
+  - `AZURE_OPENAI_AUTH_MODE=api-key`
   - `AZURE_OPENAI_VOICE_DEPLOYMENT_NAME=aviation-voice-tts`
   - `AZURE_OPENAI_VOICE_MODEL=gpt-4o-mini-tts`
   - `AZURE_OPENAI_VOICE_API_VERSION=2025-03-01-preview`
-  - `AZURE_OPENAI_AUTH_MODE=token`
   - `AZURE_OPENAI_VOICE_TURKISH=alloy`
   - `AZURE_OPENAI_VOICE_ENGLISH=alloy`
-  - Token auth supports Entra service principal (`AZURE_OPENAI_TENANT_ID`, `AZURE_OPENAI_CLIENT_ID`, `AZURE_OPENAI_CLIENT_SECRET`) and managed identity (`AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID`)
 
 ## Fabric integration context
 
@@ -101,6 +99,13 @@ Runtime integration in code:
   - Frontend proxy: `src/app/api/fabric/preflight/route.ts`
 - Core modules:
   - `src/unified_retriever.py`
+
+Fabric runtime guardrails (verified policy):
+
+- Kusto endpoint values must be either cluster root or explicit `/v1/rest/query` or `/v2/rest/query` paths.
+- Fabric auth should use SP credentials first (`FABRIC_CLIENT_ID`/`FABRIC_CLIENT_SECRET`/`FABRIC_TENANT_ID`), with static `FABRIC_BEARER_TOKEN` as fallback only.
+- Fabric SQL execution policy is REST-first when `FABRIC_SQL_ENDPOINT` is configured.
+- Fabric preflight health claims require query-readiness checks (`path_valid_for_runtime`, `query_ready`), not only endpoint reachability.
 
 Current tracked status:
 
@@ -146,6 +151,11 @@ Current tracked status:
 
 ## Decision log (non-secret)
 
+- 2026-02-23: Hard-locked backend image architecture for AKS compatibility.
+  - Decision: Added policy guardrail that `aviation-rag-backend` release images must be `linux/amd64`, with explicit build-platform pinning and manifest verification before rollout.
+  - Why: Prevent wrong-architecture image pulls during AKS deployment/boot and avoid rollout failures on `amd64` node pools.
+  - Sources: `kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" arch="}{.status.nodeInfo.architecture}{"\\n"}{end}'`, `kubectl get deploy aviation-rag-backend -n aviation-rag -o jsonpath='{.spec.template.spec.containers[0].image}{"\\n"}'`, `az acr manifest list-metadata --registry avrag705508acr --name aviation-rag-backend --orderby time_desc --top 3 -o json`.
+  - Changed-from: No explicit image-platform lock in `AGENTS.md`.
 - 2026-02-23: Standardized memory contract.
   - Decision: Keep `AGENTS.md` policy-only and treat `docs/CODEX_MEMORY.md` as volatile factual memory.
   - Why: Reduce regressions from stale runtime values in policy files.
@@ -166,3 +176,73 @@ Current tracked status:
   - Why: Avoid deployment failures in environments that use a non-default ACR while preserving strict ACR target validation.
   - Sources: `.github/workflows/deploy-backend.yaml`, `tests/test_deployment_pipelines.py`.
   - Changed-from: Hard-coded `aviationragacr` / `aviationragacr.azurecr.io`.
+- 2026-02-23: Hardened KQL/SQL/Fabric SQL execution validation and fallback behavior.
+  - Decision: Added KQL sanitize+validate flow (including schema-aware table/column checks and unsupported function guard), added SQL column-level schema validation pre-execution, and changed FABRIC_SQL capability handling to use TDS only when `pyodbc`/driver prerequisites are available with automatic REST fallback when configured.
+  - Why: Prevent runtime failures caused by malformed planner-generated KQL/SQL and missing TDS dependencies (`pyodbc`) during live demos.
+  - Sources: `src/unified_retriever.py`, `src/plan_executor.py`, `src/query_writers.py`, `tests/test_datastore_comprehensive.py`, `tests/test_source_execution_policy.py`.
+  - Changed-from: KQL accepted malformed semicolon-before-pipe patterns until validation failure, SQL validated table existence but not column existence, FABRIC_SQL attempted TDS solely based on env and failed with `fabric_sql_tds_error` when `pyodbc` was unavailable.
+- 2026-02-23: Hard-locked tenant/subscription guardrail to MngEnvMCAP705508.
+  - Decision: Enforced account `admin@MngEnvMCAP705508.onmicrosoft.com`, tenant `52095a81-130f-4b06-83f1-9859b2c73de6`, and subscription `6a539906-6ce2-4e3b-84ee-89f701de18d8` as the only in-policy runtime/deploy target; updated deployment workflows to validate hardcoded tenant/subscription constants.
+  - Why: Eliminate target drift and repeated back-and-forth shifts across tenants/subscriptions.
+  - Sources: `AGENTS.md`, `.github/workflows/deploy-backend.yaml`, `.github/workflows/deploy-frontend.yaml`, `az account show --query "{name:name,id:id,tenantId:tenantId,user:user.name}" -o json`.
+  - Changed-from: Prior memory/workflow context allowed fallback/variable-driven targeting and documented `a20bc194-9787-44ee-9c7f-7c3130e651b6`.
+- 2026-02-23: Removed cross-tenant runtime endpoint references.
+  - Decision: Standardized runtime endpoint memory to in-tenant Azure OpenAI (`aoaiaviation705508`) and in-tenant Search (`aisearchozguler`), and marked eastus2 Foundry project wiring as out-of-policy historical context.
+  - Why: Prevent runtime routing back to tenant `16b3c013-d300-468d-ac64-7eda0820b6d3` and subscription `a20bc194-9787-44ee-9c7f-7c3130e651b6`.
+  - Sources: `az cognitiveservices account show -g rg-openai -n aoaiaviation705508`, `az search service show -g rg-openai -n aisearchozguler`, `az resource list --subscription a20bc194-9787-44ee-9c7f-7c3130e651b6`.
+  - Changed-from: Memory listed `ai-eastus2hubozguler527669401205` as active project wiring.
+- 2026-02-23: Verified live datastore queryability matrix from deployed frontend `/api/chat`.
+  - Decision: Mark SQL and NOSQL as currently queryable in live mode; mark KQL, GRAPH, and FABRIC_SQL as not healthy for strict live queries.
+  - Why: Live probes with `requiredSources=[SOURCE]`, `sourcePolicy=exact`, and `failurePolicy=strict` returned source-level runtime failures for KQL/GRAPH/FABRIC_SQL while SQL and NOSQL returned successful live rows.
+  - Sources: `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/fabric/preflight`, `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/chat` (SSE `source_call_*` events), `az account show --query "{user:user.name,tenantId:tenantId,id:id}" -o json`.
+  - Changed-from: Assumed post-fix behavior that all datastore paths were healthy.
+- 2026-02-23: Added runtime source-capability and tenant-guardrail enforcement in backend.
+  - Decision: Implemented backend capability registry (`healthy/degraded/unavailable`) per source, identity guardrail checks tied to expected runtime account/tenant/subscription envs, and preflight payload expansion with `identity_guardrail`, `source_capabilities`, and baseline source status.
+  - Why: Prevent repeated regressions from endpoint/dependency drift by making source readiness explicit and blockable before query execution.
+  - Sources: `src/unified_retriever.py`, `src/api_server.py`, `k8s/backend-configmap.yaml`, `scripts/render-k8s-manifests.sh`.
+  - Changed-from: Source-mode checks were distributed and lacked centralized capability state + identity guardrail visibility.
+- 2026-02-23: Added post-deploy baseline datastore gate in backend workflow.
+  - Decision: Added a deploy workflow step that calls backend `/api/fabric/preflight` and fails deployment when baseline sources (`SQL`, `NOSQL`) are unavailable.
+  - Why: Ensure regressions are caught in deployment flow instead of rediscovered during runtime demos.
+  - Sources: `.github/workflows/deploy-backend.yaml`, `src/unified_retriever.py`.
+  - Changed-from: Deploy workflow validated rollout/image, but did not gate on datastore baseline readiness.
+- 2026-02-23: Fixed KQL/Graph query-path normalization for Fabric Kusto endpoints.
+  - Decision: Normalized Kusto endpoint handling so explicit `/v1/rest/query` or `/v2/rest/query` paths are used as-is, cluster roots derive `/v1/rest/query`, and duplicated query segments are rejected.
+  - Why: Prevent runtime 404 failures caused by malformed endpoint concatenation (for example `.../v2/rest/query/v1/rest/query`).
+  - Sources: `src/unified_retriever.py`, `tests/test_source_execution_policy.py`, live endpoint probe logs.
+  - Changed-from: Runtime always appended `/v1/rest/query` regardless of configured endpoint path.
+- 2026-02-23: Standardized Fabric SQL to REST-first execution policy.
+  - Decision: Fabric SQL now prioritizes REST execution when `FABRIC_SQL_ENDPOINT` is configured; TDS is fallback only when REST is unavailable.
+  - Why: Avoid recurring production failures from missing `pyodbc`/ODBC runtime dependencies.
+  - Sources: `src/unified_retriever.py`, `tests/test_source_execution_policy.py`, `Dockerfile.backend`.
+  - Changed-from: TDS path was preferred whenever `FABRIC_SQL_SERVER`/`FABRIC_SQL_DATABASE` were set.
+- 2026-02-23: Expanded Fabric preflight to include execution-readiness signals.
+  - Decision: Added explicit auth mode/readiness and endpoint query-readiness/path-validity fields in preflight output.
+  - Why: Endpoint reachability-only checks were insufficient and masked real runtime failures.
+  - Sources: `src/unified_retriever.py`, `tests/test_datastore_comprehensive.py`, `tests/test_source_execution_policy.py`.
+  - Changed-from: Preflight primarily reported reachability (`reachable_http_*`) without explicit query execution readiness flags.
+- 2026-02-23: Implemented token-freshness auth handling and re-aligned runtime fallback behavior.
+  - Decision: Added token TTL/static-bearer policy handling for Fabric and voice token acquisition, enforced REST-first `FABRIC_SQL_MODE=auto`, and restored GRAPH fallback behavior when live endpoint is missing while keeping source capability and preflight auth diagnostics.
+  - Why: Prevent stale-token regressions without reintroducing prior route-execution breakages (`kql_multiple_statements_not_allowed`, missing TDS deps, graph fallback regressions).
+  - Sources: `src/unified_retriever.py`, `src/intent_graph_provider.py`, `src/app/api/voice/speak/route.ts`, `tests/test_source_execution_policy.py`, `tests/test_datastore_comprehensive.py`.
+  - Changed-from: `FABRIC_SQL_MODE=auto` selected TDS first and GRAPH no-endpoint path was hard-blocked.
+- 2026-02-23: Restored Fabric SQL TDS runtime dependencies in production image.
+  - Decision: Added `pyodbc` to `requirements.txt`, installed `msodbcsql18` + unixODBC libs in backend image, and pinned backend base image to `python:3.11-slim-bookworm` for Microsoft ODBC feed compatibility.
+  - Why: `python:3.11-slim` resolved to Debian 13 (`trixie`) where the current Microsoft package-feed path/signing failed; runtime lacked `pyodbc` and blocked Fabric SQL mode.
+  - Sources: `Dockerfile.backend`, `requirements.txt`, `tests/test_deployment_pipelines.py`, `docker buildx build --platform linux/amd64 -f Dockerfile.backend ...`.
+  - Changed-from: Runtime image had no SQL ODBC driver and failed preflight with `pyodbc_unavailable`.
+- 2026-02-23: Fixed static bearer token audience for Fabric Kusto-backed sources.
+  - Decision: Rotated `FABRIC_BEARER_TOKEN` to a Kusto-cluster-scoped token (`https://<cluster>.kusto.fabric.microsoft.com`) instead of only `https://api.fabric.microsoft.com`, then rolled backend deployment.
+  - Why: `api.fabric` token produced `401` on Eventhouse query endpoint while cluster-scoped token produced query-level `400` (auth accepted).
+  - Sources: `az account get-access-token --resource https://api.fabric.microsoft.com`, `az account get-access-token --resource https://trd-rjvjgwebssdwhxbdy0.z2.kusto.fabric.microsoft.com`, `curl https://trd-rjvjgwebssdwhxbdy0.z2.kusto.fabric.microsoft.com/v2/rest/query ...`, `kubectl -n aviation-rag patch secret backend-secrets ...`, `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/fabric/preflight`.
+  - Changed-from: Static bearer rotation used `api.fabric` audience and regressed KQL/Graph/NoSQL to `reachable_http_401`.
+- 2026-02-23: Updated datastore combo runbook payload contract for frontend `/api/chat`.
+  - Decision: Updated `scripts/19_test_datastore_combinations.py` to include `messages` array in request body while keeping `message` for backward compatibility.
+  - Why: Frontend validation now requires `messages`; legacy payloads caused false-negative matrix runs with HTTP 400 before source execution.
+  - Sources: `scripts/19_test_datastore_combinations.py`, run output in `artifacts/datastore_combo_results_latest.json`.
+  - Changed-from: Script sent only `message` and produced request-shape failures.
+- 2026-02-23: Live datastore status after ODBC + token-audience fixes.
+  - Decision: Mark `SQL`, `NOSQL`, `KQL`, and `GRAPH` as queryable in strict exact-source probes; keep `FABRIC_SQL` as failing due warehouse login/authz (`SQL Server 18456`) despite TDS capability pass.
+  - Why: Source probes returned successful `source_call_done` rows for SQL/NOSQL/KQL/GRAPH; FABRIC_SQL returned contract failure with login error from ODBC driver.
+  - Sources: `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/fabric/preflight`, live SSE source probes via `POST https://aviation-rag-frontend-705508.azurewebsites.net/api/chat`, `kubectl -n aviation-rag logs ...`.
+  - Changed-from: Earlier status marked KQL/GRAPH as unhealthy and FABRIC_SQL blocked by missing `pyodbc`.

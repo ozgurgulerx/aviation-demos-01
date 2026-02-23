@@ -54,6 +54,29 @@ def get_runtime() -> AgentFrameworkRuntime:
         if runtime is None:
             logger.info("Initializing Agent Framework runtime...")
             runtime = AgentFrameworkRuntime()
+            try:
+                capabilities = runtime.retriever.source_capabilities(refresh=True)
+                unavailable = [
+                    c.get("source")
+                    for c in capabilities
+                    if str(c.get("status", "")).lower() == "unavailable"
+                ]
+                degraded = [
+                    c.get("source")
+                    for c in capabilities
+                    if str(c.get("status", "")).lower() == "degraded"
+                ]
+                guardrail_status = (
+                    (runtime.retriever._identity_guardrail_report or {}).get("status", "unknown")
+                )
+                logger.info(
+                    "Runtime source capabilities initialized (guardrail=%s unavailable=%s degraded=%s)",
+                    guardrail_status,
+                    ",".join(str(s) for s in unavailable if s) or "none",
+                    ",".join(str(s) for s in degraded if s) or "none",
+                )
+            except Exception:
+                logger.exception("Failed to initialize source capability snapshot")
             logger.info("Runtime ready (af_enabled=%s)", runtime.af_enabled)
     return runtime
 

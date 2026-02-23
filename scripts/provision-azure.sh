@@ -29,20 +29,22 @@ require_cmd envsubst
 
 CURRENT_SUBSCRIPTION="$(az account show --query id -o tsv)"
 CURRENT_TENANT="$(az account show --query tenantId -o tsv)"
+TARGET_SUBSCRIPTION_ID="6a539906-6ce2-4e3b-84ee-89f701de18d8"
+TARGET_TENANT_ID="52095a81-130f-4b06-83f1-9859b2c73de6"
 
 APP_NAME="${APP_NAME:-aviation-rag}"
 LOCATION="${LOCATION:-westeurope}"
-SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-$CURRENT_SUBSCRIPTION}"
+SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-$TARGET_SUBSCRIPTION_ID}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-aviation-rag}"
 
 # Runtime infra names
 VNET_NAME="${VNET_NAME:-vnet-aviation-rag}"
 AKS_NAME="${AKS_NAME:-aks-aviation-rag}"
-ACR_NAME="${ACR_NAME:-aviationragacr}"
+ACR_NAME="${ACR_NAME:-avrag705508acr}"
 ACR_RESOURCE_GROUP="${ACR_RESOURCE_GROUP:-$RESOURCE_GROUP}"
 APP_SERVICE_PLAN="${APP_SERVICE_PLAN:-plan-aviation-rag-frontend}"
 APP_SERVICE_PLAN_SKU="${APP_SERVICE_PLAN_SKU:-P1V3}"
-WEBAPP_NAME="${WEBAPP_NAME:-aviation-rag-frontend}"
+WEBAPP_NAME="${WEBAPP_NAME:-aviation-rag-frontend-705508}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-aviation-rag}"
 IMAGE_NAME="${IMAGE_NAME:-aviation-rag-backend}"
 
@@ -101,6 +103,9 @@ AF_MAX_SESSIONS="${AF_MAX_SESSIONS:-500}"
 FABRIC_KQL_ENDPOINT="${FABRIC_KQL_ENDPOINT:-}"
 FABRIC_GRAPH_ENDPOINT="${FABRIC_GRAPH_ENDPOINT:-}"
 FABRIC_NOSQL_ENDPOINT="${FABRIC_NOSQL_ENDPOINT:-}"
+FABRIC_SQL_ENDPOINT="${FABRIC_SQL_ENDPOINT:-}"
+FABRIC_SQL_SERVER="${FABRIC_SQL_SERVER:-}"
+FABRIC_SQL_DATABASE="${FABRIC_SQL_DATABASE:-}"
 FABRIC_GRAPH_DATABASE="${FABRIC_GRAPH_DATABASE:-}"
 GRAPH_TIMEOUT_SECONDS="${GRAPH_TIMEOUT_SECONDS:-3}"
 GRAPH_MAX_RETRIES="${GRAPH_MAX_RETRIES:-1}"
@@ -129,12 +134,28 @@ echo "============================================="
 echo " Aviation RAG — Runtime Provisioning"
 echo "============================================="
 echo "Target subscription : ${SUBSCRIPTION_ID}"
-echo "Target tenant       : ${CURRENT_TENANT}"
+echo "Target tenant       : ${TARGET_TENANT_ID}"
 echo "Resource group      : ${RESOURCE_GROUP}"
 echo "Location            : ${LOCATION}"
 echo
 
+if [ "${SUBSCRIPTION_ID}" != "${TARGET_SUBSCRIPTION_ID}" ]; then
+  echo "Provisioning is hard-locked to subscription ${TARGET_SUBSCRIPTION_ID}. Received ${SUBSCRIPTION_ID}." >&2
+  exit 1
+fi
+
 az account set --subscription "$SUBSCRIPTION_ID"
+
+ACTIVE_SUBSCRIPTION="$(az account show --query id -o tsv)"
+ACTIVE_TENANT="$(az account show --query tenantId -o tsv)"
+if [ "${ACTIVE_SUBSCRIPTION}" != "${TARGET_SUBSCRIPTION_ID}" ]; then
+  echo "Active subscription mismatch: expected ${TARGET_SUBSCRIPTION_ID}, got ${ACTIVE_SUBSCRIPTION}." >&2
+  exit 1
+fi
+if [ "${ACTIVE_TENANT}" != "${TARGET_TENANT_ID}" ]; then
+  echo "Active tenant mismatch: expected ${TARGET_TENANT_ID}, got ${ACTIVE_TENANT}." >&2
+  exit 1
+fi
 
 AKS_SUBNET_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/subnet-aks"
 PG_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${PG_SERVER_RG}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${PG_SERVER}"
@@ -430,6 +451,9 @@ if bool_true "$DEPLOY_K8S"; then
   export FABRIC_KQL_ENDPOINT
   export FABRIC_GRAPH_ENDPOINT
   export FABRIC_NOSQL_ENDPOINT
+  export FABRIC_SQL_ENDPOINT
+  export FABRIC_SQL_SERVER
+  export FABRIC_SQL_DATABASE
   export FABRIC_GRAPH_DATABASE
   export GRAPH_TIMEOUT_SECONDS
   export GRAPH_MAX_RETRIES

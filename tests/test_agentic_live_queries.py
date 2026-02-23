@@ -12,13 +12,13 @@ from openai import AzureOpenAI
 ROOT = Path(__file__).resolve().parents[1]
 
 # Keep existing search/runtime config from repository root, but force OpenAI auth/path
-# to the tenant-aligned Foundry endpoint for live integration checks.
+# to the tenant-guardrail endpoint for live integration checks.
 load_dotenv(ROOT / ".env", override=False)
 os.environ.setdefault(
     "AZURE_OPENAI_ENDPOINT",
-    "https://ai-eastus2hubozguler527669401205.cognitiveservices.azure.com/",
+    "https://swedencentral.api.cognitive.microsoft.com/",
 )
-os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT_NAME", "aviation-chat-gpt5-mini")
+os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-nano")
 os.environ.setdefault("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
 os.environ["AZURE_OPENAI_API_KEY"] = ""
 

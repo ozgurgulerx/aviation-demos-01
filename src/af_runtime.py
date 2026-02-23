@@ -52,6 +52,8 @@ _query_latency = _meter.create_histogram("rag.query.latency_ms", unit="ms", desc
 _source_latency = _meter.create_histogram("rag.source.latency_ms", unit="ms", description="Per-source retrieval latency")
 _synthesis_latency = _meter.create_histogram("rag.synthesis.latency_ms", unit="ms", description="LLM synthesis latency")
 
+EMPTY_SYNTHESIS_ERROR = "Synthesis completed without answer text."
+
 
 @dataclass
 class _SessionState:
@@ -543,7 +545,7 @@ class AgentFrameworkRuntime:
                 yield {
                     "type": "agent_update",
                     "stage": "fallback",
-                    "message": f"AF runtime failed ({exc}); switching to local fallback",
+                    "message": "AF runtime failed; switching to local fallback",
                     "sessionId": sid,
                 }
 
@@ -720,6 +722,11 @@ class AgentFrameworkRuntime:
         )
 
         answer = self._invoke_agent(prompt=prompt, session=session, session_id=session_id)
+        degraded_sources, failed_required_sources = self._summarize_source_outcomes(
+            ctx.source_results,
+            required_sources=required_sources,
+        )
+        required_sources_satisfied = len(failed_required_sources) == 0
         if not answer.strip():
             # AF agent returned nothing — use true streaming synthesis.
             _filter = self.retriever._filter_error_rows
@@ -745,11 +752,37 @@ class AgentFrameworkRuntime:
             if budget > 0:
                 synthesis_context = _truncate_context_to_budget(synthesis_context, budget)
             af_answer_parts: List[str] = []
+            synthesis_terminal_error: Optional[Dict[str, Any]] = None
             for event in self.retriever._synthesize_answer_stream(query, synthesis_context, ctx.route, conversation_history=conversation_history):
                 if event.get("type") == "agent_update" and event.get("content"):
                     af_answer_parts.append(str(event["content"]))
+                    yield event
+                    continue
+                if event.get("type") in {"agent_error", "error"}:
+                    synthesis_terminal_error = self._normalize_synthesis_error_event(
+                        dict(event),
+                        route=ctx.route,
+                        session_id=session_id,
+                        framework=self._framework_label,
+                        degraded_sources=degraded_sources,
+                        failed_required_sources=failed_required_sources,
+                        required_sources_satisfied=required_sources_satisfied,
+                        failure_policy=failure_policy,
+                        source_policy=source_policy,
+                    )
+                    yield synthesis_terminal_error
+                    break
                 yield event
             af_answer_text = "".join(af_answer_parts)
+            if synthesis_terminal_error:
+                yield self._reasoning_stage_event(
+                    "evidence_check_complete",
+                    "Evidence verification complete",
+                    verification="Partial",
+                    failOpen=True,
+                    route=ctx.route,
+                )
+                return
         else:
             af_answer_text = answer
             for event in self._emit_text_chunks(answer):
@@ -766,6 +799,29 @@ class AgentFrameworkRuntime:
         else:
             is_verified = len(ctx.citations) > 0
 
+        if not af_answer_text.strip():
+            yield self._reasoning_stage_event(
+                "evidence_check_complete",
+                "Evidence verification complete",
+                verification="Partial",
+                failOpen=True,
+                route=ctx.route,
+            )
+            yield self._build_terminal_agent_error(
+                route=ctx.route,
+                session_id=session_id,
+                framework=self._framework_label,
+                message=EMPTY_SYNTHESIS_ERROR,
+                error_code="empty_synthesis_output",
+                terminal_reason="empty_synthesis_output",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
+            return
+
         grounding = _check_answer_grounding(af_answer_text, len(ctx.citations))
 
         # --- Reasoning: evidence check complete ---
@@ -777,16 +833,13 @@ class AgentFrameworkRuntime:
             route=ctx.route,
         )
 
-        degraded_sources, failed_required_sources = self._summarize_source_outcomes(
-            ctx.source_results,
-            required_sources=required_sources,
-        )
-        required_sources_satisfied = len(failed_required_sources) == 0
         if failure_policy == "strict" and degraded_sources:
             detail = ", ".join(degraded_sources)
             yield {
                 "type": "agent_error",
                 "message": f"Strict failure policy triggered by source errors: {detail}",
+                "error_code": "strict_failure_policy_triggered",
+                "terminal_reason": "strict_failure_policy_triggered",
                 "route": ctx.route,
                 "sessionId": session_id,
                 "framework": self._framework_label,
@@ -936,6 +989,8 @@ class AgentFrameworkRuntime:
             yield {
                 "type": "agent_error",
                 "message": "RAG lookup failed before synthesis. Please retry.",
+                "error_code": "rag_lookup_failed",
+                "terminal_reason": "rag_lookup_failed",
                 "route": route,
                 "sessionId": session_id,
                 "framework": "local-fallback",
@@ -1018,13 +1073,45 @@ class AgentFrameworkRuntime:
         if budget > 0:
             synthesis_context = _truncate_context_to_budget(synthesis_context, budget)
 
+        degraded_sources, failed_required_sources = self._summarize_source_outcomes(
+            source_results,
+            required_sources=required_sources,
+        )
+        required_sources_satisfied = len(failed_required_sources) == 0
+
         # True streaming: yield tokens as they arrive from the LLM.
         local_answer_parts: List[str] = []
+        synthesis_terminal_error: Optional[Dict[str, Any]] = None
         for event in self.retriever._synthesize_answer_stream(query, synthesis_context, route, conversation_history=conversation_history):
             if event.get("type") == "agent_update" and event.get("content"):
                 local_answer_parts.append(str(event["content"]))
+                yield event
+                continue
+            if event.get("type") in {"agent_error", "error"}:
+                synthesis_terminal_error = self._normalize_synthesis_error_event(
+                    dict(event),
+                    route=route,
+                    session_id=session_id,
+                    framework="local-fallback",
+                    degraded_sources=degraded_sources,
+                    failed_required_sources=failed_required_sources,
+                    required_sources_satisfied=required_sources_satisfied,
+                    failure_policy=failure_policy,
+                    source_policy=source_policy,
+                )
+                yield synthesis_terminal_error
+                break
             yield event
         local_answer_text = "".join(local_answer_parts)
+        if synthesis_terminal_error:
+            yield self._reasoning_stage_event(
+                "evidence_check_complete",
+                "Evidence verification complete",
+                verification="Partial",
+                failOpen=True,
+                route=route,
+            )
+            return
 
         if citations_payload:
             citations = [
@@ -1047,6 +1134,29 @@ class AgentFrameworkRuntime:
         else:
             local_is_verified = len(citations_payload) > 0
 
+        if not local_answer_text.strip():
+            yield self._reasoning_stage_event(
+                "evidence_check_complete",
+                "Evidence verification complete",
+                verification="Partial",
+                failOpen=True,
+                route=route,
+            )
+            yield self._build_terminal_agent_error(
+                route=route,
+                session_id=session_id,
+                framework="local-fallback",
+                message=EMPTY_SYNTHESIS_ERROR,
+                error_code="empty_synthesis_output",
+                terminal_reason="empty_synthesis_output",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
+            return
+
         local_grounding = _check_answer_grounding(local_answer_text, len(citations_payload))
 
         # --- Reasoning: evidence check complete ---
@@ -1058,16 +1168,13 @@ class AgentFrameworkRuntime:
             route=route,
         )
 
-        degraded_sources, failed_required_sources = self._summarize_source_outcomes(
-            source_results,
-            required_sources=required_sources,
-        )
-        required_sources_satisfied = len(failed_required_sources) == 0
         if failure_policy == "strict" and degraded_sources:
             detail = ", ".join(degraded_sources)
             yield {
                 "type": "agent_error",
                 "message": f"Strict failure policy triggered by source errors: {detail}",
+                "error_code": "strict_failure_policy_triggered",
+                "terminal_reason": "strict_failure_policy_triggered",
                 "route": route,
                 "sessionId": session_id,
                 "framework": "local-fallback",
@@ -1137,11 +1244,19 @@ class AgentFrameworkRuntime:
         for source, rows in source_results.items():
             if not isinstance(rows, list):
                 continue
-            has_errors = any(
-                isinstance(row, dict) and (row.get("error") or row.get("error_code"))
-                for row in rows
-            )
-            if has_errors:
+            has_errors = False
+            has_success = False
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("error") or row.get("error_code"):
+                    has_errors = True
+                else:
+                    has_success = True
+
+            # Strict-mode degradation should reflect source-level failure, not
+            # mixed outcomes where at least one successful row exists.
+            if has_errors and not has_success:
                 degraded_sources.append(source)
 
         required_upper = {str(src).upper() for src in required_sources if str(src).strip()}
@@ -1172,6 +1287,107 @@ class AgentFrameworkRuntime:
             return self._extract_text(result)
 
         return ""
+
+    @staticmethod
+    def _build_terminal_agent_error(
+        *,
+        route: str,
+        session_id: str,
+        framework: str,
+        message: str,
+        error_code: str,
+        terminal_reason: str,
+        degraded_sources: List[str],
+        failed_required_sources: List[str],
+        required_sources_satisfied: bool,
+        failure_policy: str,
+        source_policy: str,
+    ) -> Dict[str, Any]:
+        return {
+            "type": "agent_error",
+            "message": message,
+            "error_code": error_code,
+            "terminal_reason": terminal_reason,
+            "route": route,
+            "sessionId": session_id,
+            "framework": framework,
+            "degradedSources": degraded_sources,
+            "failedRequiredSources": failed_required_sources,
+            "requiredSourcesSatisfied": required_sources_satisfied,
+            "missingRequiredSources": failed_required_sources,
+            "failurePolicy": failure_policy,
+            "sourcePolicy": source_policy,
+            "partial": False,
+        }
+
+    def _normalize_synthesis_error_event(
+        self,
+        event: Dict[str, Any],
+        *,
+        route: str,
+        session_id: str,
+        framework: str,
+        degraded_sources: List[str],
+        failed_required_sources: List[str],
+        required_sources_satisfied: bool,
+        failure_policy: str,
+        source_policy: str,
+    ) -> Dict[str, Any]:
+        error_code = str(event.get("error_code") or event.get("errorCode") or "synthesis_runtime_error")
+        raw_message = str(event.get("message") or event.get("error") or "Synthesis failed.")
+        message = self._public_error_message(raw_message, error_code)
+        terminal_reason = str(event.get("terminal_reason") or error_code)
+        return self._build_terminal_agent_error(
+            route=route,
+            session_id=session_id,
+            framework=framework,
+            message=message,
+            error_code=error_code,
+            terminal_reason=terminal_reason,
+            degraded_sources=degraded_sources,
+            failed_required_sources=failed_required_sources,
+            required_sources_satisfied=required_sources_satisfied,
+            failure_policy=failure_policy,
+            source_policy=source_policy,
+        )
+
+    @staticmethod
+    def _public_error_message(message: str, error_code: str) -> str:
+        text = (message or "").strip()
+        code = (error_code or "").strip().lower()
+        if not text:
+            return "An internal error occurred while preparing the response."
+
+        # Keep user-intentful refusals explicit; sanitize backend/runtime failures.
+        if code in {"llm_refusal", "policy_refusal"}:
+            return text
+
+        if code in {
+            "synthesis_runtime_error",
+            "rag_lookup_failed",
+            "tool_runtime_error",
+            "execution_exception",
+        }:
+            return "An internal error occurred while preparing the response."
+
+        lowered = text.lower()
+        sensitive_tokens = (
+            "traceback",
+            "exception",
+            "stack",
+            "sqlstate",
+            "pyodbc",
+            "connection",
+            "token",
+            "secret",
+            "http_",
+            "azure.",
+            "fabric_",
+            "cosmos",
+        )
+        if any(token in lowered for token in sensitive_tokens):
+            return "An internal error occurred while preparing the response."
+        return text
 
     def _call_with_common_kwargs(self, fn: Any, prompt: str, session: Any, session_id: str) -> Any:
         attempts = (
@@ -1406,6 +1622,7 @@ class AgentFrameworkRuntime:
                 terminal_error = {
                     "message": event.get("message") or event.get("error") or "Agent runtime error",
                     "errorCode": event.get("error_code") or event.get("errorCode") or "",
+                    "terminalReason": event.get("terminal_reason") or "",
                     "route": event.get("route", "ERROR"),
                     "degradedSources": list(event.get("degradedSources", [])),
                     "failedRequiredSources": list(event.get("failedRequiredSources", [])),
@@ -1440,6 +1657,7 @@ class AgentFrameworkRuntime:
                 "status": "error",
                 "error": terminal_error.get("message", "Agent runtime error"),
                 "error_code": terminal_error.get("errorCode", ""),
+                "terminal_reason": terminal_error.get("terminalReason", ""),
                 "required_sources_raw": list(terminal_error.get("required_sources_raw", [])),
                 "required_sources_normalized": list(terminal_error.get("required_sources_normalized", [])),
                 "invalid_required_sources": list(terminal_error.get("invalid_required_sources", [])),

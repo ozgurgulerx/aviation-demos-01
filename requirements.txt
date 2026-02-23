@@ -6,6 +6,7 @@ azure-search-documents>=11.4.0
 azure-identity>=1.25.0
 azure-core>=1.29.0
 azure-cosmos>=4.7.0
+pyodbc>=5.1.0
 
 # Web framework
 flask>=3.0.0

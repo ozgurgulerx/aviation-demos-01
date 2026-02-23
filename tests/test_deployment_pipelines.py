@@ -141,8 +141,6 @@ class TestDeployBackendWorkflow:
         raw = _read(os.path.join(WORKFLOWS_DIR, "deploy-backend.yaml"))
         for secret in [
             "AZURE_CLIENT_ID",
-            "AZURE_TENANT_ID",
-            "AZURE_SUBSCRIPTION_ID",
             "AZURE_OPENAI_API_KEY",
             "AZURE_SEARCH_ADMIN_KEY",
             "PGPASSWORD",
@@ -314,6 +312,10 @@ class TestDockerfileBackend:
     def test_pip_installs_requirements(self):
         assert "pip install" in self.content
         assert "requirements.txt" in self.content
+
+    def test_installs_sqlserver_odbc_driver(self):
+        assert "msodbcsql18" in self.content
+        assert "unixodbc" in self.content
 
 
 class TestDockerfileFrontend:
@@ -998,6 +1000,9 @@ class TestRequirementsTxt:
         pkgs = self._req_packages()
         assert "psycopg2-binary" in pkgs or "psycopg2" in pkgs
 
+    def test_pyodbc_in_requirements(self):
+        assert "pyodbc" in self._req_packages()
+
     def test_duplicate_installs_flagged(self):
         """Packages installed separately in Dockerfile that are already in requirements.txt."""
         req_pkgs = self._req_packages()
@@ -1136,8 +1141,8 @@ class TestKnownGaps:
         deploy_raw = _read(os.path.join(WORKFLOWS_DIR, "deploy-backend.yaml"))
         # Migrate: secrets.PGHOST
         assert "secrets.PGHOST" in migrate_raw
-        # Deploy: vars.PGHOST
-        assert "vars.PGHOST" in deploy_raw
+        # Deploy: vars.PGHOST or hardcoded PGHOST
+        assert "vars.PGHOST" in deploy_raw or "PGHOST:" in deploy_raw
 
     def test_ingress_uses_deprecated_annotation(self):
         """Ingress uses annotation-based class instead of spec.ingressClassName."""

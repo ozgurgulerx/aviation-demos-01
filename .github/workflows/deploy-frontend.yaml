@@ -25,22 +25,26 @@ permissions:
   contents: read
 
 env:
-  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'aviation-rag-frontend-705508' }}
-  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-aviation-rag' }}
+  TARGET_ACCOUNT_UPN: admin@MngEnvMCAP705508.onmicrosoft.com
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+  AZURE_WEBAPP_NAME: aviation-rag-frontend-705508
+  AZURE_RESOURCE_GROUP: rg-aviation-rag
   NODE_VERSION: ${{ vars.NODE_VERSION || '20.x' }}
   BACKEND_URL: ${{ vars.BACKEND_URL }}
   PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
   PII_CONTAINER_ENDPOINT: ${{ vars.PII_CONTAINER_ENDPOINT }}
-  AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+  AZURE_OPENAI_ENDPOINT: https://swedencentral.api.cognitive.microsoft.com/
   AZURE_OPENAI_VOICE_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_VOICE_DEPLOYMENT_NAME || 'aviation-voice-tts' }}
   AZURE_OPENAI_VOICE_MODEL: ${{ vars.AZURE_OPENAI_VOICE_MODEL || 'gpt-4o-mini-tts' }}
   AZURE_OPENAI_VOICE_API_VERSION: ${{ vars.AZURE_OPENAI_VOICE_API_VERSION || '2025-03-01-preview' }}
   AZURE_OPENAI_VOICE_TURKISH: ${{ vars.AZURE_OPENAI_VOICE_TURKISH || 'alloy' }}
   AZURE_OPENAI_VOICE_ENGLISH: ${{ vars.AZURE_OPENAI_VOICE_ENGLISH || 'alloy' }}
-  AZURE_OPENAI_AUTH_MODE: ${{ vars.AZURE_OPENAI_AUTH_MODE || 'token' }}
+  AZURE_OPENAI_AUTH_MODE: ${{ vars.AZURE_OPENAI_AUTH_MODE || 'api-key' }}
+  AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
   AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID: ${{ vars.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}
-  AZURE_OPENAI_TENANT_ID: ${{ vars.AZURE_OPENAI_TENANT_ID || secrets.AZURE_OPENAI_TENANT_ID }}
-  AZURE_OPENAI_CLIENT_ID: ${{ vars.AZURE_OPENAI_CLIENT_ID || secrets.AZURE_OPENAI_CLIENT_ID }}
+  AZURE_OPENAI_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  AZURE_OPENAI_CLIENT_ID: ${{ vars.AZURE_OPENAI_CLIENT_ID }}
   AZURE_OPENAI_CLIENT_SECRET: ${{ secrets.AZURE_OPENAI_CLIENT_SECRET }}
   AZURE_OPENAI_BEARER_TOKEN: ${{ secrets.AZURE_OPENAI_BEARER_TOKEN }}
   BACKEND_REQUEST_TIMEOUT_MS: ${{ vars.BACKEND_REQUEST_TIMEOUT_MS || '180000' }}
@@ -94,12 +98,29 @@ jobs:
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ env.TARGET_TENANT_ID }}
+          subscription-id: ${{ env.TARGET_SUBSCRIPTION_ID }}
+
+      - name: Validate Azure account target
+        run: |
+          actual_subscription="$(az account show --query id -o tsv)"
+          actual_tenant="$(az account show --query tenantId -o tsv)"
+
+          if [ "$actual_subscription" != "${{ env.TARGET_SUBSCRIPTION_ID }}" ]; then
+            echo "::error::Azure subscription mismatch. Expected '${{ env.TARGET_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
+            exit 1
+          fi
+
+          if [ "$actual_tenant" != "${{ env.TARGET_TENANT_ID }}" ]; then
+            echo "::error::Azure tenant mismatch. Expected '${{ env.TARGET_TENANT_ID }}' but got '$actual_tenant'."
+            exit 1
+          fi
+
+          echo "Azure target context verified for account=${{ env.TARGET_ACCOUNT_UPN }} subscription=$actual_subscription tenant=$actual_tenant"
 
       - name: Validate required frontend runtime variables
         run: |
-          required=(BACKEND_URL PII_ENDPOINT PII_CONTAINER_ENDPOINT AZURE_OPENAI_ENDPOINT)
+          required=(BACKEND_URL PII_ENDPOINT PII_CONTAINER_ENDPOINT AZURE_OPENAI_ENDPOINT AZURE_OPENAI_AUTH_MODE)
           for var_name in "${required[@]}"; do
             if [ -z "${!var_name:-}" ]; then
               echo "::error::Missing required repository variable: ${var_name}"
@@ -107,24 +128,17 @@ jobs:
             fi
           done
 
+          if [ "${{ env.AZURE_OPENAI_AUTH_MODE }}" = "api-key" ] && [ -z "${{ env.AZURE_OPENAI_API_KEY }}" ]; then
+            echo "::error::AZURE_OPENAI_AUTH_MODE=api-key requires AZURE_OPENAI_API_KEY secret."
+            exit 1
+          fi
+
       - name: Resolve App Service target
         run: |
-          TARGET="${{ env.AZURE_WEBAPP_NAME }}"
-          FALLBACK="aviation-rag-frontend-705508"
-
-          if az webapp show --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --name "$TARGET" >/dev/null 2>&1; then
-            echo "Using App Service target: $TARGET"
-            exit 0
-          fi
-
-          if [ "$TARGET" != "$FALLBACK" ] && az webapp show --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --name "$FALLBACK" >/dev/null 2>&1; then
-            echo "::warning::Configured AZURE_WEBAPP_NAME '$TARGET' not found. Falling back to '$FALLBACK'."
-            echo "AZURE_WEBAPP_NAME=$FALLBACK" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          echo "::error::App Service '$TARGET' not found in resource group '${{ env.AZURE_RESOURCE_GROUP }}'."
-          exit 1
+          az webapp show \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" >/dev/null
+          echo "App Service target verified: ${{ env.AZURE_WEBAPP_NAME }}"
 
       - name: Sync App Service settings
         run: |
@@ -150,20 +164,32 @@ jobs:
             "WEBSITES_PORT=3000"
           )
 
-          if [ -n "${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}" ]; then
-            SETTINGS+=("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}")
+          if [ -n "${{ env.AZURE_OPENAI_API_KEY }}" ]; then
+            SETTINGS+=("AZURE_OPENAI_API_KEY=${{ env.AZURE_OPENAI_API_KEY }}")
+          else
+            SETTINGS+=("AZURE_OPENAI_API_KEY=")
           fi
-          if [ -n "${{ env.AZURE_OPENAI_TENANT_ID }}" ]; then
+
+          if [ "${{ env.AZURE_OPENAI_AUTH_MODE }}" = "api-key" ]; then
+            SETTINGS+=("AZURE_OPENAI_TENANT_ID=")
+            SETTINGS+=("AZURE_OPENAI_CLIENT_ID=")
+            SETTINGS+=("AZURE_OPENAI_CLIENT_SECRET=")
+            SETTINGS+=("AZURE_OPENAI_BEARER_TOKEN=")
+            SETTINGS+=("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=")
+          else
             SETTINGS+=("AZURE_OPENAI_TENANT_ID=${{ env.AZURE_OPENAI_TENANT_ID }}")
-          fi
-          if [ -n "${{ env.AZURE_OPENAI_CLIENT_ID }}" ]; then
-            SETTINGS+=("AZURE_OPENAI_CLIENT_ID=${{ env.AZURE_OPENAI_CLIENT_ID }}")
-          fi
-          if [ -n "${{ env.AZURE_OPENAI_CLIENT_SECRET }}" ]; then
-            SETTINGS+=("AZURE_OPENAI_CLIENT_SECRET=${{ env.AZURE_OPENAI_CLIENT_SECRET }}")
-          fi
-          if [ -n "${{ env.AZURE_OPENAI_BEARER_TOKEN }}" ]; then
-            SETTINGS+=("AZURE_OPENAI_BEARER_TOKEN=${{ env.AZURE_OPENAI_BEARER_TOKEN }}")
+            if [ -n "${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}" ]; then
+              SETTINGS+=("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}")
+            fi
+            if [ -n "${{ env.AZURE_OPENAI_CLIENT_ID }}" ]; then
+              SETTINGS+=("AZURE_OPENAI_CLIENT_ID=${{ env.AZURE_OPENAI_CLIENT_ID }}")
+            fi
+            if [ -n "${{ env.AZURE_OPENAI_CLIENT_SECRET }}" ]; then
+              SETTINGS+=("AZURE_OPENAI_CLIENT_SECRET=${{ env.AZURE_OPENAI_CLIENT_SECRET }}")
+            fi
+            if [ -n "${{ env.AZURE_OPENAI_BEARER_TOKEN }}" ]; then
+              SETTINGS+=("AZURE_OPENAI_BEARER_TOKEN=${{ env.AZURE_OPENAI_BEARER_TOKEN }}")
+            fi
           fi
 
           az webapp config appsettings set \

@@ -34,6 +34,34 @@ class _DummyRetriever:
         return [{"id": "vec1", "title": "sample"}], []
 
 
+class _RepairingRetriever(_DummyRetriever):
+    def execute_sql_query(self, sql_query: str):
+        normalized = str(sql_query or "").strip().lower()
+        if "bad_col" in normalized:
+            return [
+                {
+                    "error": "missing columns in current schema: bad_col",
+                    "error_code": "sql_schema_missing",
+                }
+            ], []
+        if "coalesce(nullif(location" in normalized:
+            return [{"facility": "KJFK", "report_count": 3}], []
+        return [{"error": "unexpected_sql", "error_code": "sql_runtime_error"}], []
+
+
+class _RepairingSQLWriter:
+    def __init__(self):
+        self.last_constraints = {}
+
+    def generate(self, **kwargs):
+        self.last_constraints = dict(kwargs.get("constraints") or {})
+        return (
+            "SELECT COALESCE(NULLIF(location, ''), 'UNKNOWN') AS facility, "
+            "COUNT(*) AS report_count "
+            "FROM asrs_reports GROUP BY facility ORDER BY report_count DESC LIMIT 5"
+        )
+
+
 class PlanExecutorTests(unittest.TestCase):
     def test_execute_preserves_multiple_calls_same_source(self):
         retriever = _DummyRetriever()
@@ -98,6 +126,40 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertIn("VECTOR_OPS", result.source_results)
         self.assertEqual(result.source_results["VECTOR_OPS"][0].get("id"), "vec1")
         self.assertTrue(any("shared_embedding_failed:" in warning for warning in result.warnings))
+
+    def test_sql_validation_failure_regenerates_and_executes_repaired_query(self):
+        retriever = _RepairingRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        writer = _RepairingSQLWriter()
+        executor.sql_writer = writer  # type: ignore[assignment]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_sql_repair",
+                    tool="SQL",
+                    operation="aggregate",
+                    query="SELECT bad_col FROM asrs_reports LIMIT 5",
+                    params={"evidence_type": "generic"},
+                )
+            ]
+        )
+
+        result = executor.execute(
+            user_query="Top facilities by ASRS report count",
+            plan=plan,
+            schemas={"sql_schema": {"tables": [{"table": "asrs_reports", "columns": [{"name": "location"}]}]}},
+        )
+
+        self.assertIn("SQL", result.source_results)
+        rows = result.source_results["SQL"]
+        self.assertEqual(rows[0].get("facility"), "KJFK")
+        self.assertEqual(rows[0].get("report_count"), 3)
+        self.assertEqual(writer.last_constraints.get("previous_error_code"), "sql_schema_missing")
+        self.assertIn("missing columns", writer.last_constraints.get("previous_error_detail", ""))
+        done_events = [e for e in result.source_traces if e.get("type") == "source_call_done" and e.get("source") == "SQL"]
+        self.assertTrue(done_events)
+        self.assertTrue(done_events[0].get("query_rewritten"))
+        self.assertEqual(done_events[0].get("rewrite_reason"), "sql_regenerated_after_validation_failed")
 
 
 if __name__ == "__main__":

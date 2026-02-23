@@ -89,7 +89,7 @@ Use `scripts/provision-azure.sh` to provision runtime infrastructure (frontend, 
 SUBSCRIPTION_ID="<target-subscription-id>" \
 RESOURCE_GROUP="rg-aviation-rag" \
 LOCATION="westeurope" \
-ACR_NAME="aviationragacr" \
+ACR_NAME="avrag705508acr" \
 ACR_RESOURCE_GROUP="rg-aviation-rag" \
 AZURE_OPENAI_ENDPOINT="https://<openai-account>.openai.azure.com/" \
 AZURE_SEARCH_ENDPOINT="https://<search-account>.search.windows.net" \
@@ -150,10 +150,16 @@ PG_SERVER_RG="<postgres-resource-group>" \
 
 Detailed cutover steps are documented in [docs/RUNTIME_CUTOVER_RUNBOOK.md](docs/RUNTIME_CUTOVER_RUNBOOK.md).
 
-Before running manual `kubectl` checks, sync local context to the deploy target:
+Before running manual `kubectl` checks, validate local Azure/Kubernetes context against the deploy target:
 
 ```bash
 ./scripts/aks/use-deploy-target-context.sh
+```
+
+Run a full tenant-lock validation (Azure account, core resources, and live AKS runtime guardrail keys):
+
+```bash
+./scripts/validate-tenant-lock.sh
 ```
 
 ### Retrieval Profiles and Source Hints

@@ -134,6 +134,7 @@ export interface TelemetryEvent {
   alertSeverity?: OperationalAlertSeverity;
   contractStatus?: "planned" | "met" | "degraded" | "failed";
   errorCode?: string;
+  terminalReason?: string;
   degradedSources?: string[];
   failedRequiredSources?: string[];
   requiredSourcesSatisfied?: boolean;

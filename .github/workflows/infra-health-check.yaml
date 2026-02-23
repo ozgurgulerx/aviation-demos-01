@@ -10,11 +10,14 @@ permissions:
   contents: read
 
 env:
+  TARGET_ACCOUNT_UPN: admin@MngEnvMCAP705508.onmicrosoft.com
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-aviation-rag' }}
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
   NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
-  PG_RESOURCE_GROUP: ${{ vars.PG_RESOURCE_GROUP || 'rg-aviation-rag' }}
-  PG_SERVER_NAME: ${{ vars.PG_SERVER_NAME }}
+  PG_RESOURCE_GROUP: ${{ vars.PG_RESOURCE_GROUP || 'rg-openai' }}
+  PG_SERVER_NAME: ${{ vars.PG_SERVER_NAME || 'aviationragpg705508' }}
   BACKEND_PUBLIC_SERVICE: ${{ vars.BACKEND_PUBLIC_SERVICE || 'aviation-rag-backend-lb' }}
   BACKEND_INTERNAL_SERVICE: ${{ vars.BACKEND_INTERNAL_SERVICE || 'aviation-rag-backend-internal' }}
   PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
@@ -27,8 +30,25 @@ jobs:
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ env.TARGET_TENANT_ID }}
+          subscription-id: ${{ env.TARGET_SUBSCRIPTION_ID }}
+
+      - name: Validate Azure account target
+        run: |
+          actual_subscription="$(az account show --query id -o tsv)"
+          actual_tenant="$(az account show --query tenantId -o tsv)"
+
+          if [ "$actual_subscription" != "${{ env.TARGET_SUBSCRIPTION_ID }}" ]; then
+            echo "::error::Azure subscription mismatch. Expected '${{ env.TARGET_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
+            exit 1
+          fi
+
+          if [ "$actual_tenant" != "${{ env.TARGET_TENANT_ID }}" ]; then
+            echo "::error::Azure tenant mismatch. Expected '${{ env.TARGET_TENANT_ID }}' but got '$actual_tenant'."
+            exit 1
+          fi
+
+          echo "Azure target context verified for account=${{ env.TARGET_ACCOUNT_UPN }} subscription=$actual_subscription tenant=$actual_tenant"
 
       - name: Validate required variables
         run: |

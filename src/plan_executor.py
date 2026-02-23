@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -171,6 +172,24 @@ class PlanExecutor:
                             "error_code": error_code,
                             "error": error_detail,
                         }
+                        if source in {"KQL", "SQL"}:
+                            original_query = str(call.query or "").strip()
+                            executed_query = str(sql_query or "").strip()
+                            rewritten = bool(
+                                original_query and executed_query and original_query != executed_query
+                            )
+                            trace_done["query_rewritten"] = rewritten
+                            trace_done["rewrite_reason"] = (
+                                str((call.params or {}).get("__runtime_rewrite_reason", ""))
+                                if rewritten
+                                else ""
+                            )
+                            trace_done["original_query_hash"] = (
+                                self._hash_text(original_query) if original_query else ""
+                            )
+                            trace_done["executed_query_hash"] = (
+                                self._hash_text(executed_query) if executed_query else ""
+                            )
                         result.source_traces.append(trace_done)
                         if on_trace:
                             on_trace(trace_done)
@@ -294,23 +313,72 @@ class PlanExecutor:
                 )
                 return rows, citations, resolved_sql
             rows, citations = self._execute_sql_raw(sql_query)
+            first_error = rows[0].get("error_code") if rows and isinstance(rows[0], dict) else ""
+            if first_error in {"sql_validation_failed", "sql_schema_missing"}:
+                try:
+                    constraints = dict(call.params or {})
+                    constraints["previous_error_code"] = first_error
+                    constraints["previous_error_detail"] = str(rows[0].get("error", ""))
+                    constraints["previous_sql"] = sql_query
+                    regenerated = self._get_sql_writer().generate(
+                        user_query=user_query,
+                        evidence_type=evidence_type or "generic",
+                        sql_schema=schemas.get("sql_schema", {}),
+                        entities=entities,
+                        time_window=time_window,
+                        constraints=constraints,
+                    )
+
+                    if regenerated.strip().startswith("-- NEED_SCHEMA"):
+                        retry_rows, retry_citations, resolved_sql = self._handle_sql_need_schema(
+                            sql_query=regenerated,
+                            user_query=user_query,
+                            evidence_type=evidence_type,
+                            entities=entities,
+                        )
+                        rows, citations, sql_query = retry_rows, retry_citations, resolved_sql
+                        call.params["__runtime_rewrite_reason"] = "sql_regenerated_need_schema"
+                    elif regenerated.strip() and regenerated.strip() != sql_query.strip():
+                        retry_rows, retry_citations = self._execute_sql_raw(regenerated)
+                        retry_error = (
+                            retry_rows[0].get("error_code")
+                            if retry_rows and isinstance(retry_rows[0], dict)
+                            else ""
+                        )
+                        if retry_error not in {"sql_validation_failed", "sql_schema_missing"}:
+                            rows, citations, sql_query = retry_rows, retry_citations, regenerated
+                            call.params["__runtime_rewrite_reason"] = (
+                                "sql_regenerated_after_validation_failed"
+                            )
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "warning": "sql_regeneration_failed_after_validation_error",
+                            "detail": str(exc),
+                        }
+                    )
             return rows, citations, sql_query
 
         if source == "KQL":
             kql_query = call.query
+            kql_schema = schemas.get("kql_schema", {})
             if not kql_query or not self._looks_like_kql(kql_query):
                 try:
                     kql_query = self._get_kql_writer().generate(
                         user_query=user_query,
                         evidence_type=evidence_type or "generic",
-                        kql_schema=schemas.get("kql_schema", {}),
+                        kql_schema=kql_schema,
                         entities=entities,
                         time_window=time_window,
                         constraints=call.params,
                     )
                 except Exception as exc:
                     window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
-                    rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
+                    rows, citations = self.retriever.query_kql(
+                        user_query,
+                        window_minutes=window,
+                        kql_schema=kql_schema,
+                    )
                     rows.append(
                         {
                             "warning": "kql_generation_failed_using_direct_query",
@@ -320,10 +388,60 @@ class PlanExecutor:
                     return rows, citations, None
             if kql_query.strip().startswith("// NEED_SCHEMA"):
                 window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
-                rows, citations = self.retriever.query_kql(user_query, window_minutes=window)
+                rows, citations = self.retriever.query_kql(
+                    user_query,
+                    window_minutes=window,
+                    kql_schema=kql_schema,
+                )
                 return rows, citations, kql_query
             window = int(plan.time_window.horizon_min or call.params.get("window_minutes", 120))
-            rows, citations = self.retriever.query_kql(kql_query, window_minutes=window)
+            original_kql = kql_query
+            if kql_query and self._looks_like_kql(kql_query):
+                prepared_kql, prep_meta = self.retriever.prepare_kql_query(kql_query, window_minutes=window)
+                kql_query = prepared_kql
+                if prep_meta.get("query_rewritten"):
+                    call.params["__runtime_rewrite_reason"] = prep_meta.get("rewrite_reason", "kql_sanitized")
+            rows, citations = self.retriever.query_kql(
+                kql_query,
+                window_minutes=window,
+                kql_schema=kql_schema,
+            )
+            first_error = rows[0].get("error_code") if rows and isinstance(rows[0], dict) else ""
+            if (
+                first_error == "kql_validation_failed"
+                and original_kql
+                and self._looks_like_kql(original_kql)
+            ):
+                try:
+                    regenerated = self._get_kql_writer().generate(
+                        user_query=user_query,
+                        evidence_type=evidence_type or "generic",
+                        kql_schema=kql_schema,
+                        entities=entities,
+                        time_window=time_window,
+                        constraints=call.params,
+                    )
+                    regenerated, regen_meta = self.retriever.prepare_kql_query(regenerated, window_minutes=window)
+                    retry_rows, retry_citations = self.retriever.query_kql(
+                        regenerated,
+                        window_minutes=window,
+                        kql_schema=kql_schema,
+                    )
+                    retry_error = retry_rows[0].get("error_code") if retry_rows and isinstance(retry_rows[0], dict) else ""
+                    if retry_error != "kql_validation_failed":
+                        rows, citations = retry_rows, retry_citations
+                        kql_query = regenerated
+                        reason = "regenerated_after_validation_failed"
+                        if regen_meta.get("query_rewritten"):
+                            reason = f"{reason}+{regen_meta.get('rewrite_reason')}"
+                        call.params["__runtime_rewrite_reason"] = reason
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "warning": "kql_regeneration_failed_after_validation_error",
+                            "detail": str(exc),
+                        }
+                    )
             return rows, citations, kql_query
 
         if source == "GRAPH":
@@ -401,6 +519,12 @@ class PlanExecutor:
         if self.kql_writer is None:
             self.kql_writer = KQLWriter()
         return self.kql_writer
+
+    @staticmethod
+    def _hash_text(value: str) -> str:
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
     def _annotate_rows(
         self,

@@ -49,6 +49,8 @@ type QueryProfile = "pilot-brief" | "ops-live" | "compliance";
 type DemoScenario = "none" | "weather-spike" | "runway-notam" | "ground-bottleneck";
 type VoiceMode = "off" | "tr-TR" | "en-US";
 type VoiceClipStatus = "idle" | "preparing" | "ready" | "error";
+const EMPTY_SUCCESS_TERMINAL_ERROR =
+  "The briefing run completed without answer content. Please retry.";
 
 function createInitialSourceHealth(): SourceHealthStatus[] {
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
@@ -131,6 +133,38 @@ function resolveStreamEventTimestamp(event: StreamEvent): string {
     return new Date().toISOString();
   }
   return parsed.toISOString();
+}
+
+function extractStreamContent(event: StreamEvent): string {
+  if (typeof event.content === "string" && event.content) {
+    return event.content;
+  }
+
+  const rawContent = (event as { content?: unknown }).content;
+  if (Array.isArray(rawContent)) {
+    const parts = rawContent
+      .map((item) => {
+        if (!isRecord(item)) return "";
+        const text = item.text;
+        return typeof text === "string" ? text : "";
+      })
+      .filter(Boolean);
+    if (parts.length > 0) {
+      return parts.join("");
+    }
+  }
+
+  if (event.type === "text") {
+    const rawText = (event as { text?: unknown }).text;
+    if (typeof rawText === "string" && rawText) {
+      return rawText;
+    }
+    if (typeof event.message === "string" && event.message) {
+      return event.message;
+    }
+  }
+
+  return "";
 }
 
 function extractIntentPayloadFromPlan(plan?: Record<string, unknown>): ReasoningEventPayload {
@@ -779,6 +813,7 @@ export default function ChatPage() {
         let terminalAgentError: string | null = null;
         let hadPartialCompletion = false;
         let degradedSources: string[] = [];
+        let sawSuccessfulTerminal = false;
 
         const processEvent = (event: ReturnType<typeof parseSSEFrames>["events"][number]) => {
           const eventTs = resolveStreamEventTimestamp(event);
@@ -849,10 +884,13 @@ export default function ChatPage() {
             emitReasoningEvent("drafting_brief", route ? { route } : undefined, eventTs);
           }
 
-          if ((event.type === "agent_update" || event.type === "text") && event.content) {
-            fullContent += event.content;
-            setStreamingContent(fullContent);
-            emitReasoningEvent("drafting_brief", undefined, eventTs);
+          if (event.type === "agent_update" || event.type === "text") {
+            const streamedChunk = extractStreamContent(event);
+            if (streamedChunk) {
+              fullContent += streamedChunk;
+              setStreamingContent(fullContent);
+              emitReasoningEvent("drafting_brief", undefined, eventTs);
+            }
           }
 
           if (event.type === "citations" && event.citations) {
@@ -860,6 +898,7 @@ export default function ChatPage() {
           }
 
           if (event.type === "agent_done" || event.type === "agent_partial_done" || event.type === "done") {
+            sawSuccessfulTerminal = true;
             isVerified = !!event.isVerified;
             hadPartialCompletion = event.type === "agent_partial_done" || !!event.partial;
             degradedSources = Array.isArray(event.degradedSources) ? event.degradedSources : degradedSources;
@@ -954,10 +993,31 @@ export default function ChatPage() {
           }
         }
 
-        if (!fullContent.trim() && terminalAgentError) {
-          fullContent =
-            "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.";
-          setRouteLabel("Error");
+        if (!fullContent.trim()) {
+          if (terminalAgentError) {
+            fullContent =
+              "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.";
+            setRouteLabel("Error");
+          } else {
+            const protocolViolationMessage = sawSuccessfulTerminal
+              ? EMPTY_SUCCESS_TERMINAL_ERROR
+              : "The stream ended before an answer was generated. Please retry.";
+            terminalAgentError = protocolViolationMessage;
+            fullContent = protocolViolationMessage;
+            setRouteLabel("Error");
+            setConfidenceLabel("Unavailable");
+            setTimelineEvents((previous) => [
+              ...previous,
+              {
+                id: generateId(),
+                type: "agent_error",
+                stage: "error",
+                message: protocolViolationMessage,
+                status: "error",
+                timestamp: new Date().toISOString(),
+              },
+            ]);
+          }
         }
 
         const assistantMessage: Message = {
