@@ -70,8 +70,13 @@ class PlanExecutor:
         self._shared_embedding_query = user_query
         if has_vector_calls:
             _t0_emb = time.perf_counter()
-            self._shared_embedding = self.retriever.get_embedding(user_query)
-            logger.info("perf stage=%s ms=%.1f", "shared_embedding_agentic", (time.perf_counter() - _t0_emb) * 1000)
+            try:
+                self._shared_embedding = self.retriever.get_embedding(user_query)
+                logger.info("perf stage=%s ms=%.1f", "shared_embedding_agentic", (time.perf_counter() - _t0_emb) * 1000)
+            except Exception as exc:
+                self._shared_embedding = None
+                result.warnings.append(f"shared_embedding_failed:{exc}")
+                logger.warning("Shared embedding precompute failed; continuing: %s", exc)
 
         # Build evidence -> tool map for post-verification.
         for req in plan.required_evidence:
@@ -127,6 +132,7 @@ class PlanExecutor:
                         if source == "GRAPH" and call.operation == "entity_expansion":
                             self._enrich_entities_from_graph(plan, rows)
                         has_row_errors = self._rows_have_errors(rows)
+                        error_code, error_detail = self._first_row_error(rows)
                         columns, rows_preview, rows_truncated = self._build_rows_preview(rows)
                         result.source_results_by_call[call.id] = CallResult(
                             call_id=call.id,
@@ -162,6 +168,8 @@ class PlanExecutor:
                             "columns": columns,
                             "rows_preview": rows_preview,
                             "rows_truncated": rows_truncated,
+                            "error_code": error_code,
+                            "error": error_detail,
                         }
                         result.source_traces.append(trace_done)
                         if on_trace:
@@ -204,6 +212,7 @@ class PlanExecutor:
                             "columns": columns,
                             "rows_preview": rows_preview,
                             "rows_truncated": rows_truncated,
+                            "error_code": "execution_exception",
                         }
                         result.source_traces.append(trace_err)
                         if on_trace:
@@ -482,6 +491,19 @@ class PlanExecutor:
             if row.get("error") or row.get("error_code"):
                 return True
         return False
+
+    def _first_row_error(self, rows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            error_code = row.get("error_code")
+            error_detail = row.get("error")
+            if error_code or error_detail:
+                return (
+                    str(error_code) if error_code else None,
+                    str(error_detail) if error_detail else None,
+                )
+        return None, None
 
     def _safe_preview_value(self, value: Any, max_chars: int = 180) -> Any:
         return safe_preview_value(value, max_chars)

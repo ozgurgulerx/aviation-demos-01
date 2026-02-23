@@ -15,6 +15,7 @@ const RequestSchema = z.object({
   freshnessSlaMinutes: z.number().int().positive().optional(),
   explainRetrieval: z.boolean().optional().default(false),
   riskMode: z.enum(["standard", "strict"]).optional().default("standard"),
+  failurePolicy: z.enum(["graceful", "strict"]).optional().default("graceful"),
   askRecommendation: z.boolean().optional().default(false),
   demoScenario: z.string().optional(),
 });
@@ -25,7 +26,7 @@ const BACKEND_REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_REQUEST_TIMEOUT_MS
 const CHAT_STREAM_TIMEOUT_MS = Number(process.env.CHAT_STREAM_TIMEOUT_MS || "180000");
 
 const encoder = new TextEncoder();
-const TERMINAL_EVENT_TYPES = new Set(["agent_done", "done", "agent_error", "error"]);
+const TERMINAL_EVENT_TYPES = new Set(["agent_done", "agent_partial_done", "done", "agent_error", "error"]);
 
 function createSSEMessage(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
@@ -103,6 +104,7 @@ export async function POST(request: NextRequest) {
       freshnessSlaMinutes,
       explainRetrieval,
       riskMode,
+      failurePolicy,
       askRecommendation,
       demoScenario,
     } = parsed.data;
@@ -133,6 +135,7 @@ export async function POST(request: NextRequest) {
           freshness_sla_minutes: freshnessSlaMinutes,
           explain_retrieval: explainRetrieval,
           risk_mode: riskMode,
+          failure_policy: failurePolicy,
           ask_recommendation: askRecommendation,
           demo_scenario: demoScenario,
         }),

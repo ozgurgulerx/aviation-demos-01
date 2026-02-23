@@ -71,6 +71,7 @@ def chat():
     risk_mode = data.get("risk_mode", "standard")
     ask_recommendation = bool(data.get("ask_recommendation", False))
     demo_scenario = data.get("demo_scenario")
+    failure_policy = data.get("failure_policy", "graceful")
 
     # Multi-turn: extract conversation history from messages array.
     max_history_turns = int(os.getenv("MAX_CONVERSATION_HISTORY_TURNS", "3"))
@@ -111,6 +112,7 @@ def chat():
                 ask_recommendation=ask_recommendation,
                 demo_scenario=demo_scenario,
                 conversation_history=conversation_history,
+                failure_policy=failure_policy,
             ):
                 yield to_sse(event)
         except Exception as exc:
@@ -158,6 +160,7 @@ def query():
         risk_mode = data.get("risk_mode", "standard")
         ask_recommendation = bool(data.get("ask_recommendation", False))
         demo_scenario = data.get("demo_scenario")
+        failure_policy = data.get("failure_policy", "graceful")
         af_runtime = get_runtime()
         result = af_runtime.run_once(
             query=message,
@@ -170,6 +173,7 @@ def query():
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
             demo_scenario=demo_scenario,
+            failure_policy=failure_policy,
         )
         return jsonify(result)
     except Exception as exc:

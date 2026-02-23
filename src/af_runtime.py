@@ -334,10 +334,12 @@ class AgentFrameworkRuntime:
         ask_recommendation: bool = False,
         demo_scenario: Optional[str] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        failure_policy: str = "graceful",
     ) -> Generator[Dict[str, Any], None, None]:
         _t0_total = time.perf_counter()
         sid = session_id or str(uuid.uuid4())
         _resolved_route = "UNKNOWN"
+        failure_policy = self._normalize_failure_policy(failure_policy)
 
         yield {
             "type": "agent_update",
@@ -489,8 +491,9 @@ class AgentFrameworkRuntime:
                         demo_scenario=demo_scenario,
                         precomputed_route=precomputed_route,
                         conversation_history=conversation_history,
+                        failure_policy=failure_policy,
                     ):
-                        if event.get("type") == "agent_done":
+                        if event.get("type") in {"agent_done", "agent_partial_done"}:
                             _resolved_route = event.get("route", "AGENTIC")
                         yield event
                 _total_ms = (time.perf_counter() - _t0_total) * 1000
@@ -523,8 +526,9 @@ class AgentFrameworkRuntime:
                 demo_scenario=demo_scenario,
                 precomputed_route=precomputed_route,
                 conversation_history=conversation_history,
+                failure_policy=failure_policy,
             ):
-                if event.get("type") == "agent_done":
+                if event.get("type") in {"agent_done", "agent_partial_done"}:
                     _resolved_route = event.get("route", "LOCAL")
                 yield event
         _total_ms = (time.perf_counter() - _t0_total) * 1000
@@ -547,6 +551,7 @@ class AgentFrameworkRuntime:
         demo_scenario: Optional[str],
         precomputed_route: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        failure_policy: str = "graceful",
     ) -> Generator[Dict[str, Any], None, None]:
         session = self._get_or_create_session(session_id)
         call_id = str(uuid.uuid4())
@@ -712,6 +717,40 @@ class AgentFrameworkRuntime:
             route=ctx.route,
         )
 
+        degraded_sources, failed_required_sources = self._summarize_source_outcomes(
+            ctx.source_results,
+            required_sources=required_sources,
+        )
+        if failure_policy == "strict" and degraded_sources:
+            detail = ", ".join(degraded_sources)
+            yield {
+                "type": "agent_error",
+                "message": f"Strict failure policy triggered by source errors: {detail}",
+                "route": ctx.route,
+                "sessionId": session_id,
+                "framework": self._framework_label,
+                "degradedSources": degraded_sources,
+                "failedRequiredSources": failed_required_sources,
+                "failurePolicy": failure_policy,
+            }
+            return
+
+        if degraded_sources:
+            yield {
+                "type": "agent_partial_done",
+                "isVerified": is_verified,
+                "route": ctx.route,
+                "reasoning": ctx.reasoning,
+                "sessionId": session_id,
+                "framework": self._framework_label,
+                "grounding": grounding,
+                "degradedSources": degraded_sources,
+                "failedRequiredSources": failed_required_sources,
+                "fatalSourceCount": len(degraded_sources),
+                "failurePolicy": failure_policy,
+                "partial": True,
+            }
+
         yield {
             "type": "agent_done",
             "isVerified": is_verified,
@@ -720,6 +759,11 @@ class AgentFrameworkRuntime:
             "sessionId": session_id,
             "framework": self._framework_label,
             "grounding": grounding,
+            "degradedSources": degraded_sources,
+            "failedRequiredSources": failed_required_sources,
+            "fatalSourceCount": len(degraded_sources),
+            "failurePolicy": failure_policy,
+            "partial": bool(degraded_sources),
         }
 
     def _run_with_local_pipeline(
@@ -736,6 +780,7 @@ class AgentFrameworkRuntime:
         demo_scenario: Optional[str],
         precomputed_route: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        failure_policy: str = "graceful",
     ) -> Generator[Dict[str, Any], None, None]:
         call_id = str(uuid.uuid4())
 
@@ -920,6 +965,40 @@ class AgentFrameworkRuntime:
             route=route,
         )
 
+        degraded_sources, failed_required_sources = self._summarize_source_outcomes(
+            source_results,
+            required_sources=required_sources,
+        )
+        if failure_policy == "strict" and degraded_sources:
+            detail = ", ".join(degraded_sources)
+            yield {
+                "type": "agent_error",
+                "message": f"Strict failure policy triggered by source errors: {detail}",
+                "route": route,
+                "sessionId": session_id,
+                "framework": "local-fallback",
+                "degradedSources": degraded_sources,
+                "failedRequiredSources": failed_required_sources,
+                "failurePolicy": failure_policy,
+            }
+            return
+
+        if degraded_sources:
+            yield {
+                "type": "agent_partial_done",
+                "isVerified": local_is_verified,
+                "route": route,
+                "reasoning": reasoning,
+                "sessionId": session_id,
+                "framework": "local-fallback",
+                "grounding": local_grounding,
+                "degradedSources": degraded_sources,
+                "failedRequiredSources": failed_required_sources,
+                "fatalSourceCount": len(degraded_sources),
+                "failurePolicy": failure_policy,
+                "partial": True,
+            }
+
         yield {
             "type": "agent_done",
             "isVerified": local_is_verified,
@@ -928,7 +1007,43 @@ class AgentFrameworkRuntime:
             "sessionId": session_id,
             "framework": "local-fallback",
             "grounding": local_grounding,
+            "degradedSources": degraded_sources,
+            "failedRequiredSources": failed_required_sources,
+            "fatalSourceCount": len(degraded_sources),
+            "failurePolicy": failure_policy,
+            "partial": bool(degraded_sources),
         }
+
+    @staticmethod
+    def _normalize_failure_policy(value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized in {"strict", "graceful"}:
+            return normalized
+        return "graceful"
+
+    def _summarize_source_outcomes(
+        self,
+        source_results: Dict[str, List[Dict[str, Any]]],
+        required_sources: List[str],
+    ) -> tuple[List[str], List[str]]:
+        degraded_sources: List[str] = []
+        for source, rows in source_results.items():
+            if not isinstance(rows, list):
+                continue
+            has_errors = any(
+                isinstance(row, dict) and (row.get("error") or row.get("error_code"))
+                for row in rows
+            )
+            if has_errors:
+                degraded_sources.append(source)
+
+        required_upper = {str(src).upper() for src in required_sources if str(src).strip()}
+        failed_required_sources = [
+            source
+            for source in degraded_sources
+            if str(source).upper() in required_upper
+        ]
+        return sorted(set(degraded_sources)), sorted(set(failed_required_sources))
 
     def _invoke_agent(self, prompt: str, session: Any, session_id: str) -> str:
         if self._agent is None:
@@ -1151,10 +1266,12 @@ class AgentFrameworkRuntime:
         risk_mode: str = "standard",
         ask_recommendation: bool = False,
         demo_scenario: Optional[str] = None,
+        failure_policy: str = "graceful",
     ) -> Dict[str, Any]:
         answer_parts: List[str] = []
         citations: List[Dict[str, Any]] = []
         metadata: Dict[str, Any] = {}
+        terminal_error: Dict[str, Any] = {}
 
         retrieval_plan: Dict[str, Any] = {}
         for event in self.run_stream(
@@ -1168,6 +1285,7 @@ class AgentFrameworkRuntime:
             risk_mode=risk_mode,
             ask_recommendation=ask_recommendation,
             demo_scenario=demo_scenario,
+            failure_policy=failure_policy,
         ):
             if event.get("type") == "agent_update" and event.get("content"):
                 answer_parts.append(str(event["content"]))
@@ -1175,8 +1293,32 @@ class AgentFrameworkRuntime:
                 citations = list(event.get("citations", []))
             elif event.get("type") == "retrieval_plan":
                 retrieval_plan = dict(event.get("plan", {}))
-            elif event.get("type") == "agent_done":
+            elif event.get("type") in {"agent_error", "error"}:
+                terminal_error = {
+                    "message": event.get("message") or event.get("error") or "Agent runtime error",
+                    "route": event.get("route", "ERROR"),
+                    "degradedSources": list(event.get("degradedSources", [])),
+                    "failedRequiredSources": list(event.get("failedRequiredSources", [])),
+                    "partial": bool(event.get("partial", False)),
+                }
+            elif event.get("type") in {"agent_done", "agent_partial_done"}:
                 metadata = event
+
+        if terminal_error and not metadata:
+            return {
+                "answer": "".join(answer_parts).strip(),
+                "citations": citations,
+                "retrieval_plan": retrieval_plan,
+                "route": terminal_error.get("route", "ERROR"),
+                "reasoning": "terminal_agent_error",
+                "framework": self._framework_label,
+                "is_verified": False,
+                "degraded_sources": list(terminal_error.get("degradedSources", [])),
+                "failed_required_sources": list(terminal_error.get("failedRequiredSources", [])),
+                "partial": bool(terminal_error.get("partial", False)),
+                "status": "error",
+                "error": terminal_error.get("message", "Agent runtime error"),
+            }
 
         return {
             "answer": "".join(answer_parts).strip(),
@@ -1186,4 +1328,7 @@ class AgentFrameworkRuntime:
             "reasoning": metadata.get("reasoning", ""),
             "framework": metadata.get("framework", self._framework_label),
             "is_verified": bool(metadata.get("isVerified")),
+            "degraded_sources": list(metadata.get("degradedSources", [])),
+            "failed_required_sources": list(metadata.get("failedRequiredSources", [])),
+            "partial": bool(metadata.get("partial", False)),
         }

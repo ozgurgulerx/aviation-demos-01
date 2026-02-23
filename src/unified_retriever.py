@@ -324,23 +324,44 @@ class UnifiedRetriever:
             logger.warning("PII filter disabled")
 
         # Cosmos DB client for NOSQL (NOTAM) retrieval
+        # Prefer DefaultAzureCredential (AAD/managed identity) because the
+        # Cosmos DB account may have local key auth disabled.  Fall back to
+        # key-based auth only if AAD fails.
         self._cosmos_container = None
         if _COSMOS_SDK_AVAILABLE and AZURE_COSMOS_ENDPOINT:
+            cosmos_client = None
+            # 1. Try AAD / managed-identity first
             try:
-                if AZURE_COSMOS_KEY:
+                from azure.identity import DefaultAzureCredential
+                _cred = DefaultAzureCredential()
+                cosmos_client = CosmosClient(AZURE_COSMOS_ENDPOINT, credential=_cred)
+                # Validate the credential by listing databases (lightweight)
+                cosmos_client.get_database_client(AZURE_COSMOS_DATABASE).read()
+                logger.info("Cosmos DB connected via DefaultAzureCredential")
+            except Exception as aad_exc:
+                cosmos_client = None
+                logger.info("Cosmos DB AAD auth failed (%s), trying key-based auth", aad_exc)
+            # 2. Fall back to key-based auth
+            if cosmos_client is None and AZURE_COSMOS_KEY:
+                try:
                     cosmos_client = CosmosClient(AZURE_COSMOS_ENDPOINT, credential=AZURE_COSMOS_KEY)
-                else:
-                    from azure.identity import DefaultAzureCredential
-                    cosmos_client = CosmosClient(AZURE_COSMOS_ENDPOINT, credential=DefaultAzureCredential())
-                cosmos_db = cosmos_client.get_database_client(AZURE_COSMOS_DATABASE)
-                self._cosmos_container = cosmos_db.get_container_client(AZURE_COSMOS_CONTAINER)
-                logger.info(
-                    "Connected to Cosmos DB: %s/%s/%s",
-                    AZURE_COSMOS_ENDPOINT, AZURE_COSMOS_DATABASE, AZURE_COSMOS_CONTAINER,
-                )
-            except Exception as exc:
-                self._cosmos_container = None
-                logger.warning("Cosmos DB unavailable (%s)", exc)
+                    logger.info("Cosmos DB connected via account key")
+                except Exception as key_exc:
+                    cosmos_client = None
+                    logger.warning("Cosmos DB key-based auth also failed (%s)", key_exc)
+            if cosmos_client is not None:
+                try:
+                    cosmos_db = cosmos_client.get_database_client(AZURE_COSMOS_DATABASE)
+                    self._cosmos_container = cosmos_db.get_container_client(AZURE_COSMOS_CONTAINER)
+                    logger.info(
+                        "Connected to Cosmos DB: %s/%s/%s",
+                        AZURE_COSMOS_ENDPOINT, AZURE_COSMOS_DATABASE, AZURE_COSMOS_CONTAINER,
+                    )
+                except Exception as exc:
+                    self._cosmos_container = None
+                    logger.warning("Cosmos DB unavailable (%s)", exc)
+            else:
+                logger.warning("Cosmos DB: no valid credential available")
         elif not _COSMOS_SDK_AVAILABLE and AZURE_COSMOS_ENDPOINT:
             logger.warning("azure-cosmos SDK not installed; Cosmos NOSQL retrieval unavailable")
 
@@ -403,6 +424,14 @@ class UnifiedRetriever:
 
         logger.info("perf stage=%s cache=miss ms=%.1f", "get_embedding", elapsed)
         return result
+
+    def get_embedding_safe(self, text: str) -> Tuple[Optional[List[float]], Optional[str]]:
+        """Best-effort embedding lookup that never raises."""
+        try:
+            return self.get_embedding(text), None
+        except Exception as exc:
+            logger.warning("Embedding lookup failed; continuing without shared embedding: %s", exc)
+            return None, str(exc)
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -1088,7 +1117,16 @@ class UnifiedRetriever:
         top_raw = max(top, _RERANK_RAW_CANDIDATES if _RERANK_ENABLED else top)
 
         if embedding is None:
-            embedding = self.get_embedding(query)
+            embedding, embedding_error = self.get_embedding_safe(query)
+            if embedding is None:
+                return [
+                    self._source_error_row(
+                        source=source,
+                        code="embedding_runtime_error",
+                        detail=embedding_error or "embedding_lookup_failed",
+                        extra={"index": index_name},
+                    )
+                ], []
 
         vector_kwargs: Dict[str, Any] = {
             "vector": embedding,
@@ -1798,7 +1836,7 @@ Notes:
 
     def execute_hybrid_route(self, query: str, sql_hint: str = None) -> RetrievalResult:
         """Execute hybrid retrieval (SQL + Semantic in parallel)."""
-        query_embedding = self.get_embedding(query)
+        query_embedding, _embedding_error = self.get_embedding_safe(query)
 
         sql_results, sql_query, sql_citations = [], None, []
         semantic_results, semantic_citations = [], []

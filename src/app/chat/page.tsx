@@ -759,6 +759,7 @@ export default function ChatPage() {
             queryProfile,
             freshnessSlaMinutes,
             explainRetrieval,
+            failurePolicy: "graceful",
             demoScenario: demoScenario === "none" ? undefined : demoScenario,
           }),
         });
@@ -775,6 +776,9 @@ export default function ChatPage() {
         let newCitations: Citation[] = [];
         let isVerified = false;
         let buffer = "";
+        let terminalAgentError: string | null = null;
+        let hadPartialCompletion = false;
+        let degradedSources: string[] = [];
 
         const processEvent = (event: ReturnType<typeof parseSSEFrames>["events"][number]) => {
           const eventTs = resolveStreamEventTimestamp(event);
@@ -855,8 +859,10 @@ export default function ChatPage() {
             newCitations = event.citations;
           }
 
-          if (event.type === "agent_done" || event.type === "done") {
+          if (event.type === "agent_done" || event.type === "agent_partial_done" || event.type === "done") {
             isVerified = !!event.isVerified;
+            hadPartialCompletion = event.type === "agent_partial_done" || !!event.partial;
+            degradedSources = Array.isArray(event.degradedSources) ? event.degradedSources : degradedSources;
             setRouteLabel(event.route || "ORCHESTRATED");
             emitReasoningEvent(
               "evidence_check_complete",
@@ -900,7 +906,19 @@ export default function ChatPage() {
           }
 
           if (event.type === "agent_error" || event.type === "error") {
-            throw new Error(event.message || event.error || "Agent runtime error");
+            terminalAgentError = event.message || event.error || "Agent runtime error";
+            isVerified = false;
+            setRouteLabel("Error");
+            setConfidenceLabel("Unavailable");
+            emitReasoningEvent(
+              "evidence_check_complete",
+              {
+                verification: "Partial",
+                failOpen: true,
+                route: "ERROR",
+              },
+              eventTs
+            );
           }
 
           const alert = toOperationalAlert(event);
@@ -936,6 +954,12 @@ export default function ChatPage() {
           }
         }
 
+        if (!fullContent.trim() && terminalAgentError) {
+          fullContent =
+            "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.";
+          setRouteLabel("Error");
+        }
+
         const assistantMessage: Message = {
           id: generateId(),
           role: "assistant",
@@ -966,13 +990,19 @@ export default function ChatPage() {
         }
 
         setConfidenceLabel(
-          isVerified
-            ? newCitations.length > 0
-              ? "High (verified with evidence)"
-              : "Medium (verified without citations)"
-            : newCitations.length > 0
-              ? "Medium (evidence present, not fully verified)"
-              : "Low (limited evidence)"
+          terminalAgentError
+            ? "Unavailable"
+            : hadPartialCompletion
+              ? degradedSources.length > 0
+                ? `Medium (degraded: ${degradedSources.join(", ")})`
+                : "Medium (partial completion)"
+              : isVerified
+                ? newCitations.length > 0
+                  ? "High (verified with evidence)"
+                  : "Medium (verified without citations)"
+                : newCitations.length > 0
+                  ? "Medium (evidence present, not fully verified)"
+                  : "Low (limited evidence)"
         );
 
         setShowFollowUps(true);

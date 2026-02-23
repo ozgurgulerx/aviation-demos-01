@@ -47,6 +47,7 @@ export interface StreamEvent {
     | "retrieval_plan"
     | "source_call_start"
     | "source_call_done"
+    | "agent_partial_done"
     | "citations"
     | "agent_done"
     | "agent_error"
@@ -80,6 +81,8 @@ export interface StreamEvent {
   rows_preview?: Array<Record<string, unknown>>;
   rows_truncated?: boolean;
   error?: string;
+  error_code?: string;
+  contract_status?: "planned" | "met" | "degraded" | "failed";
   citations?: Array<{
     id: number;
     provider: string;
@@ -126,6 +129,11 @@ export interface StreamEvent {
     invalid_markers?: number[];
     grounding_status?: string;
   };
+  degradedSources?: string[];
+  failedRequiredSources?: string[];
+  fatalSourceCount?: number;
+  failurePolicy?: "graceful" | "strict";
+  partial?: boolean;
 }
 
 export function parseSSELine(line: string): StreamEvent | null {
@@ -235,13 +243,19 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
             }
           : undefined,
       };
-    case "source_call_done":
+    case "source_call_done": {
+      const sourceDoneStatus = resolveSourceDoneStatus(event);
+      const sourceName = event.source || "Source";
+      const doneMessage =
+        sourceDoneStatus === "error"
+          ? `${sourceName} retrieval failed${event.error_code ? ` (${event.error_code})` : ""}`
+          : `${sourceName} returned ${event.row_count || 0} rows`;
       return {
         id: fallbackId,
         type: event.type,
         stage: "source_call",
-        message: `${event.source || "Source"} returned ${event.row_count || 0} rows`,
-        status: "completed",
+        message: doneMessage,
+        status: sourceDoneStatus,
         timestamp,
         source: normalizeSourceName(event.source),
         rowCount: event.row_count || 0,
@@ -249,6 +263,8 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         durationMs: event.duration_ms,
         eventId: event.event_id,
         parentEventId: event.parent_event_id,
+        contractStatus: event.contract_status,
+        errorCode: event.error_code,
         sourceMeta: event.source_meta
           ? {
               storeType: event.source_meta.store_type,
@@ -257,6 +273,7 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
             }
           : undefined,
       };
+    }
     case "scenario_loaded":
       return {
         id: fallbackId,
@@ -306,6 +323,20 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         source: normalizeSourceName(event.source),
         alertSeverity: event.severity,
       };
+    case "agent_partial_done":
+      return {
+        id: fallbackId,
+        type: event.type,
+        stage: "agent_done",
+        message: `Run completed with degraded sources via ${event.route || "orchestrated route"}`,
+        status: "info",
+        timestamp,
+        degradedSources: event.degradedSources,
+        failedRequiredSources: event.failedRequiredSources,
+        fatalSourceCount: event.fatalSourceCount,
+        failurePolicy: event.failurePolicy,
+        partial: true,
+      };
     case "agent_done":
       return {
         id: fallbackId,
@@ -314,6 +345,11 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         message: `Run complete via ${event.route || "orchestrated route"}`,
         status: "completed",
         timestamp,
+        degradedSources: event.degradedSources,
+        failedRequiredSources: event.failedRequiredSources,
+        fatalSourceCount: event.fatalSourceCount,
+        failurePolicy: event.failurePolicy,
+        partial: event.partial,
       };
     case "agent_error":
     case "error":
@@ -459,6 +495,11 @@ export function updateSourceHealth(
   const freshness = event.source_meta?.freshness;
   const eventTimestamp = resolveEventTimestamp(event);
 
+  const sourceDoneError =
+    event.contract_status === "failed" ||
+    !!event.error_code ||
+    !!event.error;
+
   if (!existing) {
     next.push({
       source,
@@ -466,7 +507,7 @@ export function updateSourceHealth(
         event.type === "source_call_start"
           ? "querying"
           : event.type === "source_call_done"
-            ? event.error ? "error" : "ready"
+            ? sourceDoneError ? "error" : "ready"
             : "idle",
       rowCount: event.row_count || 0,
       updatedAt: eventTimestamp,
@@ -484,7 +525,7 @@ export function updateSourceHealth(
             event.type === "source_call_start"
               ? "querying"
               : event.type === "source_call_done"
-                ? event.error ? "error" : "ready"
+                ? sourceDoneError ? "error" : "ready"
                 : item.status,
           rowCount:
             event.type === "source_call_done"
@@ -509,6 +550,16 @@ function resolveEventTimestamp(event: StreamEvent): string {
     }
   }
   return new Date().toISOString();
+}
+
+function resolveSourceDoneStatus(event: StreamEvent): TelemetryEvent["status"] {
+  if (event.contract_status === "failed" || event.error_code || event.error) {
+    return "error";
+  }
+  if (event.contract_status === "degraded") {
+    return "info";
+  }
+  return "completed";
 }
 
 export function toOperationalAlert(event: StreamEvent): OperationalAlert | null {

@@ -49,7 +49,25 @@ export function TimelinePanel({
 }: TimelinePanelProps) {
   const reducedMotion = useReducedMotion();
   const latestEvents = events.slice(-12);
-  const hasError = latestEvents.some((event) => event.status === "error");
+  const fatalErrorEvent = [...latestEvents].reverse().find(
+    (event) => event.type === "agent_error" && event.status === "error"
+  );
+  const degradedSources = Array.from(
+    new Set(
+      latestEvents
+        .filter(
+          (event) =>
+            event.type === "source_call_done" &&
+            (event.status === "error" || event.status === "info") &&
+            typeof event.source === "string" &&
+            event.source.trim().length > 0
+        )
+        .map((event) => event.source as string)
+    )
+  );
+  const hasFatalError = !!fatalErrorEvent;
+  const hasDegradedSources = degradedSources.length > 0 && !hasFatalError;
+  const fatalErrorMessage = resolveFatalMessage(fatalErrorEvent?.message || "");
   const [expanded, setExpanded] = useState(false);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
 
@@ -245,7 +263,7 @@ export function TimelinePanel({
         </AnimatePresence>
 
         <AnimatePresence>
-          {hasError && onRetryLast && (
+          {hasFatalError && onRetryLast && (
             <motion.div
               initial={reducedMotion ? false : { opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
@@ -255,12 +273,27 @@ export function TimelinePanel({
             >
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <Lock className="h-3.5 w-3.5 text-destructive" />
-                Retrieval failed for one or more stages. Retry with current constraints.
+                {fatalErrorMessage}
               </div>
               <Button size="sm" variant="outline" onClick={onRetryLast} className="h-7 gap-1.5 text-xs">
                 <RotateCcw className="h-3.5 w-3.5" />
                 Retry
               </Button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {hasDegradedSources && (
+            <motion.div
+              initial={reducedMotion ? false : { opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={reducedMotion ? { opacity: 1, y: 0 } : { opacity: 0, y: -4 }}
+              transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
+              className="mt-3 flex items-center gap-2 rounded-lg border border-amber-500/35 bg-amber-500/[0.08] px-3 py-2 text-xs text-muted-foreground"
+            >
+              <AlertCircle className="h-3.5 w-3.5 text-amber-600 dark:text-amber-300" />
+              Retrieval completed with degraded sources: {degradedSources.join(", ")}.
             </motion.div>
           )}
         </AnimatePresence>
@@ -340,6 +373,21 @@ export function TimelinePanel({
       </Dialog>
     </section>
   );
+}
+
+function resolveFatalMessage(message: string): string {
+  const text = (message || "").trim();
+  const lowered = text.toLowerCase();
+  if (lowered.includes("timed out")) {
+    return "Streaming timed out before completion. Retry with the same constraints or reduce source load.";
+  }
+  if (lowered.includes("backend service error")) {
+    return "Backend service returned an error. Retry after data-path health recovers.";
+  }
+  if (text) {
+    return text;
+  }
+  return "Retrieval pipeline failed. Retry with current constraints.";
 }
 
 function EventChip({ type }: { type: TelemetryEvent["type"] }) {

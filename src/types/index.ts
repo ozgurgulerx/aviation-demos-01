@@ -101,6 +101,7 @@ export interface TelemetryEvent {
     | "retrieval_plan"
     | "source_call_start"
     | "source_call_done"
+    | "agent_partial_done"
     | "agent_done"
     | "agent_error"
     | "text"
@@ -131,6 +132,13 @@ export interface TelemetryEvent {
   evidenceRefs?: number[];
   mode?: "live" | "fallback" | "unknown";
   alertSeverity?: OperationalAlertSeverity;
+  contractStatus?: "planned" | "met" | "degraded" | "failed";
+  errorCode?: string;
+  degradedSources?: string[];
+  failedRequiredSources?: string[];
+  fatalSourceCount?: number;
+  failurePolicy?: "graceful" | "strict";
+  partial?: boolean;
 }
 
 export interface OperationalAlert {

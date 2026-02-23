@@ -27,6 +27,12 @@ class _DummyRetriever:
     def execute_sql_query(self, _sql_query: str):
         return [{"facility": "KJFK", "report_count": 2}], []
 
+    def get_embedding(self, _query: str):
+        raise RuntimeError("embedding backend unavailable")
+
+    def query_semantic(self, _query: str, top: int = 5, embedding=None, source: str = "VECTOR_OPS", filter_expression=None):
+        return [{"id": "vec1", "title": "sample"}], []
+
 
 class PlanExecutorTests(unittest.TestCase):
     def test_execute_preserves_multiple_calls_same_source(self):
@@ -77,6 +83,21 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertEqual(rows[0].get("facility"), "KJFK")
         self.assertEqual(rows[0].get("report_count"), 2)
         self.assertEqual(rows[0].get("partial_schema"), "-- NEED_SCHEMA: damage_score missing")
+
+    def test_vector_execution_continues_when_shared_embedding_precompute_fails(self):
+        retriever = _DummyRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(id="call_vec", tool="VECTOR_OPS", operation="lookup", query="runway risk"),
+            ]
+        )
+
+        result = executor.execute(user_query="runway risk", plan=plan, schemas={})
+
+        self.assertIn("VECTOR_OPS", result.source_results)
+        self.assertEqual(result.source_results["VECTOR_OPS"][0].get("id"), "vec1")
+        self.assertTrue(any("shared_embedding_failed:" in warning for warning in result.warnings))
 
 
 if __name__ == "__main__":

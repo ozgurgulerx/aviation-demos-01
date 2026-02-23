@@ -436,8 +436,12 @@ class AviationRagContextProvider:
         shared_embedding = None
         if has_vector_steps:
             _t0_emb = time.perf_counter()
-            shared_embedding = self.retriever.get_embedding(query)
-            logger.info("perf stage=%s ms=%.1f", "shared_embedding_legacy", (time.perf_counter() - _t0_emb) * 1000)
+            try:
+                shared_embedding = self.retriever.get_embedding(query)
+                logger.info("perf stage=%s ms=%.1f", "shared_embedding_legacy", (time.perf_counter() - _t0_emb) * 1000)
+            except Exception as exc:
+                shared_embedding = None
+                logger.warning("Shared embedding precompute failed in legacy path; continuing: %s", exc)
 
         def _run(step: SourcePlan) -> tuple[str, List[Dict[str, Any]], List[Citation], Optional[str]]:
             params = dict(step.params)
@@ -490,6 +494,7 @@ class AviationRagContextProvider:
                         isinstance(row, dict) and (row.get("error") or row.get("error_code"))
                         for row in rows
                     )
+                    error_code, error_detail = self._first_row_error(rows)
                     execution_mode = self.retriever.source_mode(source)
                     if has_row_errors:
                         contract_status = "failed"
@@ -513,6 +518,8 @@ class AviationRagContextProvider:
                         "rows_preview": rows_preview,
                         "rows_truncated": rows_truncated,
                         "duration_ms": duration_ms,
+                        "error_code": error_code,
+                        "error": error_detail,
                         "event_id": step_event_ids[idx],
                         "parent_event_id": plan_event_id,
                     }
@@ -540,6 +547,7 @@ class AviationRagContextProvider:
                         "rows_preview": rows_preview,
                         "rows_truncated": rows_truncated,
                         "duration_ms": duration_ms,
+                        "error_code": "execution_exception",
                         "event_id": step_event_ids[idx],
                         "parent_event_id": plan_event_id,
                     }
@@ -627,6 +635,19 @@ class AviationRagContextProvider:
 
         rendered = str(value)
         return rendered if len(rendered) <= max_chars else rendered[: max_chars - 3] + "..."
+
+    def _first_row_error(self, rows: List[Dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            error_code = row.get("error_code")
+            error_detail = row.get("error")
+            if error_code or error_detail:
+                return (
+                    str(error_code) if error_code else None,
+                    str(error_detail) if error_detail else None,
+                )
+        return None, None
 
     def _load_fusion_weights(self) -> Dict[str, float]:
         raw = os.getenv("CONTEXT_FUSION_WEIGHTS", "").strip()
