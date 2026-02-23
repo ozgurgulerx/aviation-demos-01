@@ -135,6 +135,10 @@ def _fabric_token_min_ttl_seconds() -> int:
     return _env_int("FABRIC_TOKEN_MIN_TTL_SECONDS", 120, minimum=0)
 
 
+def _source_call_timeout_seconds() -> float:
+    return _env_float("SOURCE_CALL_TIMEOUT_SECONDS", 20.0, minimum=1.0)
+
+
 def _allow_static_fabric_bearer() -> bool:
     return os.getenv("ALLOW_STATIC_FABRIC_BEARER", "false").strip().lower() in {
         "1", "true", "yes", "y", "on"
@@ -579,6 +583,8 @@ class UnifiedRetriever:
 
     def get_embedding(self, text: str) -> List[float]:
         """Get embedding from Azure OpenAI with LRU cache."""
+        if not isinstance(text, str):
+            raise TypeError(f"embedding_input_must_be_string:{type(text).__name__}")
         normalized = text.strip()[:8000]
         with self._embedding_cache_lock:
             if normalized in self._embedding_cache:
@@ -3006,6 +3012,25 @@ class UnifiedRetriever:
         kql_schema: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve event-window signals from Eventhouse (live only)."""
+        effective_kql_schema = kql_schema
+        if not isinstance(effective_kql_schema, dict) or "tables" not in effective_kql_schema:
+            effective_kql_schema = {
+                "tables": [
+                    {
+                        "table": "opensky_states",
+                        "columns": ["callsign", "icao24", "time_position", "timestamp"],
+                    },
+                    {
+                        "table": "hazards_airsigmets",
+                        "columns": ["raw_text", "valid_time_from", "valid_time_to", "points"],
+                    },
+                    {
+                        "table": "hazards_gairmets",
+                        "columns": ["valid_time", "points", "hazard"],
+                    },
+                ]
+            }
+        table_columns = self._kql_table_columns(effective_kql_schema)
         kql_endpoint = self._effective_fabric_endpoint("KQL")
         kql_capability = self.source_capability("KQL", refresh=True)
         if kql_capability.get("status") == "unavailable":
@@ -3024,17 +3049,63 @@ class UnifiedRetriever:
                 airports = self._extract_airports_from_query(query)
                 query_lower = (query or "").lower()
                 is_weather_query = any(w in query_lower for w in ("weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm"))
-                if airports and is_weather_query:
-                    # Query hazards_airsigmets for weather-related airport queries.
-                    # Note: hazards_airsigmets has points (lat/lon polygon) not station IDs,
-                    # so we search raw_text for the airport identifiers.
-                    values = ",".join(f"'{a}'" for a in airports)
-                    csl = (
-                        "hazards_airsigmets "
-                        f"| where raw_text has_any ({values}) "
-                        f"| where valid_time_to > ago({max(1, int(window_minutes))}m) "
-                        "| top 40 by valid_time_from desc"
+                is_airport_risk_query = any(
+                    token in query_lower
+                    for token in (
+                        "risk",
+                        "departure",
+                        "disruption",
+                        "compare",
+                        "next-90",
+                        "next 90",
                     )
+                )
+                if airports and (is_weather_query or is_airport_risk_query):
+                    iata_tokens = sorted(set(re.findall(r"\b[A-Z]{3}\b", (query or "").upper())))
+                    terms = sorted(set([*airports, *iata_tokens]))
+                    values = ",".join(f"'{term}'" for term in terms)
+
+                    has_airsigmets = "hazards_airsigmets" in table_columns
+                    has_gairmets = "hazards_gairmets" in table_columns
+                    airsig_cols = table_columns.get("hazards_airsigmets", set())
+                    gair_cols = table_columns.get("hazards_gairmets", set())
+                    window = max(1, int(window_minutes))
+
+                    if has_airsigmets and {"raw_text", "valid_time_from", "valid_time_to"}.issubset(airsig_cols):
+                        csl = (
+                            "let horizon_start = now(); "
+                            f"let horizon_end = now() + {window}m; "
+                            "hazards_airsigmets "
+                            "| where valid_time_to >= horizon_start and valid_time_from <= horizon_end "
+                            f"| where raw_text has_any ({values}) "
+                            "| top 40 by valid_time_from desc"
+                        )
+                    elif has_gairmets and {"valid_time", "points"}.issubset(gair_cols):
+                        csl = (
+                            "let horizon_start = now(); "
+                            f"let horizon_end = now() + {window}m; "
+                            "hazards_gairmets "
+                            "| where valid_time between (horizon_start .. horizon_end) "
+                            f"| where tostring(points) has_any ({values}) or tostring(hazard) has_any ({values}) "
+                            "| top 40 by valid_time desc"
+                        )
+                    else:
+                        explicit_ids = self._extract_explicit_flight_identifiers(query)
+                        if not explicit_ids:
+                            return [
+                                self._source_error_row(
+                                    source="KQL",
+                                    code="kql_unmappable_airport_filter",
+                                    detail="airport identifiers cannot be mapped to available KQL tables",
+                                    extra={"airports": airports},
+                                )
+                            ], []
+                        values = ",".join(f"'{value}'" for value in explicit_ids)
+                        csl = (
+                            "opensky_states "
+                            f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                            "| take 50"
+                        )
                 elif airports:
                     explicit_ids = self._extract_explicit_flight_identifiers(query)
                     if not explicit_ids:
@@ -3065,7 +3136,7 @@ class UnifiedRetriever:
                         csl = "opensky_states | take 50"
                 csl, _changed, _reason = self._sanitize_kql_query(csl)
 
-            validation_error = self._validate_kql_query(csl, kql_schema=kql_schema)
+            validation_error = self._validate_kql_query(csl, kql_schema=effective_kql_schema)
             if validation_error:
                 return [
                     self._source_error_row(
@@ -3076,7 +3147,11 @@ class UnifiedRetriever:
                     )
                 ], []
 
-            rows, error = self._kusto_rows(kql_endpoint, csl)
+            rows, error = self._kusto_rows(
+                kql_endpoint,
+                csl,
+                timeout_seconds=_source_call_timeout_seconds(),
+            )
             if rows:
                 citation = Citation(
                     source_type="KQL",
@@ -3097,7 +3172,11 @@ class UnifiedRetriever:
             ], []
         else:
             payload = {"query": query, "window_minutes": window_minutes}
-            response = self._post_json(kql_endpoint, payload)
+            response = self._post_json(
+                kql_endpoint,
+                payload,
+                timeout_seconds=_source_call_timeout_seconds(),
+            )
             if isinstance(response, dict) and "error" not in response:
                 rows = response.get("rows", [])
                 if rows:
@@ -3390,7 +3469,11 @@ class UnifiedRetriever:
             return [self._source_unavailable_row("NOSQL", "NOSQL source not configured (no Cosmos DB or FABRIC_NOSQL_ENDPOINT)")], []
 
         if self._is_kusto_endpoint(nosql_endpoint):
-            docs, _error = self._kusto_rows(nosql_endpoint, "hazards_airsigmets | take 30")
+            docs, _error = self._kusto_rows(
+                nosql_endpoint,
+                "hazards_airsigmets | take 30",
+                timeout_seconds=_source_call_timeout_seconds(),
+            )
             if docs:
                 citation = Citation(
                     source_type="NOSQL",
@@ -3404,7 +3487,11 @@ class UnifiedRetriever:
             return [self._source_error_row("NOSQL", "nosql_runtime_error", _error or "nosql_query_returned_no_rows")], []
 
         payload = {"query": query}
-        response = self._post_json(nosql_endpoint, payload)
+        response = self._post_json(
+            nosql_endpoint,
+            payload,
+            timeout_seconds=_source_call_timeout_seconds(),
+        )
         if isinstance(response, dict) and "error" not in response:
             docs = response.get("docs", [])
             if docs:
@@ -3476,13 +3563,23 @@ Notes:
 
         logger.info("FABRIC_SQL TDS query: %s", sql[:200])
 
+        sql_token_scope = "https://database.windows.net/.default"
+        token_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
+        token = str(token_bundle.get("token") or "")
+        if not token or not bool(token_bundle.get("auth_ready")):
+            detail = str(token_bundle.get("reason") or "fabric_sql_tds_auth_not_ready")
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {"sql": sql})], []
+        token_aud = str(_decode_jwt_payload(token).get("aud") or "")
+        if token_aud and "database.windows.net" not in token_aud:
+            detail = f"fabric_sql_tds_invalid_token_audience:{token_aud}"
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {"sql": sql})], []
+
+        connect_timeout = _env_int("FABRIC_SQL_TDS_CONNECT_TIMEOUT_SECONDS", 10, minimum=1)
+        query_timeout = _env_int("FABRIC_SQL_TDS_QUERY_TIMEOUT_SECONDS", 15, minimum=1)
+
         try:
             import pyodbc
             import struct
-            from azure.identity import DefaultAzureCredential
-
-            credential = DefaultAzureCredential()
-            token = credential.get_token("https://database.windows.net/.default").token
             encoded = token.encode("UTF-16-LE")
             token_bytes = struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
 
@@ -3492,16 +3589,20 @@ Notes:
                 f"Database={database};"
                 f"Encrypt=yes;"
                 f"TrustServerCertificate=no;"
-                f"Connection Timeout=30;"
+                f"Connection Timeout={connect_timeout};"
             )
-            conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=30)
+            conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=connect_timeout)
             cursor = conn.cursor()
+            cursor.timeout = query_timeout
             cursor.execute(sql)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
             conn.close()
         except Exception as exc:
-            return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", str(exc), {"sql": sql})], []
+            detail = str(exc)
+            if "18456" in detail:
+                return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {"sql": sql})], []
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", detail, {"sql": sql})], []
 
         if not rows:
             return [self._source_error_row("FABRIC_SQL", "fabric_sql_no_rows", "query returned no rows", {"sql": sql})], []
@@ -3546,7 +3647,11 @@ Notes:
         if FABRIC_SQL_DATABASE:
             payload["database"] = FABRIC_SQL_DATABASE
 
-        response = self._post_json(fabric_sql_endpoint, payload)
+        response = self._post_json(
+            fabric_sql_endpoint,
+            payload,
+            timeout_seconds=_source_call_timeout_seconds(),
+        )
         if isinstance(response, dict) and response.get("error"):
             return [self._source_error_row("FABRIC_SQL", "fabric_sql_runtime_error", str(response.get("error")), {"sql": sql})], []
 
@@ -3587,8 +3692,15 @@ Notes:
         mode_detail = self._fabric_sql_effective_mode_detail()
         mode = str(mode_detail.get("mode") or "blocked")
         if mode == "rest":
+            if not bool(mode_detail.get("auth_ready")):
+                detail = str(mode_detail.get("reason") or "fabric_sql_rest_auth_not_ready")
+                return [self._source_unavailable_row("FABRIC_SQL", detail)], []
             return self._query_fabric_sql_rest(query)
         if mode == "tds":
+            tds_capability = self._fabric_sql_tds_capability(refresh=False)
+            if not bool(tds_capability.get("ok")):
+                detail = str(tds_capability.get("detail") or "fabric_sql_tds_unavailable")
+                return [self._source_unavailable_row("FABRIC_SQL", detail)], []
             fabric_sql_server = os.getenv("FABRIC_SQL_SERVER", "").strip()
             fabric_sql_database = os.getenv("FABRIC_SQL_DATABASE", "").strip() or FABRIC_SQL_DATABASE
             return self._query_fabric_sql_tds(query, fabric_sql_server, fabric_sql_database)

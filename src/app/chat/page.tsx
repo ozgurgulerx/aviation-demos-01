@@ -400,6 +400,8 @@ export default function ChatPage() {
   const [activeCitationId, setActiveCitationId] = useState<number | null>(null);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStartedAtMs, setLoadingStartedAtMs] = useState<number | null>(null);
+  const [, setLoadingTick] = useState(0);
   const [streamingContent, setStreamingContent] = useState("");
   const [timelineEvents, setTimelineEvents] = useState<TelemetryEvent[]>([]);
   const [reasoningEvents, setReasoningEvents] = useState<ReasoningSseEvent[]>([]);
@@ -430,6 +432,16 @@ export default function ChatPage() {
   });
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isLoading) {
+      return;
+    }
+    const timer = setInterval(() => {
+      setLoadingTick((value) => value + 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isLoading]);
 
   const emitReasoningEvent = useCallback(
     (stage: ReasoningStage, payload?: ReasoningEventPayload, ts?: string) => {
@@ -764,6 +776,7 @@ export default function ChatPage() {
 
       setMessages((previous) => [...previous, userMessage]);
       setIsLoading(true);
+      setLoadingStartedAtMs(Date.now());
       setStreamingContent("");
       setTimelineEvents([]);
       setReasoningEvents([]);
@@ -1109,6 +1122,7 @@ export default function ChatPage() {
         });
       } finally {
         setIsLoading(false);
+        setLoadingStartedAtMs(null);
         setStreamingContent("");
       }
     },
@@ -1301,6 +1315,11 @@ export default function ChatPage() {
           messages={messages}
           isLoading={isLoading}
           streamingContent={streamingContent}
+          loadingElapsedMs={
+            isLoading && loadingStartedAtMs
+              ? Math.max(0, Date.now() - loadingStartedAtMs)
+              : 0
+          }
           onCitationClick={handleCitationClick}
           activeCitationId={activeCitationId}
           onSpeakMessage={(messageId, content) => {

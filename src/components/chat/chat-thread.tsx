@@ -23,6 +23,7 @@ interface ChatThreadProps {
   messages: MessageType[];
   isLoading: boolean;
   streamingContent?: string;
+  loadingElapsedMs?: number;
   onCitationClick?: (id: number) => void;
   activeCitationId?: number | null;
   onSpeakMessage?: (messageId: string, content: string) => void;
@@ -51,6 +52,7 @@ export function ChatThread({
   messages,
   isLoading,
   streamingContent,
+  loadingElapsedMs = 0,
   onCitationClick,
   activeCitationId,
   onSpeakMessage,
@@ -188,7 +190,9 @@ export function ChatThread({
                       exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
                       transition={{ duration: reducedMotion ? 0 : 0.15 }}
                     >
-                      {currentReasoningDetail || "Analyzing intent, retrieval path, and evidence..."}
+                      {loadingElapsedMs >= 15000
+                        ? "Retrieval is taking longer than usual. Generating a provisional brief from available evidence..."
+                        : (currentReasoningDetail || "Analyzing intent, retrieval path, and evidence...")}
                     </motion.span>
                   </AnimatePresence>
                 </div>

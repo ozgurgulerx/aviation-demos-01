@@ -301,6 +301,9 @@ class TestDockerfileBackend:
     def test_gunicorn_binds_to_5001(self):
         assert "0.0.0.0:5001" in self.content
 
+    def test_gunicorn_disables_control_socket(self):
+        assert "--no-control-socket" in self.content
+
     def test_env_defaults_set(self):
         assert "GUNICORN_WORKER_CLASS=gthread" in self.content
         assert "GUNICORN_WORKERS=" in self.content
@@ -865,6 +868,10 @@ class TestPortConsistency:
     def test_gunicorn_binds_5001_in_deployment(self):
         raw = _read(os.path.join(K8S_DIR, "backend-deployment.yaml"))
         assert "0.0.0.0:5001" in raw
+
+    def test_gunicorn_control_socket_disabled_in_deployment(self):
+        raw = _read(os.path.join(K8S_DIR, "backend-deployment.yaml"))
+        assert "--no-control-socket" in raw
 
     def test_all_probes_use_port_5001(self):
         docs = _load_yaml_docs(os.path.join(K8S_DIR, "backend-deployment.yaml"))

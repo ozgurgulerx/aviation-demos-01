@@ -151,6 +151,11 @@ Current tracked status:
 
 ## Decision log (non-secret)
 
+- 2026-02-23: Disabled Gunicorn control socket for read-only AKS pods and completed live frontend/backend rollout.
+  - Decision: Added `--no-control-socket` to backend Gunicorn startup command in both `Dockerfile.backend` and `k8s/backend-deployment.yaml`, then rolled AKS backend to image tag `fix-risk-stream-20260223200655` and deployed frontend via App Service zip deploy.
+  - Why: Gunicorn `25.1.0` control socket defaults to `gunicorn.ctl` under `/app`; with `readOnlyRootFilesystem=true` this caused startup probe timeouts (`Control server error: [Errno 30] Read-only file system`) and stalled backend rollout.
+  - Sources: `kubectl -n aviation-rag describe pod ...`, `kubectl -n aviation-rag logs deployment/aviation-rag-backend --tail=60`, `kubectl -n aviation-rag rollout status deployment/aviation-rag-backend --timeout=600s`, `kubectl -n aviation-rag get deployment aviation-rag-backend -o jsonpath=...`, `az webapp deploy --resource-group rg-aviation-rag --name aviation-rag-frontend-705508 --src-path /tmp/app.zip --type zip --async true --restart true`, live SSE probes through `https://aviation-rag-frontend-705508.azurewebsites.net/api/chat`.
+  - Changed-from: Backend Gunicorn command did not disable control socket; rollout to `fix-risk-stream-20260223200655` stalled with unready pods.
 - 2026-02-23: Hard-locked backend image architecture for AKS compatibility.
   - Decision: Added policy guardrail that `aviation-rag-backend` release images must be `linux/amd64`, with explicit build-platform pinning and manifest verification before rollout.
   - Why: Prevent wrong-architecture image pulls during AKS deployment/boot and avoid rollout failures on `amd64` node pools.

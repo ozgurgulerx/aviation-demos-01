@@ -49,6 +49,7 @@ spec:
         args:
         - >
           exec gunicorn --bind 0.0.0.0:5001
+          --no-control-socket
           --worker-class "${GUNICORN_WORKER_CLASS}"
           --workers "${GUNICORN_WORKERS}"
           --threads "${GUNICORN_THREADS}"

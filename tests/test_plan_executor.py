@@ -185,6 +185,46 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertEqual(result.source_results["VECTOR_OPS"][0].get("id"), "vec1")
         self.assertTrue(any("shared_embedding_failed:" in warning for warning in result.warnings))
 
+    def test_vector_call_with_non_string_query_coerces_to_user_query(self):
+        retriever = _DummyRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        plan = AgenticPlan.from_dict(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_vec_bad_query",
+                        "tool": "VECTOR_OPS",
+                        "operation": "lookup",
+                        "query": {"text": "structured payload should not crash"},
+                    }
+                ]
+            }
+        )
+
+        result = executor.execute(user_query="runway risk", plan=plan, schemas={})
+
+        self.assertIn("VECTOR_OPS", result.source_results)
+        self.assertEqual(result.source_results["VECTOR_OPS"][0].get("id"), "vec1")
+        call = plan.tool_calls[0]
+        self.assertEqual(call.params.get("__raw_query_type"), "dict")
+        self.assertIsNone(call.query)
+
+        direct_plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(  # type: ignore[arg-type]
+                    id="call_vec_runtime_coercion",
+                    tool="VECTOR_OPS",
+                    operation="lookup",
+                    query={"text": "dict payload"},
+                )
+            ]
+        )
+        executor.execute(user_query="runway risk", plan=direct_plan, schemas={})
+        self.assertEqual(
+            direct_plan.tool_calls[0].params.get("__runtime_query_coercion"),
+            "invalid_query_type:dict",
+        )
+
     def test_sql_validation_failure_regenerates_and_executes_repaired_query(self):
         retriever = _RepairingRetriever()
         executor = PlanExecutor(retriever)  # type: ignore[arg-type]

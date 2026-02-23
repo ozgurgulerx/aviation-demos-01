@@ -281,9 +281,10 @@ class PlanExecutor:
         evidence_type = str(call.params.get("evidence_type", "")).strip()
         time_window = plan.time_window.to_dict()
         entities = plan.entities
+        call_query = self._coerce_query_text(call.query, user_query, source, call)
 
         if source == "SQL":
-            sql_query = call.query
+            sql_query = call_query
             if sql_query and sql_query.strip().startswith("-- NEED_SCHEMA"):
                 rows, citations, resolved_sql = self._handle_sql_need_schema(
                     sql_query=sql_query,
@@ -378,7 +379,7 @@ class PlanExecutor:
             return rows, citations, sql_query
 
         if source == "KQL":
-            kql_query = call.query
+            kql_query = call_query
             kql_schema = schemas.get("kql_schema", {})
             call.params = dict(call.params or {})
             if not kql_query or not self._looks_like_kql(kql_query):
@@ -478,20 +479,20 @@ class PlanExecutor:
 
         if source == "GRAPH":
             hops = int(call.params.get("hops", 2))
-            rows, citations = self.retriever.query_graph(call.query or user_query, hops=hops)
+            rows, citations = self.retriever.query_graph(call_query, hops=hops)
             return rows, citations, None
 
         if source == "NOSQL":
-            rows, citations = self.retriever.query_nosql(call.query or user_query)
+            rows, citations = self.retriever.query_nosql(call_query)
             return rows, citations, None
 
         if source == "FABRIC_SQL":
-            rows, citations = self.retriever.query_fabric_sql(call.query or user_query)
+            rows, citations = self.retriever.query_fabric_sql(call_query)
             return rows, citations, None
 
         if source in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
             # Reuse shared embedding when the query text matches the original user query.
-            effective_query = call.query or user_query
+            effective_query = call_query
             shared_emb = None
             if (
                 self._shared_embedding is not None
@@ -551,6 +552,23 @@ class PlanExecutor:
         if self.kql_writer is None:
             self.kql_writer = KQLWriter()
         return self.kql_writer
+
+    def _coerce_query_text(self, value: Any, user_query: str, source: str, call: ToolCall) -> str:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+            return str(user_query or "")
+        if value is None:
+            return str(user_query or "")
+
+        detail = f"invalid_query_type:{type(value).__name__}"
+        params = dict(call.params or {})
+        params.setdefault("__runtime_query_coercion", detail)
+        params.setdefault("__runtime_query_coercion_source", source)
+        params.setdefault("__runtime_query_preview", str(self._safe_preview_value(value, max_chars=180)))
+        call.params = params
+        return str(user_query or "")
 
     @staticmethod
     def _hash_text(value: str) -> str:

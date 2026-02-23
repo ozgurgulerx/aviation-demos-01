@@ -221,11 +221,55 @@ class SourceExecutionPolicyTests(unittest.TestCase):
 
     def test_kql_airport_only_query_returns_unmappable_filter_error(self):
         retriever = self._build_retriever()
+        schema = {
+            "tables": [
+                {
+                    "table": "opensky_states",
+                    "columns": [{"name": "callsign"}, {"name": "icao24"}],
+                }
+            ]
+        }
         with patch.object(ur, "FABRIC_KQL_ENDPOINT", "https://demo.kusto.fabric.microsoft.com"):
             rows, _citations = retriever.query_kql(
-                "compare next-90-minute flight risk across SAW, AYT, ADB"
+                "compare next-90-minute flight risk across SAW, AYT, ADB",
+                kql_schema=schema,
             )
         self.assertEqual(rows[0].get("error_code"), "kql_unmappable_airport_filter")
+
+    def test_kql_airport_risk_query_prefers_hazards_table_when_schema_allows(self):
+        retriever = self._build_retriever()
+        seen: dict[str, object] = {}
+
+        def fake_kusto_rows(_endpoint, csl, database=None, timeout_seconds=None):
+            seen["csl"] = csl
+            seen["database"] = database
+            seen["timeout_seconds"] = timeout_seconds
+            return [{"hazard": "TS", "severity": "MOD"}], None
+
+        retriever._kusto_rows = fake_kusto_rows
+        schema = {
+            "tables": [
+                {
+                    "table": "hazards_airsigmets",
+                    "columns": [
+                        {"name": "raw_text"},
+                        {"name": "valid_time_from"},
+                        {"name": "valid_time_to"},
+                        {"name": "hazard"},
+                        {"name": "severity"},
+                    ],
+                }
+            ]
+        }
+        with patch.object(ur, "FABRIC_KQL_ENDPOINT", "https://demo.kusto.fabric.microsoft.com"):
+            rows, _citations = retriever.query_kql(
+                "compare next-90-minute flight risk across SAW, AYT, ADB",
+                kql_schema=schema,
+            )
+        self.assertEqual(rows[0].get("hazard"), "TS")
+        self.assertIn("hazards_airsigmets", str(seen.get("csl", "")))
+        self.assertIn("raw_text has_any", str(seen.get("csl", "")))
+        self.assertGreater(float(seen.get("timeout_seconds", 0) or 0), 0)
 
     def test_kql_blocks_unsafe_statement(self):
         retriever = self._build_retriever()
@@ -237,8 +281,10 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         retriever = self._build_retriever()
         seen = {}
 
-        def fake_kusto_rows(_endpoint, csl):
+        def fake_kusto_rows(_endpoint, csl, database=None, timeout_seconds=None):
             seen["csl"] = csl
+            seen["database"] = database
+            seen["timeout_seconds"] = timeout_seconds
             return [{"callsign": "THY123"}], None
 
         retriever._kusto_rows = fake_kusto_rows
@@ -438,6 +484,9 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         retriever._fabric_sql_tds_capability = MagicMock(
             return_value={"ok": False, "detail": "pyodbc_unavailable:No module named 'pyodbc'"}
         )
+        retriever._fabric_auth_reason_for_source = MagicMock(
+            return_value=(True, "ready", {"auth_mode": "sp_client_credentials", "auth_ready": True, "token": "x"})
+        )
         with patch.object(ur, "FABRIC_SQL_ENDPOINT", "https://fabric.example/sql"), patch.dict(
             os.environ,
             {"FABRIC_SQL_SERVER": "warehouse.example.fabric.microsoft.com", "FABRIC_SQL_DATABASE": "wh"},
@@ -452,6 +501,9 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         retriever = self._build_retriever()
         retriever._post_json = MagicMock(return_value=[{"airport": "IST", "carrier": "TK"}])
         retriever._fabric_sql_tds_capability = MagicMock(return_value={"ok": True, "detail": "ready"})
+        retriever._fabric_auth_reason_for_source = MagicMock(
+            return_value=(True, "ready", {"auth_mode": "sp_client_credentials", "auth_ready": True, "token": "x"})
+        )
         retriever._query_fabric_sql_tds = MagicMock(return_value=([{"airport": "JFK"}], []))
         with patch.object(ur, "FABRIC_SQL_ENDPOINT", "https://fabric.example/sql"), patch.dict(
             os.environ,
