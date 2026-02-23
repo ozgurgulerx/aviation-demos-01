@@ -95,7 +95,7 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short -m "not integration" --ignore=tests/test_production_e2e.py
 
-  build_and_push:
+  build-and-push:
     needs: lint-and-test
     runs-on: ubuntu-latest
     outputs:
@@ -163,7 +163,7 @@ jobs:
           echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
 
   deploy:
-    needs: build_and_push
+    needs: build-and-push
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -327,7 +327,7 @@ jobs:
 
       - name: Enforce deployment image from build job
         run: |
-          expected_image="${{ needs.build_and_push.outputs.image_ref }}"
+          expected_image="${{ needs['build-and-push'].outputs.image_ref }}"
           if [ -z "$expected_image" ]; then
             echo "::error::Build output image_ref is empty."
             exit 1
@@ -387,7 +387,7 @@ jobs:
           timeout_seconds=900
           poll_interval=15
           deadline=$(( $(date +%s) + timeout_seconds ))
-          expected_image="${{ needs.build_and_push.outputs.image_ref }}"
+          expected_image="${{ needs['build-and-push'].outputs.image_ref }}"
           if [ -z "$expected_image" ]; then
             echo "::error::Build output image_ref is empty."
             exit 1
@@ -524,7 +524,7 @@ jobs:
 
       - name: Verify deployment
         run: |
-          expected_image="${{ needs.build_and_push.outputs.image_ref }}"
+          expected_image="${{ needs['build-and-push'].outputs.image_ref }}"
           if [ -z "$expected_image" ]; then
             echo "::error::Build output image_ref is empty."
             exit 1
