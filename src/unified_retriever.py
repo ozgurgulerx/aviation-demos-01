@@ -597,6 +597,25 @@ class UnifiedRetriever:
     def _graph_database(self) -> str:
         return (FABRIC_GRAPH_DATABASE or FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "")).strip()
 
+    def _ensure_graph_runtime_state(self) -> None:
+        """Lazily initialize graph runtime controls for partially constructed test objects."""
+        if not hasattr(self, "_graph_timeout_seconds"):
+            self._graph_timeout_seconds = _env_float("GRAPH_TIMEOUT_SECONDS", 12.0, minimum=1.0)
+        if not hasattr(self, "_graph_max_retries"):
+            self._graph_max_retries = _env_int("GRAPH_MAX_RETRIES", 2, minimum=0)
+        if not hasattr(self, "_graph_retry_backoff_seconds"):
+            self._graph_retry_backoff_seconds = _env_float("GRAPH_RETRY_BACKOFF_SECONDS", 0.75, minimum=0.0)
+        if not hasattr(self, "_graph_cb_fail_threshold"):
+            self._graph_cb_fail_threshold = _env_int("GRAPH_CIRCUIT_BREAKER_FAIL_THRESHOLD", 4, minimum=1)
+        if not hasattr(self, "_graph_cb_open_seconds"):
+            self._graph_cb_open_seconds = _env_float("GRAPH_CIRCUIT_BREAKER_OPEN_SECONDS", 45.0, minimum=1.0)
+        if not hasattr(self, "_graph_circuit_lock") or self._graph_circuit_lock is None:
+            self._graph_circuit_lock = threading.Lock()
+        if not hasattr(self, "_graph_circuit_failures"):
+            self._graph_circuit_failures = 0
+        if not hasattr(self, "_graph_circuit_open_until"):
+            self._graph_circuit_open_until = 0.0
+
     def _graph_retryable_error(self, detail: Optional[str]) -> bool:
         text = str(detail or "").strip().lower()
         if not text:
@@ -620,6 +639,7 @@ class UnifiedRetriever:
         time.sleep(sleep_seconds)
 
     def _graph_circuit_snapshot(self) -> Dict[str, Any]:
+        self._ensure_graph_runtime_state()
         now = time.time()
         with self._graph_circuit_lock:
             is_open = self._graph_circuit_open_until > now
@@ -633,6 +653,7 @@ class UnifiedRetriever:
         }
 
     def _graph_circuit_is_open(self) -> bool:
+        self._ensure_graph_runtime_state()
         now = time.time()
         with self._graph_circuit_lock:
             if self._graph_circuit_open_until <= now:
@@ -643,11 +664,13 @@ class UnifiedRetriever:
             return True
 
     def _graph_circuit_record_success(self) -> None:
+        self._ensure_graph_runtime_state()
         with self._graph_circuit_lock:
             self._graph_circuit_failures = 0
             self._graph_circuit_open_until = 0.0
 
     def _graph_circuit_record_failure(self) -> None:
+        self._ensure_graph_runtime_state()
         now = time.time()
         with self._graph_circuit_lock:
             self._graph_circuit_failures += 1
@@ -676,6 +699,7 @@ class UnifiedRetriever:
         return out
 
     def _query_graph_live(self, query: str, hops: int = 2, probe: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str], int, Dict[str, Any]]:
+        self._ensure_graph_runtime_state()
         max_attempts = 1 + max(0, self._graph_max_retries)
         attempts = 0
 
@@ -738,6 +762,7 @@ class UnifiedRetriever:
         return [], last_error or "graph_endpoint_query_failed", attempts, {"graph_path": "fabric_graph_live_http"}
 
     def _probe_graph_query(self) -> Dict[str, Any]:
+        self._ensure_graph_runtime_state()
         if not FABRIC_GRAPH_ENDPOINT:
             return {
                 "status": "warn",
@@ -1694,13 +1719,19 @@ class UnifiedRetriever:
                         When provided, only edges of these types are traversed.
         """
         if not self.sql_available:
-            return [self._source_unavailable_row("GRAPH", unavailable_detail or "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable")], []
+            detail = "FABRIC_GRAPH_ENDPOINT not configured and SQL unavailable"
+            if unavailable_detail:
+                detail = f"{detail}; context={unavailable_detail}"
+            return [self._source_unavailable_row("GRAPH", detail)], []
 
         # Verify ops_graph_edges table exists in the current schema.
         schema = self.cached_sql_schema()
         table_names = {str(t.get("table", "")).lower() for t in schema.get("tables", []) if isinstance(t, dict)}
         if "ops_graph_edges" not in table_names:
-            return [self._source_unavailable_row("GRAPH", unavailable_detail or "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL")], []
+            detail = "FABRIC_GRAPH_ENDPOINT not configured and ops_graph_edges table not found in PostgreSQL"
+            if unavailable_detail:
+                detail = f"{detail}; context={unavailable_detail}"
+            return [self._source_unavailable_row("GRAPH", detail)], []
 
         # Build optional edge-type filter clause.
         edge_filter_clause = ""
