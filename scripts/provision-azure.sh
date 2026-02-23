@@ -38,7 +38,7 @@ RESOURCE_GROUP="${RESOURCE_GROUP:-rg-aviation-rag}"
 # Runtime infra names
 VNET_NAME="${VNET_NAME:-vnet-aviation-rag}"
 AKS_NAME="${AKS_NAME:-aks-aviation-rag}"
-ACR_NAME="${ACR_NAME:-avrag705508acr}"
+ACR_NAME="${ACR_NAME:-aviationragacr}"
 ACR_RESOURCE_GROUP="${ACR_RESOURCE_GROUP:-$RESOURCE_GROUP}"
 APP_SERVICE_PLAN="${APP_SERVICE_PLAN:-plan-aviation-rag-frontend}"
 APP_SERVICE_PLAN_SKU="${APP_SERVICE_PLAN_SKU:-P1V3}"

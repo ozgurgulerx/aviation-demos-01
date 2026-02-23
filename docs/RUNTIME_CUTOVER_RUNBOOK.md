@@ -38,7 +38,7 @@ Example:
 SUBSCRIPTION_ID="<target-subscription-id>" \
 RESOURCE_GROUP="rg-aviation-rag" \
 LOCATION="westeurope" \
-ACR_NAME="avrag705508acr" \
+ACR_NAME="aviationragacr" \
 ACR_RESOURCE_GROUP="rg-aviation-rag" \
 PG_SERVER_RG="<postgres-rg>" \
 PG_SERVER="<postgres-server>" \

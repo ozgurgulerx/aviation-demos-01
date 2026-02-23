@@ -89,7 +89,7 @@ Use `scripts/provision-azure.sh` to provision runtime infrastructure (frontend, 
 SUBSCRIPTION_ID="<target-subscription-id>" \
 RESOURCE_GROUP="rg-aviation-rag" \
 LOCATION="westeurope" \
-ACR_NAME="avrag705508acr" \
+ACR_NAME="aviationragacr" \
 ACR_RESOURCE_GROUP="rg-aviation-rag" \
 AZURE_OPENAI_ENDPOINT="https://<openai-account>.openai.azure.com/" \
 AZURE_SEARCH_ENDPOINT="https://<search-account>.search.windows.net" \
