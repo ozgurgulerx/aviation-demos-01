@@ -732,6 +732,33 @@ class UnifiedRetriever:
             return []
         return self._extract_airports_from_query(sql_query)
 
+    def _extract_explicit_flight_identifiers(self, query: str) -> List[str]:
+        if isinstance(query, str):
+            text = query
+        elif isinstance(query, (dict, list)):
+            try:
+                text = json.dumps(query, ensure_ascii=False)
+            except Exception:
+                text = str(query)
+        else:
+            text = str(query or "")
+
+        out: List[str] = []
+        upper = text.upper()
+
+        # Airline flight number style identifiers (e.g., TK123, THY6047).
+        for match in re.findall(r"\b[A-Z]{2,3}\s?\d{1,4}[A-Z]?\b", upper):
+            normalized = re.sub(r"\s+", "", match)
+            if normalized not in out:
+                out.append(normalized)
+
+        # Raw 24-bit ICAO transponder hex (icao24) identifiers.
+        for match in re.findall(r"\b[0-9A-F]{6}\b", upper):
+            if match not in out:
+                out.append(match)
+
+        return out[:12]
+
     def _resolve_kusto_query_endpoint(self, endpoint: str) -> Tuple[str, bool, str]:
         """Normalize Kusto endpoint to a valid query URI.
 
@@ -2374,20 +2401,107 @@ class UnifiedRetriever:
     def _heuristic_sql_fallback(self, query: str, need_schema_detail: str) -> Optional[str]:
         """Best-effort SQL fallback when writer returns NEED_SCHEMA."""
         schema = self.cached_sql_schema()
-        tables = {
-            str(t.get("table", "")).lower(): {
-                str(col.get("name", "")).lower()
-                for col in (t.get("columns") or [])
+        tables: Dict[str, set[str]] = {}
+        for table_entry in schema.get("tables", []):
+            if not isinstance(table_entry, dict):
+                continue
+            table = str(table_entry.get("table", "")).lower().strip()
+            schema_name = str(table_entry.get("schema", "")).lower().strip()
+            if not table:
+                continue
+            cols = {
+                str(col.get("name", "")).lower().strip()
+                for col in (table_entry.get("columns") or [])
                 if isinstance(col, dict)
             }
-            for t in schema.get("tables", [])
-            if isinstance(t, dict)
-        }
+            tables[table] = cols
+            if schema_name:
+                tables[f"{schema_name}.{table}"] = cols
         asrs_cols = tables.get("asrs_reports", set())
+        q = (query or "").lower()
+        need_detail = str(need_schema_detail or "").lower()
+
+        # Runway/airport fallback for queries that fail with generated columns that are
+        # not present in OurAirports schema (e.g., a.iata, runway_id, airport, active).
+        runway_terms = {"runway", "airport", "airports", "flight risk", "disruption", "compare"}
+        runway_missing_markers = {"runway_id", "a.iata", " airport", " active", "ourairports"}
+        if (
+            any(term in q for term in runway_terms)
+            and any(marker in need_detail for marker in runway_missing_markers)
+        ):
+            required_airport_cols = {"id", "ident", "iata_code"}
+            required_runway_cols = {"id", "airport_ref", "surface", "length_ft", "width_ft", "closed"}
+
+            def _safe_ident(ident: str) -> Optional[str]:
+                value = str(ident or "").strip()
+                if re.fullmatch(r"[a-z_][a-z0-9_]*", value):
+                    return value
+                return None
+
+            airport_table_ref: Optional[str] = None
+            runway_table_ref: Optional[str] = None
+
+            for table_entry in schema.get("tables", []):
+                if not isinstance(table_entry, dict):
+                    continue
+                table_name = str(table_entry.get("table", "")).lower().strip()
+                schema_name = str(table_entry.get("schema", "")).lower().strip()
+                table_ident = _safe_ident(table_name)
+                schema_ident = _safe_ident(schema_name) if schema_name else None
+                if not table_ident:
+                    continue
+                cols = {
+                    str(col.get("name", "")).lower().strip()
+                    for col in (table_entry.get("columns") or [])
+                    if isinstance(col, dict)
+                }
+                qualified = f"{schema_ident}.{table_ident}" if schema_ident else table_ident
+                if table_name == "ourairports_airports" and cols.issuperset(required_airport_cols):
+                    airport_table_ref = qualified
+                if table_name == "ourairports_runways" and cols.issuperset(required_runway_cols):
+                    runway_table_ref = qualified
+
+            if airport_table_ref and runway_table_ref:
+                iata_tokens = [
+                    token
+                    for token in re.findall(r"\b[A-Z]{3}\b", (query or "").upper())
+                    if token
+                    and token not in {
+                        "THE", "AND", "FOR", "WITH", "FROM", "NEXT", "MIN",
+                        "RISK", "ACROSS", "FLIGHT", "COMPARE", "OVER", "UNDER",
+                    }
+                ]
+                icao_tokens = self._extract_airports_from_query(query)
+                where_clause = ""
+                if iata_tokens or icao_tokens:
+                    filters: List[str] = []
+                    if iata_tokens:
+                        filters.append(
+                            "a.iata_code IN (" + ", ".join(f"'{token}'" for token in sorted(set(iata_tokens))) + ")"
+                        )
+                    if icao_tokens:
+                        filters.append(
+                            "a.ident IN (" + ", ".join(f"'{token}'" for token in sorted(set(icao_tokens))) + ")"
+                        )
+                    where_clause = "WHERE (" + " OR ".join(filters) + ") "
+                return (
+                    "SELECT "
+                    "COALESCE(NULLIF(a.iata_code, ''), a.ident) AS airport, "
+                    "r.id AS runway_id, "
+                    "r.surface, "
+                    "r.length_ft, "
+                    "r.width_ft, "
+                    "r.closed "
+                    f"FROM {runway_table_ref} r "
+                    f"JOIN {airport_table_ref} a ON r.airport_ref = a.id "
+                    f"{where_clause}"
+                    "ORDER BY airport ASC, r.length_ft DESC NULLS LAST "
+                    "LIMIT 200"
+                )
+
         if not asrs_cols:
             return None
 
-        q = (query or "").lower()
         ask_top = any(token in q for token in ("top", "highest", "rank"))
         ask_count = "count" in q or "how many" in q or "number of" in q
         ask_facility = any(token in q for token in ("facility", "facilities", "airport", "airports", "location", "station"))
@@ -2922,8 +3036,17 @@ class UnifiedRetriever:
                         "| top 40 by valid_time_from desc"
                     )
                 elif airports:
-                    # Query opensky_states for flight tracking near airports.
-                    values = ",".join(f"'{a}'" for a in airports)
+                    explicit_ids = self._extract_explicit_flight_identifiers(query)
+                    if not explicit_ids:
+                        return [
+                            self._source_error_row(
+                                source="KQL",
+                                code="kql_unmappable_airport_filter",
+                                detail="airport identifiers cannot be mapped to opensky_states without explicit callsign or icao24 values",
+                                extra={"airports": airports},
+                            )
+                        ], []
+                    values = ",".join(f"'{value}'" for value in explicit_ids)
                     csl = (
                         "opensky_states "
                         f"| where callsign has_any ({values}) or icao24 in~ ({values}) "

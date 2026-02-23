@@ -114,6 +114,87 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(sql, "-- NEED_SCHEMA: damage_score column in asrs_reports")
         self.assertEqual(rows[0].get("error_code"), "sql_schema_missing")
 
+    def test_heuristic_sql_fallback_builds_valid_runway_query_for_airport_compare(self):
+        retriever = self._build_retriever()
+        retriever.cached_sql_schema = MagicMock(
+            return_value={
+                "tables": [
+                    {
+                        "schema": "demo",
+                        "table": "ourairports_airports",
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "ident"},
+                            {"name": "iata_code"},
+                        ],
+                    },
+                    {
+                        "schema": "demo",
+                        "table": "ourairports_runways",
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "airport_ref"},
+                            {"name": "surface"},
+                            {"name": "length_ft"},
+                            {"name": "width_ft"},
+                            {"name": "closed"},
+                        ],
+                    },
+                ]
+            }
+        )
+
+        sql = retriever._heuristic_sql_fallback(
+            "compare next-90-minute flight risk across SAW, AYT, ADB",
+            "missing columns in current schema: a.iata, active, airport, runway_id",
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn("ourairports_runways", sql)
+        self.assertIn("ourairports_airports", sql)
+        self.assertIn("a.iata_code", sql)
+        self.assertIn("r.id AS runway_id", sql)
+        self.assertIn("'SAW'", sql)
+        self.assertIn("'AYT'", sql)
+        self.assertIn("'ADB'", sql)
+
+    def test_heuristic_sql_fallback_uses_detected_non_demo_schema(self):
+        retriever = self._build_retriever()
+        retriever.cached_sql_schema = MagicMock(
+            return_value={
+                "tables": [
+                    {
+                        "schema": "ops",
+                        "table": "ourairports_airports",
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "ident"},
+                            {"name": "iata_code"},
+                        ],
+                    },
+                    {
+                        "schema": "ops",
+                        "table": "ourairports_runways",
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "airport_ref"},
+                            {"name": "surface"},
+                            {"name": "length_ft"},
+                            {"name": "width_ft"},
+                            {"name": "closed"},
+                        ],
+                    },
+                ]
+            }
+        )
+
+        sql = retriever._heuristic_sql_fallback(
+            "compare next-90-minute flight risk across SAW, AYT, ADB",
+            "missing columns in current schema: a.iata, active, airport, runway_id",
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn("FROM ops.ourairports_runways r", sql)
+        self.assertIn("JOIN ops.ourairports_airports a", sql)
+
     def test_source_mode_blocks_sql_when_unavailable(self):
         retriever = self._build_retriever()
         retriever.sql_available = False
@@ -137,6 +218,14 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         # Natural language is auto-translated to KQL via airport extraction;
         # with a non-functional endpoint, the generated KQL fails at runtime.
         self.assertIn(rows[0].get("error_code"), {"kql_runtime_error", "kql_validation_failed"})
+
+    def test_kql_airport_only_query_returns_unmappable_filter_error(self):
+        retriever = self._build_retriever()
+        with patch.object(ur, "FABRIC_KQL_ENDPOINT", "https://demo.kusto.fabric.microsoft.com"):
+            rows, _citations = retriever.query_kql(
+                "compare next-90-minute flight risk across SAW, AYT, ADB"
+            )
+        self.assertEqual(rows[0].get("error_code"), "kql_unmappable_airport_filter")
 
     def test_kql_blocks_unsafe_statement(self):
         retriever = self._build_retriever()

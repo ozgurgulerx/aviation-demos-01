@@ -949,6 +949,10 @@ export default function ChatPage() {
             isVerified = false;
             setRouteLabel("Error");
             setConfidenceLabel("Unavailable");
+            if (!fullContent.trim() && terminalAgentError) {
+              fullContent = terminalAgentError;
+              setStreamingContent(fullContent);
+            }
             emitReasoningEvent(
               "evidence_check_complete",
               {
@@ -995,8 +999,7 @@ export default function ChatPage() {
 
         if (!fullContent.trim()) {
           if (terminalAgentError) {
-            fullContent =
-              "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.";
+            fullContent = terminalAgentError;
             setRouteLabel("Error");
           } else {
             const protocolViolationMessage = sawSuccessfulTerminal

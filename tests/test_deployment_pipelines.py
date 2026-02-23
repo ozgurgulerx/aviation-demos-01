@@ -179,6 +179,12 @@ class TestDeployFrontendWorkflow:
         paths = self.wf["on"]["push"]["paths"]
         assert any("deploy-frontend" in p for p in paths)
 
+    def test_token_auth_supports_client_id_secret_fallback_and_validation(self):
+        raw = _read(os.path.join(WORKFLOWS_DIR, "deploy-frontend.yaml"))
+        assert "AZURE_OPENAI_CLIENT_ID_SECRET" in raw
+        assert "effective_client_id=" in raw
+        assert "AZURE_OPENAI_AUTH_MODE=token requires client credentials" in raw
+
 
 class TestInfraHealthCheckWorkflow:
     """infra-health-check.yaml structural checks."""

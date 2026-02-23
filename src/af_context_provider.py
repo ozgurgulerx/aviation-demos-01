@@ -315,6 +315,12 @@ class AviationRagContextProvider:
         )
         if (source_policy or "include").strip().lower() == "exact":
             plan = self._enforce_exact_source_policy(plan, required_sources, query=query)
+        plan = self._prune_non_viable_tool_calls(
+            plan=plan,
+            required_sources=required_sources,
+            source_policy=source_policy,
+            query=query,
+        )
         execution = self.plan_executor.execute(query, plan, schemas, on_trace=on_trace)
         verification = self.evidence_verifier.verify(
             plan=plan,
@@ -515,6 +521,83 @@ class AviationRagContextProvider:
             "source_policy_exact_applied:" + ",".join(required)
         )
         return plan
+
+    def _prune_non_viable_tool_calls(
+        self,
+        plan: "AgenticPlan",
+        required_sources: List[str],
+        source_policy: str,
+        query: str,
+    ) -> "AgenticPlan":
+        source_policy_norm = (source_policy or "include").strip().lower()
+        if source_policy_norm == "exact":
+            return plan
+
+        required: set[str] = set()
+        for raw in required_sources:
+            src = _canon_tool(str(raw))
+            if src:
+                required.add(src)
+
+        capabilities = {
+            str(cap.get("source", "")).upper(): cap
+            for cap in self.retriever.source_capabilities(refresh=True)
+            if isinstance(cap, dict)
+        }
+
+        kept: List[ToolCall] = []
+        kept_ids: set[str] = set()
+        for call in plan.tool_calls:
+            tool = _canon_tool(call.tool)
+            if not tool:
+                kept.append(call)
+                kept_ids.add(call.id)
+                continue
+
+            if tool not in required:
+                capability = capabilities.get(tool, {})
+                status = str(capability.get("status", "")).strip().lower()
+                if status == "unavailable":
+                    reason = str(capability.get("reason_code") or "unavailable")
+                    plan.warnings.append(f"tool_pruned_unavailable:{tool}:{reason}")
+                    continue
+                if tool == "KQL" and self._is_airport_only_kql_call(call.query or query):
+                    plan.warnings.append("tool_pruned_unmappable_airport_kql:KQL")
+                    continue
+
+            kept.append(call)
+            kept_ids.add(call.id)
+
+        dropped_dependency_count = 0
+        for call in kept:
+            original_depends = list(call.depends_on or [])
+            filtered = [dep for dep in original_depends if dep in kept_ids]
+            dropped_dependency_count += max(0, len(original_depends) - len(filtered))
+            call.depends_on = filtered
+
+        if dropped_dependency_count:
+            plan.warnings.append(f"tool_prune_dropped_dependencies:{dropped_dependency_count}")
+
+        plan.tool_calls = kept
+        return plan
+
+    def _is_airport_only_kql_call(self, query: str) -> bool:
+        text = str(query or "")
+        airports = self.retriever._extract_airports_from_query(text)
+        if not airports:
+            return False
+
+        lower = text.lower()
+        weather_terms = ("weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm")
+        if any(term in lower for term in weather_terms):
+            return False
+
+        explicit_ids = self.retriever._extract_explicit_flight_identifiers(text)
+        if explicit_ids:
+            return False
+        if "callsign" in lower or "icao24" in lower:
+            return False
+        return True
 
     def _execute_plan(
         self,

@@ -45,6 +45,7 @@ env:
   AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID: ${{ vars.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}
   AZURE_OPENAI_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
   AZURE_OPENAI_CLIENT_ID: ${{ vars.AZURE_OPENAI_CLIENT_ID }}
+  AZURE_OPENAI_CLIENT_ID_SECRET: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
   AZURE_OPENAI_CLIENT_SECRET: ${{ secrets.AZURE_OPENAI_CLIENT_SECRET }}
   AZURE_OPENAI_BEARER_TOKEN: ${{ secrets.AZURE_OPENAI_BEARER_TOKEN }}
   BACKEND_REQUEST_TIMEOUT_MS: ${{ vars.BACKEND_REQUEST_TIMEOUT_MS || '180000' }}
@@ -133,6 +134,18 @@ jobs:
             exit 1
           fi
 
+          if [ "${{ env.AZURE_OPENAI_AUTH_MODE }}" = "token" ]; then
+            effective_client_id="${AZURE_OPENAI_CLIENT_ID:-${AZURE_OPENAI_CLIENT_ID_SECRET:-}}"
+            if [ -n "${AZURE_OPENAI_CLIENT_SECRET:-}" ] && [ -z "${effective_client_id}" ]; then
+              echo "::error::AZURE_OPENAI_CLIENT_SECRET is configured but no AZURE_OPENAI_CLIENT_ID is set in vars or secrets."
+              exit 1
+            fi
+            if [ -z "${effective_client_id}" ] && [ -z "${AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID:-}" ] && [ -z "${AZURE_OPENAI_BEARER_TOKEN:-}" ]; then
+              echo "::error::AZURE_OPENAI_AUTH_MODE=token requires client credentials, managed identity client ID, or bearer token."
+              exit 1
+            fi
+          fi
+
       - name: Resolve App Service target
         run: |
           az webapp show \
@@ -177,12 +190,13 @@ jobs:
             SETTINGS+=("AZURE_OPENAI_BEARER_TOKEN=")
             SETTINGS+=("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=")
           else
+            effective_client_id="${AZURE_OPENAI_CLIENT_ID:-${AZURE_OPENAI_CLIENT_ID_SECRET:-}}"
             SETTINGS+=("AZURE_OPENAI_TENANT_ID=${{ env.AZURE_OPENAI_TENANT_ID }}")
             if [ -n "${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}" ]; then
               SETTINGS+=("AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID=${{ env.AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID }}")
             fi
-            if [ -n "${{ env.AZURE_OPENAI_CLIENT_ID }}" ]; then
-              SETTINGS+=("AZURE_OPENAI_CLIENT_ID=${{ env.AZURE_OPENAI_CLIENT_ID }}")
+            if [ -n "${effective_client_id}" ]; then
+              SETTINGS+=("AZURE_OPENAI_CLIENT_ID=${effective_client_id}")
             fi
             if [ -n "${{ env.AZURE_OPENAI_CLIENT_SECRET }}" ]; then
               SETTINGS+=("AZURE_OPENAI_CLIENT_SECRET=${{ env.AZURE_OPENAI_CLIENT_SECRET }}")

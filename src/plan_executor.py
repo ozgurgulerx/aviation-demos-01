@@ -337,6 +337,7 @@ class PlanExecutor:
                             entities=entities,
                         )
                         rows, citations, sql_query = retry_rows, retry_citations, resolved_sql
+                        call.params = dict(call.params or {})
                         call.params["__runtime_rewrite_reason"] = "sql_regenerated_need_schema"
                     elif regenerated.strip() and regenerated.strip() != sql_query.strip():
                         retry_rows, retry_citations = self._execute_sql_raw(regenerated)
@@ -347,8 +348,25 @@ class PlanExecutor:
                         )
                         if retry_error not in {"sql_validation_failed", "sql_schema_missing"}:
                             rows, citations, sql_query = retry_rows, retry_citations, regenerated
+                            call.params = dict(call.params or {})
                             call.params["__runtime_rewrite_reason"] = (
                                 "sql_regenerated_after_validation_failed"
+                            )
+                        else:
+                            retry_detail = ""
+                            if retry_rows and isinstance(retry_rows[0], dict):
+                                retry_detail = str(retry_rows[0].get("error") or retry_rows[0].get("error_code") or "")
+                            need_schema_marker = f"-- NEED_SCHEMA: {retry_detail or 'sql_schema_missing'}"
+                            fallback_rows, fallback_citations, fallback_sql = self._handle_sql_need_schema(
+                                sql_query=need_schema_marker,
+                                user_query=user_query,
+                                evidence_type=evidence_type,
+                                entities=entities,
+                            )
+                            rows, citations, sql_query = fallback_rows, fallback_citations, fallback_sql
+                            call.params = dict(call.params or {})
+                            call.params["__runtime_rewrite_reason"] = (
+                                "sql_regenerated_after_validation_failed+heuristic_fallback"
                             )
                 except Exception as exc:
                     rows.append(

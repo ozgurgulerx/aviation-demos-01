@@ -62,6 +62,36 @@ class _RepairingSQLWriter:
         )
 
 
+class _StillBrokenRetriever(_DummyRetriever):
+    def execute_sql_query(self, sql_query: str):
+        normalized = str(sql_query or "").strip().lower()
+        if "bad_col" in normalized:
+            return [
+                {
+                    "error": "missing columns in current schema: bad_col",
+                    "error_code": "sql_schema_missing",
+                }
+            ], []
+        if "still_bad" in normalized:
+            return [
+                {
+                    "error": "missing columns in current schema: still_bad",
+                    "error_code": "sql_schema_missing",
+                }
+            ], []
+        if "ltfj" in normalized:
+            return [{"airport": "LTFJ", "runway_id": 1, "surface": "asphalt"}], []
+        return [{"error": "unexpected_sql", "error_code": "sql_runtime_error"}], []
+
+    def _heuristic_sql_fallback(self, _query: str, _detail: str):
+        return "SELECT 'LTFJ' AS airport, 1 AS runway_id, 'asphalt' AS surface"
+
+
+class _StillBrokenSQLWriter:
+    def generate(self, **_kwargs):
+        return "SELECT still_bad FROM demo.ourairports_runways LIMIT 5"
+
+
 class PlanExecutorTests(unittest.TestCase):
     def test_execute_preserves_multiple_calls_same_source(self):
         retriever = _DummyRetriever()
@@ -160,6 +190,39 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertTrue(done_events)
         self.assertTrue(done_events[0].get("query_rewritten"))
         self.assertEqual(done_events[0].get("rewrite_reason"), "sql_regenerated_after_validation_failed")
+
+    def test_sql_validation_failure_regeneration_can_fall_back_to_heuristic_sql(self):
+        retriever = _StillBrokenRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        executor.sql_writer = _StillBrokenSQLWriter()  # type: ignore[assignment]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_sql_fallback",
+                    tool="SQL",
+                    operation="aggregate",
+                    query="SELECT bad_col FROM demo.ourairports_runways LIMIT 5",
+                    params={"evidence_type": "generic"},
+                )
+            ]
+        )
+
+        result = executor.execute(
+            user_query="compare next-90-minute flight risk across SAW, AYT, ADB",
+            plan=plan,
+            schemas={"sql_schema": {"tables": [{"table": "ourairports_runways", "columns": [{"name": "id"}]}]}},
+        )
+
+        self.assertIn("SQL", result.source_results)
+        rows = result.source_results["SQL"]
+        self.assertEqual(rows[0].get("airport"), "LTFJ")
+        self.assertEqual(rows[0].get("runway_id"), 1)
+        done_events = [e for e in result.source_traces if e.get("type") == "source_call_done" and e.get("source") == "SQL"]
+        self.assertTrue(done_events)
+        self.assertEqual(
+            done_events[0].get("rewrite_reason"),
+            "sql_regenerated_after_validation_failed+heuristic_fallback",
+        )
 
 
 if __name__ == "__main__":
