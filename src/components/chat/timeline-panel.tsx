@@ -119,7 +119,8 @@ export function TimelinePanel({
             const pulse = subtlePulse(source.status === "querying", !!reducedMotion);
             const sourceSnapshot = sourceSnapshots[source.source];
             const hasPreview = !!sourceSnapshot && sourceSnapshot.rowsPreview.length > 0;
-            const canOpenDetails = hasPreview || source.status === "error";
+            const hasErrorDetails = source.status === "error" && !!sourceSnapshot;
+            const canOpenDetails = hasPreview || hasErrorDetails;
             return (
               <motion.div
                 key={source.source}
@@ -185,16 +186,22 @@ export function TimelinePanel({
                         className="rounded border border-border/70 bg-background/70 px-1.5 font-mono text-[10px] hover:bg-background disabled:cursor-not-allowed disabled:opacity-55"
                         onClick={(event) => {
                           event.stopPropagation();
-                          if (hasPreview || source.status === "error") {
+                          if (canOpenDetails) {
                             setSelectedSource(source.source);
                           }
                         }}
-                        disabled={!hasPreview && source.status !== "error"}
-                        title={hasPreview ? "View retrieved rows" : source.status === "error" ? "View error details" : "No row preview available for this source call"}
+                        disabled={!canOpenDetails}
+                        title={
+                          hasPreview
+                            ? "View retrieved rows"
+                            : hasErrorDetails
+                              ? "View error details"
+                              : "No row preview available for this source call"
+                        }
                       >
                         {source.rowCount > 0
                           ? `${source.rowCount} rows`
-                          : source.status === "error"
+                          : hasErrorDetails
                             ? "error"
                             : "preview"}
                       </motion.button>
