@@ -4,9 +4,9 @@ Last updated: 2026-02-23
 
 ## Freshness metadata (non-secret)
 
-- Runtime facts last verified: 2026-02-20
+- Runtime facts last verified: 2026-02-23
 - Runtime facts stale-after window: 7 days
-- Infrastructure topology last verified: 2026-02-20
+- Infrastructure topology last verified: 2026-02-23
 - Infrastructure topology stale-after window: 30 days
 - On stale/contradictory data: verify against repo truth and command output before risky execution.
 - Structure reference for future updates: `docs/CODEX_MEMORY_TEMPLATE.md`.
@@ -156,3 +156,13 @@ Current tracked status:
   - Why: Keep future updates deterministic and reduce structure drift across edits.
   - Sources: `docs/CODEX_MEMORY_TEMPLATE.md`, `docs/CODEX_MEMORY.md`.
   - Changed-from: Earlier file used equivalent content with partially different labels/order.
+- 2026-02-23: Hardened chat transport against cold-start and proxy timeout failures.
+  - Decision: Increased frontend proxy defaults to `BACKEND_REQUEST_TIMEOUT_MS=180000` and `CHAT_STREAM_TIMEOUT_MS=240000`, ensured deploy workflow syncs these values to App Service settings, and reduced worker recycle churn via `GUNICORN_MAX_REQUESTS=1000` / `GUNICORN_MAX_REQUESTS_JITTER=200` defaults.
+  - Why: Prevent premature proxy aborts during backend cold-start and long-running retrieval/synthesis calls.
+  - Sources: `src/app/api/chat/route.ts`, `.github/workflows/deploy-frontend.yaml`, `.github/workflows/deploy-backend.yaml`, `scripts/render-k8s-manifests.sh`, `Dockerfile.backend`.
+  - Changed-from: Previous defaults were `BACKEND_REQUEST_TIMEOUT_MS=45000`, `CHAT_STREAM_TIMEOUT_MS=180000`, `GUNICORN_MAX_REQUESTS=200`, `GUNICORN_MAX_REQUESTS_JITTER=50`; workflow did not sync frontend timeout settings.
+- 2026-02-23: Restored ACR configurability in backend deploy workflow.
+  - Decision: Reinstated repository variable overrides for `AZURE_CONTAINER_REGISTRY_NAME` and `AZURE_CONTAINER_REGISTRY` in `.github/workflows/deploy-backend.yaml`, keeping safe defaults.
+  - Why: Avoid deployment failures in environments that use a non-default ACR while preserving strict ACR target validation.
+  - Sources: `.github/workflows/deploy-backend.yaml`, `tests/test_deployment_pipelines.py`.
+  - Changed-from: Hard-coded `aviationragacr` / `aviationragacr.azurecr.io`.

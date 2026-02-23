@@ -4,6 +4,7 @@
 import logging
 import os
 import sys
+import threading
 
 from flask import Flask, Response, jsonify, request, stream_with_context
 
@@ -40,15 +41,20 @@ except ImportError:
     pass
 
 runtime = None
+runtime_lock = threading.Lock()
 
 
 def get_runtime() -> AgentFrameworkRuntime:
     """Lazily initialize runtime so health checks are not blocked by cold-start."""
     global runtime
-    if runtime is None:
-        logger.info("Initializing Agent Framework runtime...")
-        runtime = AgentFrameworkRuntime()
-        logger.info("Runtime ready (af_enabled=%s)", runtime.af_enabled)
+    if runtime is not None:
+        return runtime
+
+    with runtime_lock:
+        if runtime is None:
+            logger.info("Initializing Agent Framework runtime...")
+            runtime = AgentFrameworkRuntime()
+            logger.info("Runtime ready (af_enabled=%s)", runtime.af_enabled)
     return runtime
 
 
@@ -98,9 +104,31 @@ def chat():
     if len(message) > MAX_MESSAGE_LENGTH:
         return jsonify({"error": f"Message exceeds maximum length of {MAX_MESSAGE_LENGTH} characters"}), 400
 
-    af_runtime = get_runtime()
-
     def event_stream():
+        # Emit an immediate event so proxy callers do not time out waiting for
+        # the first byte when runtime cold-start is slow.
+        yield to_sse({
+            "type": "agent_update",
+            "stage": "runtime_init",
+            "message": "Initializing runtime",
+        })
+
+        try:
+            af_runtime = get_runtime()
+        except Exception:
+            logger.exception("Runtime initialization error")
+            yield to_sse({
+                "type": "agent_error",
+                "message": "Runtime initialization failed while preparing your request.",
+                "route": "RUNTIME_INIT_ERROR",
+            })
+            yield to_sse({
+                "type": "done",
+                "route": "RUNTIME_INIT_ERROR",
+                "isVerified": False,
+            })
+            return
+
         try:
             for event in af_runtime.run_stream(
                 query=message,
@@ -118,9 +146,10 @@ def chat():
                 failure_policy=failure_policy,
             ):
                 yield to_sse(event)
-        except Exception as exc:
+        except Exception:
             logger.exception("SSE stream error")
             yield to_sse({"type": "agent_error", "message": "An internal error occurred while processing your request."})
+            yield to_sse({"type": "done", "route": "STREAM_ERROR", "isVerified": False})
 
     return Response(
         stream_with_context(event_stream()),

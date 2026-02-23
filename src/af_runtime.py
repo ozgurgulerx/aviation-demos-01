@@ -927,7 +927,27 @@ class AgentFrameworkRuntime:
 
         lookup_thread.join()
         if exc_holder:
-            raise exc_holder[0]
+            exc = exc_holder[0]
+            route = route_label if isinstance(route_label, str) and route_label else "AGENTIC"
+            logger.error(
+                "Local pipeline rag lookup failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            yield {
+                "type": "agent_error",
+                "message": "RAG lookup failed before synthesis. Please retry.",
+                "route": route,
+                "sessionId": session_id,
+                "framework": "local-fallback",
+                "degradedSources": [],
+                "failedRequiredSources": [],
+                "requiredSourcesSatisfied": len(required_sources) == 0,
+                "missingRequiredSources": list(required_sources),
+                "failurePolicy": failure_policy,
+                "sourcePolicy": source_policy,
+                "partial": False,
+            }
+            return
         tool_result = result_holder[0]
 
         logger.info("perf stage=%s ms=%.1f", "rag_lookup", (time.perf_counter() - _t0_rag) * 1000)

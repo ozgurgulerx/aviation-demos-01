@@ -44,7 +44,8 @@ All development and testing targets the live Azure deployment — **not** local 
   - PII: `POST /api/pii`
 - **Backend**: AKS cluster `aks-aviation-rag`, namespace `aviation-rag`
   - Pod: `aviation-rag-backend` (gunicorn, port 5001)
-  - External LB: `http://20.240.76.230` (only reachable from within Azure VNet)
+  - Internal LB service: `aviation-rag-backend-internal` (private VNet path)
+  - Public LB/IPs are fallback/debug paths only
   - Health: `GET /health`
   - Chat: `POST /api/chat`
   - Query: `POST /api/query`
@@ -145,12 +146,12 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
            -> SEMANTIC route: AI Search (vector + semantic) -> citations
            -> HYBRID route:   SQL + Semantic in parallel (ThreadPoolExecutor)
         -> Azure OpenAI (gpt-5-nano) synthesizes answer from context
-     <- SSE stream: tool_call -> text (word-by-word) -> metadata -> citations -> done
+     <- SSE stream: tool_call -> source traces -> streamed text chunks -> citations -> done
 ```
 
 **Query routes:** SQL (rankings, counts, comparisons), SEMANTIC (similarity, descriptions), HYBRID (combined).
 **PII detection:** Dual-layer — frontend pre-send + backend pre-LLM. 14 categories. Fail-open on service unavailability.
-**SSE streaming:** Cosmetic word-by-word (5ms delay). Backend returns full JSON; Next.js splits it.
+**SSE streaming:** Backend emits native SSE events; Next.js proxy passes backend SSE through to the client.
 
 ## Key Conventions
 
@@ -166,13 +167,15 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - Flask with flask-cors (all origins allowed)
 - API key auth for Azure OpenAI (`AZURE_OPENAI_AUTH_MODE=api-key`); `DefaultAzureCredential` supported as fallback
 - DB: PostgreSQL only (requires `PGHOST` set)
-- Single gunicorn worker in production (`--workers 1 --timeout 180`)
+- Single gunicorn worker in production (`--workers 1 --timeout 240`)
 - PII filter: 14 categories, confidence >= 0.8, fail-open on timeout (5s)
 
 ## Environment Variables
 
 ### Frontend (server-side)
 - `BACKEND_URL` / `PYTHON_API_URL` — Python backend URL (default: `http://localhost:5001`)
+- `BACKEND_REQUEST_TIMEOUT_MS` — proxy timeout for backend connection (default: `180000`)
+- `CHAT_STREAM_TIMEOUT_MS` — max stream duration at proxy layer (default: `240000`)
 - `PII_ENDPOINT` / `PII_CONTAINER_ENDPOINT` — PII service URL
 - `PII_API_KEY` — PII API key (not needed for container mode)
 
@@ -214,5 +217,5 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - **Increase gunicorn workers** beyond 1 without reviewing in-memory state in unified_retriever.py
 - **Skip PostgreSQL connection pool** changes without reviewing thread safety in unified_retriever.py
 - **Forget CSP `connect-src`** in `next.config.mjs` when changing backend domain
-- **Assume SSE reduces latency** — streaming is cosmetic, backend returns full response synchronously
+- **Assume startup is free** — cold runtime initialization can be slow; keep first SSE byte fast
 - **Use `AZURE_OPENAI_API_KEY` in production** — prefer `DefaultAzureCredential` (managed identity)
