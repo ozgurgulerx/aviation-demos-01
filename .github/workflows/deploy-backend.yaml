@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 env:
-  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'aviationragacr' }}
-  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'aviationragacr.azurecr.io' }}
+  AZURE_CONTAINER_REGISTRY_NAME: aviationragacr
+  AZURE_CONTAINER_REGISTRY: aviationragacr.azurecr.io
   IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
   IMAGE_TAG: ${{ github.sha }}
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
