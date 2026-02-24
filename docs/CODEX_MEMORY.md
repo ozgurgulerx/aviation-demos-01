@@ -151,6 +151,11 @@ Current tracked status:
 
 ## Decision log (non-secret)
 
+- 2026-02-24: Rolled backend to latest local `main` commits after additional auth-hardening changes.
+  - Decision: Built and pushed backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-3177058-manual-20260224100916` from `HEAD` (`3177058`) using `docker buildx --platform linux/amd64`, verified ACR manifest platform (`os=linux`, `architecture=amd64`), and rolled AKS deployment `aviation-rag-backend` to the new tag. Kept frontend on the already-deployed `bd74d4f` build because no newer frontend file changes existed after that commit.
+  - Why: Deploy the latest backend fixes (`cc278eb`, `3177058`) to production while preserving platform and tenant/subscription guardrails.
+  - Sources: `git log --oneline -n 3`, `./scripts/aks/use-deploy-target-context.sh`, `./scripts/validate-tenant-lock.sh`, `docker buildx build --platform linux/amd64 -f Dockerfile.backend ... --push`, `az acr repository show-manifests --name avrag705508acr --repository aviation-rag-backend --detail --orderby time_desc -o json`, `kubectl -n aviation-rag set image deployment/aviation-rag-backend ...`, `kubectl -n aviation-rag rollout status deployment/aviation-rag-backend --timeout=900s`, `kubectl -n aviation-rag get deployment aviation-rag-backend -o jsonpath=...`, `curl http://127.0.0.1:18081/health`, `curl http://127.0.0.1:18081/api/fabric/preflight`.
+  - Changed-from: Backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-013c513-manual-20260224090444`.
 - 2026-02-24: Rolled local `HEAD` to backend AKS and frontend App Service with baseline preflight gate.
   - Decision: Built and pushed backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-583946c-manual-20260224074650` via `docker buildx --platform linux/amd64`, updated AKS deployment to that tag, synced frontend App Service runtime settings (including `CHAT_STREAM_TIMEOUT_MS=240000`), and deployed `/tmp/app.zip` through OneDeploy.
   - Why: Deploy current local branch commits while preserving subscription guardrails and AKS architecture compatibility.
