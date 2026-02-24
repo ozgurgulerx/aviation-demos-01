@@ -15,6 +15,7 @@ import type { QueryType } from "@/data/seed";
 interface FollowUpSuggestion {
   text: string;
   type: QueryType;
+  sources?: number;
 }
 
 interface FollowUpChipsProps {
@@ -31,31 +32,30 @@ const iconMap: Record<QueryType, React.ElementType> = {
   compliance: BookCheck,
 };
 
-const colorMap: Record<QueryType, { bg: string; text: string; border: string }> = {
-  "ops-live": {
-    bg: "bg-primary/10",
-    text: "text-primary",
-    border: "border-primary/30",
+type ComplexityTier = 1 | 2 | 3;
+
+function getComplexityTier(sources: number): ComplexityTier {
+  if (sources <= 2) return 1;
+  if (sources <= 4) return 2;
+  return 3;
+}
+
+const tierColorMap: Record<ComplexityTier, { bg: string; text: string; border: string; glow?: string }> = {
+  1: {
+    bg: "bg-slate-500/10",
+    text: "text-slate-600 dark:text-slate-300",
+    border: "border-slate-500/25",
   },
-  safety: {
-    bg: "bg-teal-500/10",
-    text: "text-teal-700 dark:text-teal-300",
-    border: "border-teal-500/30",
+  2: {
+    bg: "bg-amber-500/10",
+    text: "text-amber-700 dark:text-amber-300",
+    border: "border-amber-500/30",
   },
-  network: {
-    bg: "bg-blue-500/10",
-    text: "text-blue-700 dark:text-blue-300",
-    border: "border-blue-500/30",
-  },
-  maintenance: {
-    bg: "bg-orange-500/10",
-    text: "text-orange-700 dark:text-orange-300",
-    border: "border-orange-500/30",
-  },
-  compliance: {
-    bg: "bg-cyan-500/10",
-    text: "text-cyan-700 dark:text-cyan-300",
-    border: "border-cyan-500/30",
+  3: {
+    bg: "bg-purple-500/15",
+    text: "text-purple-700 dark:text-purple-300",
+    border: "border-purple-500/40",
+    glow: "shadow-[0_0_8px_hsl(270,60%,60%,0.25)]",
   },
 };
 
@@ -92,6 +92,7 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
       return {
         text: suggestion,
         type: inferQueryType(suggestion),
+        sources: 1,
       };
     }
 
@@ -108,7 +109,8 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
       <div className="mx-auto max-w-5xl flex flex-wrap gap-2">
         {normalizedSuggestions.map((suggestion, index) => {
           const Icon = iconMap[suggestion.type];
-          const palette = colorMap[suggestion.type];
+          const tier = getComplexityTier(suggestion.sources ?? 1);
+          const palette = tierColorMap[tier];
           const Chip = isHydrated ? motion.div : "div";
           const chipProps = isHydrated
             ? { initial: { opacity: 0, scale: 0.94 }, animate: { opacity: 1, scale: 1 }, transition: { delay: index * 0.04 } }
@@ -121,8 +123,11 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => onSelect(suggestion.text)}
-                className={`h-auto border ${palette.border} ${palette.bg} px-3 py-2 text-xs transition-all hover:-translate-y-0.5`}
+                onClick={() => {
+                  console.log("[FollowUpChip] clicked:", suggestion.text);
+                  onSelect(suggestion.text);
+                }}
+                className={`h-auto border ${palette.border} ${palette.bg} ${palette.glow ?? ""} px-3 py-2 text-xs transition-all hover:-translate-y-0.5`}
               >
                 <Icon className={`h-3.5 w-3.5 ${palette.text}`} />
                 <span className="text-left">{suggestion.text}</span>

@@ -123,28 +123,62 @@ export type QueryType =
 export interface FollowUpSuggestion {
   text: string;
   type: QueryType;
+  sources?: number;
 }
 
 export const ENHANCED_FOLLOW_UP_SUGGESTIONS: FollowUpSuggestion[] = [
+  // --- Tier 1 (1-2 sources) ---
   {
     text: "Compare next-90-minute departure risk across SAW, AYT, and ADB.",
     type: "ops-live",
-  },
-  {
-    text: "Show crew legality risks likely to breach in the next rotation.",
-    type: "safety",
+    sources: 1,
   },
   {
     text: "Trace dependency chain for a delayed inbound tail and downstream legs.",
     type: "network",
-  },
-  {
-    text: "Summarize active MEL and techlog items impacting dispatchability.",
-    type: "maintenance",
+    sources: 2,
   },
   {
     text: "List applicable AD/NOTAM documents tied to current disruptions.",
     type: "compliance",
+    sources: 2,
+  },
+  // --- Tier 2 (3-4 sources) ---
+  {
+    text: "Compare BTS cancellation rates at SAW over past winters with current SIGMET coverage and turnaround bottlenecks.",
+    type: "ops-live",
+    sources: 3,
+  },
+  {
+    text: "For carriers with the worst on-time record to ADB, surface matching ASRS safety narratives and delay root causes.",
+    type: "safety",
+    sources: 3,
+  },
+  {
+    text: "Identify legs where baggage mishandling, crew duty overruns, and turnaround delays coincide.",
+    type: "maintenance",
+    sources: 3,
+  },
+  {
+    text: "Which airworthiness directives apply to tails currently flying with deferred MEL items?",
+    type: "compliance",
+    sources: 3,
+  },
+  // --- Tier 3 (5+ sources) ---
+  {
+    text: "Assess full operational risk for the IST evening bank: live weather hazards, BTS delay trends, active NOTAMs, crew legality status, and related ASRS incident history.",
+    type: "ops-live",
+    sources: 5,
+  },
+  {
+    text: "Map the full disruption cascade if TC-JHZ is grounded at SAW: downstream flight network, crew re-assignments, baggage impacts, regulatory constraints, and airport facility alternatives.",
+    type: "network",
+    sources: 5,
+  },
+  {
+    text: "Produce a go/no-go departure briefing for SAW: live SIGMETs, active NOTAMs, MEL and crew status, BTS on-time baseline, runway procedures, and related safety narratives.",
+    type: "ops-live",
+    sources: 6,
   },
 ];
 
