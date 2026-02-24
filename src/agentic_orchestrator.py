@@ -19,7 +19,10 @@ from intent_graph_provider import IntentGraphSnapshot
 from shared_utils import (
     OPENAI_API_VERSION,
     ENGLISH_4LETTER_BLOCKLIST as _ENGLISH_4LETTER_BLOCKLIST,
+    OPS_TABLE_SIGNALS,
+    FABRIC_SQL_DELAY_TRIGGERS,
     supports_explicit_temperature as _supports_explicit_temperature,
+    matches_any,
 )
 
 
@@ -398,33 +401,46 @@ class AgenticOrchestrator:
         plan.coverage = list(coverage_map.values())
         return plan
 
+    _POLICY_TERMS = frozenset({"policy", "sop", "compliance", "clause", "airworthiness", "directive", "easa", "bulletin", "regulatory"})
+    _ARRIVAL_TERMS = frozenset({"arrival", "approach", "landing"})
+    _ANALYTICS_TERMS = frozenset({"on-time", "cancellation rate", "schedule performance", "bts", "carrier delay", "delay cause"})
+    _DISRUPTION_TERMS = frozenset({"disruption", "irrops"})
+    _SAFETY_TERMS = frozenset({"summarize", "similar", "narrative", "what happened", "lessons", "bird strike", "incident report"})
+    _REPLAY_TERMS = frozenset({"replay", "history", "last week", "yesterday"})
+    _COMPARE_TERMS = frozenset({"compare", "versus", "ranking", "benchmark"})
+    _FLEET_TERMS = frozenset({"fleet", "aircraft count", "fleet size"})
+    _ROUTE_TERMS = frozenset({"route", "connection", "destination", "network"})
+    _TREND_TERMS = frozenset({"trend", "incident rate", "safety record", "accident"})
+    _AIRPORT_TERMS = frozenset({"airport info", "runway", "elevation", "frequency", "icao", "gate", "turnaround", "station"})
+    _DELAY_PERF_TERMS = frozenset({"delay", "performance"})
+
     def _infer_intent(self, query: str) -> str:
         q = query.lower()
         if self._is_short_horizon_departure_risk_query(query):
             return "PilotBrief.Departure"
-        if any(t in q for t in ("policy", "sop", "compliance", "clause", "airworthiness", "directive", "easa", "bulletin", "regulatory")):
+        if matches_any(q, self._POLICY_TERMS):
             return "Policy.Check"
-        if any(t in q for t in ("arrival", "approach", "landing")):
+        if matches_any(q, self._ARRIVAL_TERMS):
             return "PilotBrief.Arrival"
-        if any(t in q for t in ("on-time", "cancellation rate", "schedule performance", "bts", "carrier delay", "delay cause")):
+        if matches_any(q, self._ANALYTICS_TERMS):
             return "Analytics.Compare"
-        if any(t in q for t in ("disruption", "irrops")):
+        if matches_any(q, self._DISRUPTION_TERMS):
             return "Disruption.Explain"
-        if any(t in q for t in ("summarize", "similar", "narrative", "what happened", "lessons", "bird strike", "incident report")):
+        if matches_any(q, self._SAFETY_TERMS):
             return "Safety.Trend"
-        if any(t in q for t in ("replay", "history", "last week", "yesterday")):
+        if matches_any(q, self._REPLAY_TERMS):
             return "Replay.History"
-        if any(t in q for t in ("compare", "versus", "ranking", "benchmark")):
+        if matches_any(q, self._COMPARE_TERMS):
             return "Analytics.Compare"
-        if any(t in q for t in ("fleet", "aircraft count", "fleet size")):
+        if matches_any(q, self._FLEET_TERMS):
             return "Fleet.Status"
-        if any(t in q for t in ("route", "connection", "destination", "network")):
+        if matches_any(q, self._ROUTE_TERMS):
             return "RouteNetwork.Query"
-        if any(t in q for t in ("trend", "incident rate", "safety record", "accident")):
+        if matches_any(q, self._TREND_TERMS):
             return "Safety.Trend"
-        if any(t in q for t in ("airport info", "runway", "elevation", "frequency", "icao", "gate", "turnaround", "station")):
+        if matches_any(q, self._AIRPORT_TERMS):
             return "Airport.Info"
-        if any(t in q for t in ("delay", "performance")):
+        if matches_any(q, self._DELAY_PERF_TERMS):
             return "Analytics.Compare"
         return "PilotBrief.Departure"
 
@@ -432,8 +448,15 @@ class AgenticOrchestrator:
     def _is_short_horizon_departure_risk_query(query: str) -> bool:
         text = str(query or "")
         lower = text.lower()
-        has_compare = any(token in lower for token in ("compare", "across", "versus", "vs"))
-        has_departure_risk = ("departure" in lower and "risk" in lower) or ("flight risk" in lower)
+        _compare_kws = frozenset({"compare", "across", "versus", "vs"})
+        has_compare = matches_any(lower, _compare_kws)
+        _departure_kws = frozenset({"departure"})
+        _risk_kws = frozenset({"risk"})
+        _flight_risk_kws = frozenset({"flight risk"})
+        has_departure_risk = (
+            (matches_any(lower, _departure_kws) and matches_any(lower, _risk_kws))
+            or matches_any(lower, _flight_risk_kws)
+        )
         has_short_horizon = bool(
             re.search(
                 r"\bnext[-\s]?\d{1,3}\s*(?:[-\s]?minute(?:s)?|[-\s]?min|m)\b",
@@ -454,39 +477,34 @@ class AgenticOrchestrator:
 
         enrichments: List[tuple[str, str, str]] = []
         # Narrative/similarity -> VECTOR_OPS
-        if any(m in query_l for m in (
+        _narrative_kws = frozenset({
             "summarize", "similar", "narrative", "what happened",
             "examples", "lessons", "incident", "bird strike",
             "describe", "asrs", "safety report", "failure scenario",
             "engine failure", "hydraulic", "scenario",
-        )):
+        })
+        if matches_any(query_l, _narrative_kws):
             enrichments.append(("VECTOR_OPS", "semantic_lookup", "Query mentions narrative/similarity"))
         # Regulatory -> VECTOR_REG
-        if any(m in query_l for m in (
+        _regulatory_kws = frozenset({
             "airworthiness", "notam", "easa", "compliance",
             "directive", "sop", "bulletin", "regulatory",
-            "ad ", "faa ad",
-        )):
+            "ad", "faa ad",
+        })
+        if matches_any(query_l, _regulatory_kws):
             enrichments.append(("VECTOR_REG", "semantic_lookup", "Query mentions regulatory content"))
         # Airport ops -> VECTOR_AIRPORT
-        if any(m in query_l for m in (
+        _airport_kws = frozenset({
             "runway", "gate", "turnaround", "airport info",
             "station info", "facility", "airport configuration",
             "ltfm", "ltba", "ltfj", "sabiha", "istanbul airport",
-        )):
+        })
+        if matches_any(query_l, _airport_kws):
             enrichments.append(("VECTOR_AIRPORT", "semantic_lookup", "Query mentions airport operations"))
         # Delay analytics -> FABRIC_SQL (BTS data only, not ops_* tables)
-        _fabric_sql_delay_triggers = (
-            "delay", "on-time", "cancellation", "schedule performance",
-            "bts", "carrier performance", "on time",
-            "average delay", "carrier delay", "weather delay",
-            "nas delay", "delay cause",
-        )
-        _ops_table_signals = ("mel", "techlog", "tech log", "crew", "baggage",
-                              "turnaround", "milestone", "dispatch", "deferred")
         if (
-            any(m in query_l for m in _fabric_sql_delay_triggers)
-            and not any(m in query_l for m in _ops_table_signals)
+            matches_any(query_l, FABRIC_SQL_DELAY_TRIGGERS)
+            and not matches_any(query_l, OPS_TABLE_SIGNALS)
         ):
             enrichments.append(("FABRIC_SQL", "sql_lookup", "Query mentions delay/performance analytics"))
 

@@ -8,7 +8,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from shared_utils import canon_tool, normalize_source_policy, validate_source_policy_request
+from shared_utils import (
+    canon_tool,
+    normalize_source_policy,
+    validate_source_policy_request,
+    matches_any,
+    OPS_TABLE_SIGNALS,
+    FABRIC_SQL_DELAY_TRIGGERS,
+)
 
 
 VALID_SOURCES = {
@@ -100,58 +107,62 @@ class RetrievalPlan:
         }
 
 
+_REALTIME_MARKERS = frozenset({
+    "last", "live", "real-time", "realtime", "minutes",
+    "now", "current status", "recent",
+})
+
+_GRAPH_MARKERS = frozenset({
+    "impact", "dependency", "depends on", "connected",
+    "alternate", "route network", "relationship",
+})
+
+_REGULATORY_MARKERS = frozenset({
+    "ad", "airworthiness", "notam", "easa", "compliance", "directive",
+})
+
+_NARRATIVE_MARKERS = frozenset({
+    "summarize", "similar", "narrative", "what happened", "examples", "lessons",
+})
+
+_AIRPORT_OPS_MARKERS = frozenset({
+    "runway", "gate", "turnaround", "airport", "station", "ltfm", "ltfj", "ltba",
+})
+
+_NOSQL_MARKERS = frozenset({
+    "notam", "operational doc", "ops doc", "ground handling doc", "parking stand",
+})
+
+
 def _wants_realtime(query_l: str) -> bool:
-    markers = (
-        "last ",
-        "live",
-        "real-time",
-        "realtime",
-        "minutes",
-        "now",
-        "current status",
-        "recent",
-    )
-    return any(m in query_l for m in markers)
+    return matches_any(query_l, _REALTIME_MARKERS)
 
 
 def _wants_graph(query_l: str) -> bool:
-    markers = (
-        "impact",
-        "dependency",
-        "depends on",
-        "connected",
-        "alternate",
-        "route network",
-        "relationship",
-    )
-    return any(m in query_l for m in markers)
+    return matches_any(query_l, _GRAPH_MARKERS)
 
 
 def _wants_regulatory(query_l: str) -> bool:
-    markers = ("ad ", "airworthiness", "notam", "easa", "compliance", "directive")
-    return any(m in query_l for m in markers)
+    return matches_any(query_l, _REGULATORY_MARKERS)
 
 
 def _wants_narrative(query_l: str) -> bool:
-    markers = ("summarize", "similar", "narrative", "what happened", "examples", "lessons")
-    return any(m in query_l for m in markers)
+    return matches_any(query_l, _NARRATIVE_MARKERS)
 
 
 def _wants_airport_ops(query_l: str) -> bool:
-    markers = ("runway", "gate", "turnaround", "airport", "station", "ltfm", "ltfj", "ltba")
-    return any(m in query_l for m in markers)
+    return matches_any(query_l, _AIRPORT_OPS_MARKERS)
 
 
 def _wants_nosql(query_l: str) -> bool:
-    markers = ("notam", "operational doc", "ops doc", "ground handling doc", "parking stand")
-    return any(m in query_l for m in markers)
+    return matches_any(query_l, _NOSQL_MARKERS)
 
 
 def _wants_analytics(query_l: str) -> bool:
-    markers = ("delay", "on-time", "schedule performance", "bts",
-               "carrier delay", "cancellation rate", "on time performance",
-               "delay cause", "weather delay", "nas delay")
-    return any(m in query_l for m in markers)
+    return (
+        matches_any(query_l, FABRIC_SQL_DELAY_TRIGGERS)
+        and not matches_any(query_l, OPS_TABLE_SIGNALS)
+    )
 
 
 def build_retrieval_plan(

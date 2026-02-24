@@ -9,7 +9,9 @@ previously defined independently in multiple modules.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
@@ -159,6 +161,53 @@ def build_rows_preview(
             preview.append(item)
 
     return columns, preview, len(rows) > len(preview)
+
+
+# ---------------------------------------------------------------------------
+# Word-boundary-aware keyword matching
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=64)
+def _compile_keyword_pattern(keywords: frozenset) -> re.Pattern:
+    escaped = sorted((re.escape(k) for k in keywords), key=len, reverse=True)
+    return re.compile(r"(?<!\w)(?:" + "|".join(escaped) + r")(?!\w)", re.IGNORECASE)
+
+
+def matches_any(text: str, keywords: frozenset) -> bool:
+    """Word-boundary-aware keyword matching.
+
+    Prevents false positives like 'dispatcher' matching 'dispatch' or
+    'destination' matching 'station'.  Uses ``(?<!\\w)``/``(?!\\w)``
+    instead of ``\\b`` for better handling of multi-word phrases.
+    The compiled regex is cached per unique keyword frozenset.
+    """
+    return bool(_compile_keyword_pattern(keywords).search(text))
+
+
+# ---------------------------------------------------------------------------
+# Centralized keyword sets for query classification
+# ---------------------------------------------------------------------------
+
+OPS_TABLE_SIGNALS: frozenset = frozenset({
+    "mel", "techlog", "tech log", "technical log", "minimum equipment",
+    "dispatch", "dispatched", "deferred", "jasc",
+    "crew", "duty", "fatigue", "legality",
+    "baggage", "mishandled", "luggage",
+    "turnaround", "milestones", "milestone", "ground handling",
+    "flight leg", "flight legs", "leg_id", "ops_",
+    "tail", "tailnum", "inbound", "downstream",
+    "dependency", "chain", "trace",
+    "propagat",
+})
+
+FABRIC_SQL_DELAY_TRIGGERS: frozenset = frozenset({
+    "delay", "delays", "delayed",
+    "on-time", "on time", "cancellation", "cancellations",
+    "schedule performance",
+    "bts", "carrier performance", "carrier delay", "weather delay",
+    "nas delay", "delay cause", "average delay",
+    "cancellation rate", "on time performance",
+})
 
 
 # ---------------------------------------------------------------------------

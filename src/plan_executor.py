@@ -20,7 +20,16 @@ logger = logging.getLogger(__name__)
 from contracts.agentic_plan import AgenticPlan, ToolCall
 from query_writers import KQLWriter, SQLWriter
 from unified_retriever import Citation, UnifiedRetriever
-from shared_utils import utc_now as _utc_now, safe_preview_value, build_rows_preview, KNOWN_TOOLS, TOOL_ALIASES, canon_tool
+from shared_utils import (
+    utc_now as _utc_now,
+    safe_preview_value,
+    build_rows_preview,
+    KNOWN_TOOLS,
+    TOOL_ALIASES,
+    canon_tool,
+    OPS_TABLE_SIGNALS,
+    matches_any,
+)
 
 
 @dataclass
@@ -512,10 +521,7 @@ class PlanExecutor:
                     "sql_schema_missing",
                 }
             ):
-                _ops_signals = {"mel", "techlog", "tech log", "crew", "baggage",
-                                "turnaround", "milestone", "dispatch", "deferred",
-                                "flight leg", "ops_"}
-                if any(t in (call_query or "").lower() for t in _ops_signals):
+                if matches_any((call_query or "").lower(), OPS_TABLE_SIGNALS):
                     logger.info(
                         "FABRIC_SQL->SQL cross-source fallback: query=%s error=%s",
                         (call_query or "")[:100], rows[0].get("error_code"),

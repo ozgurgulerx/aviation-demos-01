@@ -42,8 +42,11 @@ from shared_utils import (
     ENGLISH_4LETTER_BLOCKLIST as _ENGLISH_4LETTER_BLOCKLIST,
     CITY_AIRPORT_MAP,
     IATA_TO_ICAO_MAP,
+    OPS_TABLE_SIGNALS,
+    FABRIC_SQL_DELAY_TRIGGERS,
     env_bool as _env_bool,
     env_csv as _env_csv,
+    matches_any,
 )
 
 logger = logging.getLogger(__name__)
@@ -2701,10 +2704,13 @@ class UnifiedRetriever:
         # -----------------------------------------------------------------
         # Delay / OPS fallback branches (schema-aware)
         # -----------------------------------------------------------------
-        delay_terms = {"delay", "late", "on-time", "on time", "punctuality", "otp"}
-        turnaround_terms = {"turnaround", "milestone", "ground handling", "pushback", "gate", "boarding"}
-        crew_terms = {"crew", "duty", "fatigue", "legality", "captain", "first officer", "cabin"}
-        baggage_terms = {"baggage", "bag", "mishandled", "luggage"}
+        _delay_terms = frozenset({"delay", "delays", "delayed", "late", "on-time", "on time", "punctuality", "otp"})
+        _turnaround_terms = frozenset({"turnaround", "milestone", "ground handling", "pushback", "gate", "boarding"})
+        _crew_terms = frozenset({"crew", "duty", "fatigue", "legality", "captain", "first officer", "cabin"})
+        _baggage_terms = frozenset({"baggage", "bag", "mishandled", "luggage"})
+        _mel_terms = frozenset({"mel", "techlog", "tech log", "technical log", "minimum equipment",
+                                "dispatch", "dispatchab", "deferred", "jasc", "airworth"})
+        _chain_terms = frozenset({"dependency", "chain", "trace", "depend", "linked", "connection", "multi-table", "cross-table"})
 
         flight_leg_cols = tables.get("ops_flight_legs", set()) | tables.get("demo.ops_flight_legs", set())
         milestone_cols = tables.get("ops_turnaround_milestones", set()) | tables.get("demo.ops_turnaround_milestones", set())
@@ -2718,8 +2724,64 @@ class UnifiedRetriever:
                 return f"demo.{table_base}"
             return table_base
 
+        # --- Dependency chain / trace / multi-table queries ---
+        # (must precede delay branch: "trace dependency chain for a delayed..."
+        #  is more specific and should match chain, not delay)
+        if matches_any(q, _chain_terms) and flight_leg_cols:
+            legs_tbl = _qual("ops_flight_legs")
+            select_parts = ["l.leg_id", "l.carrier_code", "l.flight_no", "l.tailnum",
+                            "l.origin_iata", "l.dest_iata"]
+            join_parts: list[str] = []
+            if crew_cols:
+                crew_tbl = _qual("ops_crew_rosters")
+                join_parts.append(f"LEFT JOIN {crew_tbl} c ON c.leg_id = l.leg_id")
+                select_parts.extend(["c.crew_id", "c.role"])
+            if milestone_cols:
+                mile_tbl = _qual("ops_turnaround_milestones")
+                join_parts.append(f"LEFT JOIN {mile_tbl} m ON m.leg_id = l.leg_id")
+                select_parts.extend(["m.milestone", "m.delay_cause_code"])
+            if mel_cols:
+                mel_tbl = _qual("ops_mel_techlog_events")
+                join_parts.append(f"LEFT JOIN {mel_tbl} t ON t.leg_id = l.leg_id")
+                select_parts.extend(["t.jasc_code", "t.mel_category", "t.severity"])
+            # Extract possible tailnum filter from query (e.g., "N12345")
+            tail_match = re.search(r"\b(N\d{3,5}[A-Z]{0,2})\b", query or "", re.IGNORECASE)
+            where_clause = f"WHERE l.tailnum = '{tail_match.group(1).upper()}' " if tail_match else ""
+            joins_str = " ".join(join_parts)
+            return (
+                f"SELECT {', '.join(select_parts)} "
+                f"FROM {legs_tbl} l "
+                f"{joins_str} "
+                f"{where_clause}"
+                f"ORDER BY l.scheduled_dep_utc DESC NULLS LAST "
+                f"LIMIT 50"
+            )
+
+        # --- MEL / techlog queries ---
+        if matches_any(q, _mel_terms) and mel_cols:
+            tbl = _qual("ops_mel_techlog_events")
+            if {"mel_category", "severity", "deferred_flag"}.issubset(mel_cols):
+                return (
+                    f"SELECT mel_category, severity, "
+                    f"COUNT(*) AS events, "
+                    f"SUM(CAST(NULLIF(deferred_flag, '') AS INTEGER)) AS deferred_count "
+                    f"FROM {tbl} "
+                    f"WHERE deferred_flag IS NOT NULL "
+                    f"GROUP BY mel_category, severity "
+                    f"ORDER BY events DESC "
+                    f"LIMIT 50"
+                )
+            if "mel_category" in mel_cols:
+                return (
+                    f"SELECT mel_category, COUNT(*) AS events "
+                    f"FROM {tbl} "
+                    f"GROUP BY mel_category "
+                    f"ORDER BY events DESC "
+                    f"LIMIT 50"
+                )
+
         # --- Delay queries ---
-        if any(term in q for term in delay_terms):
+        if matches_any(q, _delay_terms):
             # Option A: delay columns exist in ops_flight_legs
             if {"dep_delay_min", "arr_delay_min"}.issubset(flight_leg_cols):
                 tbl = _qual("ops_flight_legs")
@@ -2749,7 +2811,7 @@ class UnifiedRetriever:
                 )
 
         # --- Turnaround queries ---
-        if any(term in q for term in turnaround_terms) and milestone_cols:
+        if matches_any(q, _turnaround_terms) and milestone_cols:
             tbl = _qual("ops_turnaround_milestones")
             if {"milestone", "delay_cause_code"}.issubset(milestone_cols):
                 return (
@@ -2769,7 +2831,7 @@ class UnifiedRetriever:
                 )
 
         # --- Crew / duty queries ---
-        if any(term in q for term in crew_terms) and crew_cols:
+        if matches_any(q, _crew_terms) and crew_cols:
             tbl = _qual("ops_crew_rosters")
             if {"role", "cumulative_duty_hours", "legality_risk_flag"}.issubset(crew_cols):
                 return (
@@ -2790,7 +2852,7 @@ class UnifiedRetriever:
                 )
 
         # --- Baggage queries ---
-        if any(term in q for term in baggage_terms) and bag_cols:
+        if matches_any(q, _baggage_terms) and bag_cols:
             tbl = _qual("ops_baggage_events")
             if {"event_type", "bag_count", "root_cause"}.issubset(bag_cols):
                 return (
@@ -2809,63 +2871,6 @@ class UnifiedRetriever:
                     f"GROUP BY event_type "
                     f"ORDER BY events DESC"
                 )
-
-        # --- MEL / techlog queries ---
-        mel_terms = {"mel", "techlog", "tech log", "technical log", "minimum equipment",
-                     "dispatch", "dispatchab", "deferred", "jasc", "airworth"}
-        if any(term in q for term in mel_terms) and mel_cols:
-            tbl = _qual("ops_mel_techlog_events")
-            if {"mel_category", "severity", "deferred_flag"}.issubset(mel_cols):
-                return (
-                    f"SELECT mel_category, severity, "
-                    f"COUNT(*) AS events, "
-                    f"SUM(CAST(NULLIF(deferred_flag, '') AS INTEGER)) AS deferred_count "
-                    f"FROM {tbl} "
-                    f"WHERE deferred_flag IS NOT NULL "
-                    f"GROUP BY mel_category, severity "
-                    f"ORDER BY events DESC "
-                    f"LIMIT 50"
-                )
-            if "mel_category" in mel_cols:
-                return (
-                    f"SELECT mel_category, COUNT(*) AS events "
-                    f"FROM {tbl} "
-                    f"GROUP BY mel_category "
-                    f"ORDER BY events DESC "
-                    f"LIMIT 50"
-                )
-
-        # --- Dependency chain / trace / multi-table queries ---
-        chain_terms = {"dependency", "chain", "trace", "depend", "linked", "connection", "multi-table", "cross-table"}
-        if any(term in q for term in chain_terms) and flight_leg_cols:
-            legs_tbl = _qual("ops_flight_legs")
-            select_parts = ["l.leg_id", "l.carrier_code", "l.flight_no", "l.tailnum",
-                            "l.origin_iata", "l.dest_iata"]
-            join_parts: list[str] = []
-            if crew_cols:
-                crew_tbl = _qual("ops_crew_rosters")
-                join_parts.append(f"LEFT JOIN {crew_tbl} c ON c.leg_id = l.leg_id")
-                select_parts.extend(["c.crew_id", "c.role"])
-            if milestone_cols:
-                mile_tbl = _qual("ops_turnaround_milestones")
-                join_parts.append(f"LEFT JOIN {mile_tbl} m ON m.leg_id = l.leg_id")
-                select_parts.extend(["m.milestone", "m.delay_cause_code"])
-            if mel_cols:
-                mel_tbl = _qual("ops_mel_techlog_events")
-                join_parts.append(f"LEFT JOIN {mel_tbl} t ON t.leg_id = l.leg_id")
-                select_parts.extend(["t.jasc_code", "t.mel_category", "t.severity"])
-            # Extract possible tailnum filter from query (e.g., "N12345")
-            tail_match = re.search(r"\b(N\d{3,5}[A-Z]{0,2})\b", query or "", re.IGNORECASE)
-            where_clause = f"WHERE l.tailnum = '{tail_match.group(1).upper()}' " if tail_match else ""
-            joins_str = " ".join(join_parts)
-            return (
-                f"SELECT {', '.join(select_parts)} "
-                f"FROM {legs_tbl} l "
-                f"{joins_str} "
-                f"{where_clause}"
-                f"ORDER BY l.scheduled_dep_utc DESC NULLS LAST "
-                f"LIMIT 50"
-            )
 
         if not asrs_cols:
             return None
@@ -3408,18 +3413,10 @@ class UnifiedRetriever:
             else:
                 airports = self._extract_airports_from_query(query)
                 query_lower = (query or "").lower()
-                is_weather_query = any(w in query_lower for w in ("weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm"))
-                is_airport_risk_query = any(
-                    token in query_lower
-                    for token in (
-                        "risk",
-                        "departure",
-                        "disruption",
-                        "compare",
-                        "next-90",
-                        "next 90",
-                    )
-                )
+                _weather_terms = frozenset({"weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm"})
+                _airport_risk_terms = frozenset({"risk", "departure", "disruption", "compare", "next-90", "next 90"})
+                is_weather_query = matches_any(query_lower, _weather_terms)
+                is_airport_risk_query = matches_any(query_lower, _airport_risk_terms)
                 if airports and (is_weather_query or is_airport_risk_query):
                     iata_tokens = sorted(set(re.findall(r"\b[A-Z]{3}\b", (query or "").upper())))
                     terms = sorted(set([*airports, *iata_tokens]))
@@ -3484,16 +3481,22 @@ class UnifiedRetriever:
                         "| take 50"
                     )
                 else:
-                    tokens = self._query_tokens(query)
-                    if tokens:
-                        values = ",".join(f"'{t}'" for t in tokens)
+                    explicit_ids = self._extract_explicit_flight_identifiers(query)
+                    if explicit_ids:
+                        values = ",".join(f"'{v}'" for v in explicit_ids)
                         csl = (
                             "opensky_states "
                             f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
                             "| take 50"
                         )
                     else:
-                        csl = "opensky_states | take 50"
+                        return [
+                            self._source_error_row(
+                                source="KQL",
+                                code="kql_no_structured_identifiers",
+                                detail="query has no callsign, icao24, or airport identifiers for KQL",
+                            )
+                        ], []
                 csl, _changed, _reason = self._sanitize_kql_query(csl)
 
             validation_error = self._validate_kql_query(csl, kql_schema=effective_kql_schema)
@@ -3870,40 +3873,99 @@ class UnifiedRetriever:
         detail = str(response.get("error")) if isinstance(response, dict) else "nosql_endpoint_query_failed"
         return [self._source_error_row("NOSQL", "nosql_runtime_error", detail)], []
 
-    def _get_fabric_sql_schema(self) -> str:
-        """Return warehouse-specific schema hint for the Fabric SQL writer."""
-        return """
-Tables in Fabric SQL Warehouse (T-SQL dialect):
+    def _get_fabric_sql_schema(self) -> Dict[str, Any]:
+        """Return warehouse-specific schema as a structured Dict for the Fabric SQL writer.
 
-- bts_ontime_reporting: Year INT, Quarter INT, Month INT, DayofMonth INT,
-    DayOfWeek INT, FlightDate VARCHAR, IATA_Code_Marketing_Airline VARCHAR,
-    Flight_Number_Marketing_Airline VARCHAR, IATA_Code_Operating_Airline VARCHAR,
-    Tail_Number VARCHAR, Flight_Number_Operating_Airline VARCHAR,
-    Origin VARCHAR, OriginCityName VARCHAR, OriginState VARCHAR,
-    Dest VARCHAR, DestCityName VARCHAR, DestState VARCHAR,
-    CRSDepTime VARCHAR, DepTime VARCHAR, DepDelay FLOAT, DepDelayMinutes FLOAT,
-    DepDel15 FLOAT, CRSArrTime VARCHAR, ArrTime VARCHAR, ArrDelay FLOAT,
-    ArrDelayMinutes FLOAT, ArrDel15 FLOAT, Cancelled FLOAT,
-    CancellationCode VARCHAR, Diverted FLOAT, CRSElapsedTime FLOAT,
-    ActualElapsedTime FLOAT, AirTime FLOAT, Distance FLOAT, DistanceGroup INT,
-    CarrierDelay FLOAT, WeatherDelay FLOAT, NASDelay FLOAT,
-    SecurityDelay FLOAT, LateAircraftDelay FLOAT
-
-- airline_delay_causes: year INT, month INT, carrier VARCHAR,
-    carrier_name VARCHAR, airport VARCHAR, airport_name VARCHAR,
-    arr_flights FLOAT, arr_del15 FLOAT, carrier_ct FLOAT,
-    weather_ct FLOAT, nas_ct FLOAT, security_ct FLOAT,
-    late_aircraft_ct FLOAT, arr_cancelled FLOAT, arr_diverted FLOAT,
-    arr_delay FLOAT, carrier_delay FLOAT, weather_delay FLOAT,
-    nas_delay FLOAT, security_delay FLOAT, late_aircraft_delay FLOAT
-
-Notes:
-- IATA_Code_Marketing_Airline is the 2-letter carrier code (e.g. 'DL', 'AA', 'UA')
-- Origin/Dest are IATA airport codes (e.g. 'ATL', 'JFK', 'LAX')
-- Delay columns are in minutes; NULL means no delay of that type
-- Cancelled: 1.0 = cancelled, 0.0 = not cancelled
-- Use TOP N instead of LIMIT N (T-SQL dialect)
-"""
+        Matches the PostgreSQL schema format so the LLM writer sees a proper
+        JSON object rather than a raw multiline string.
+        """
+        return {
+            "source": "fabric_sql_warehouse",
+            "dialect": "tsql",
+            "tables": [
+                {
+                    "schema": "dbo",
+                    "table": "bts_ontime_reporting",
+                    "columns": [
+                        {"name": "Year", "type": "INT"},
+                        {"name": "Quarter", "type": "INT"},
+                        {"name": "Month", "type": "INT"},
+                        {"name": "DayofMonth", "type": "INT"},
+                        {"name": "DayOfWeek", "type": "INT"},
+                        {"name": "FlightDate", "type": "VARCHAR"},
+                        {"name": "IATA_Code_Marketing_Airline", "type": "VARCHAR"},
+                        {"name": "Flight_Number_Marketing_Airline", "type": "VARCHAR"},
+                        {"name": "IATA_Code_Operating_Airline", "type": "VARCHAR"},
+                        {"name": "Tail_Number", "type": "VARCHAR"},
+                        {"name": "Flight_Number_Operating_Airline", "type": "VARCHAR"},
+                        {"name": "Origin", "type": "VARCHAR"},
+                        {"name": "OriginCityName", "type": "VARCHAR"},
+                        {"name": "OriginState", "type": "VARCHAR"},
+                        {"name": "Dest", "type": "VARCHAR"},
+                        {"name": "DestCityName", "type": "VARCHAR"},
+                        {"name": "DestState", "type": "VARCHAR"},
+                        {"name": "CRSDepTime", "type": "VARCHAR"},
+                        {"name": "DepTime", "type": "VARCHAR"},
+                        {"name": "DepDelay", "type": "FLOAT"},
+                        {"name": "DepDelayMinutes", "type": "FLOAT"},
+                        {"name": "DepDel15", "type": "FLOAT"},
+                        {"name": "CRSArrTime", "type": "VARCHAR"},
+                        {"name": "ArrTime", "type": "VARCHAR"},
+                        {"name": "ArrDelay", "type": "FLOAT"},
+                        {"name": "ArrDelayMinutes", "type": "FLOAT"},
+                        {"name": "ArrDel15", "type": "FLOAT"},
+                        {"name": "Cancelled", "type": "FLOAT"},
+                        {"name": "CancellationCode", "type": "VARCHAR"},
+                        {"name": "Diverted", "type": "FLOAT"},
+                        {"name": "CRSElapsedTime", "type": "FLOAT"},
+                        {"name": "ActualElapsedTime", "type": "FLOAT"},
+                        {"name": "AirTime", "type": "FLOAT"},
+                        {"name": "Distance", "type": "FLOAT"},
+                        {"name": "DistanceGroup", "type": "INT"},
+                        {"name": "CarrierDelay", "type": "FLOAT"},
+                        {"name": "WeatherDelay", "type": "FLOAT"},
+                        {"name": "NASDelay", "type": "FLOAT"},
+                        {"name": "SecurityDelay", "type": "FLOAT"},
+                        {"name": "LateAircraftDelay", "type": "FLOAT"},
+                    ],
+                },
+                {
+                    "schema": "dbo",
+                    "table": "airline_delay_causes",
+                    "columns": [
+                        {"name": "year", "type": "INT"},
+                        {"name": "month", "type": "INT"},
+                        {"name": "carrier", "type": "VARCHAR"},
+                        {"name": "carrier_name", "type": "VARCHAR"},
+                        {"name": "airport", "type": "VARCHAR"},
+                        {"name": "airport_name", "type": "VARCHAR"},
+                        {"name": "arr_flights", "type": "FLOAT"},
+                        {"name": "arr_del15", "type": "FLOAT"},
+                        {"name": "carrier_ct", "type": "FLOAT"},
+                        {"name": "weather_ct", "type": "FLOAT"},
+                        {"name": "nas_ct", "type": "FLOAT"},
+                        {"name": "security_ct", "type": "FLOAT"},
+                        {"name": "late_aircraft_ct", "type": "FLOAT"},
+                        {"name": "arr_cancelled", "type": "FLOAT"},
+                        {"name": "arr_diverted", "type": "FLOAT"},
+                        {"name": "arr_delay", "type": "FLOAT"},
+                        {"name": "carrier_delay", "type": "FLOAT"},
+                        {"name": "weather_delay", "type": "FLOAT"},
+                        {"name": "nas_delay", "type": "FLOAT"},
+                        {"name": "security_delay", "type": "FLOAT"},
+                        {"name": "late_aircraft_delay", "type": "FLOAT"},
+                    ],
+                },
+            ],
+            "notes": [
+                "Use TOP N instead of LIMIT N (T-SQL dialect)",
+                "IATA_Code_Marketing_Airline is the 2-letter carrier code (e.g. 'DL', 'AA', 'UA')",
+                "Origin/Dest are IATA airport codes (e.g. 'ATL', 'JFK', 'LAX')",
+                "Delay columns are in minutes; NULL means no delay of that type",
+                "Cancelled: 1.0 = cancelled, 0.0 = not cancelled",
+                "Do NOT use @parameter placeholders - inline all values as literals",
+            ],
+        }
 
     # -- Fabric SQL heuristic fallback (BTS tables, T-SQL dialect) -----------
 
@@ -3926,6 +3988,10 @@ Notes:
         """
         q = (query or "").lower()
 
+        # Ops-table queries don't belong in BTS tables — bail early.
+        if matches_any(q, OPS_TABLE_SIGNALS):
+            return None
+
         # Extract IATA airport codes from the query
         iata_tokens = sorted({
             token
@@ -3938,17 +4004,18 @@ Notes:
                 return ""
             return f"{col} IN (" + ", ".join(f"'{t}'" for t in tokens) + ")"
 
-        delay_terms = {"delay", "late", "on-time", "on time", "punctuality", "otp",
-                       "risk", "departure risk", "arrival risk"}
-        cause_terms = {"cause", "reason", "breakdown", "weather", "carrier delay",
-                       "nas delay", "security delay", "late aircraft"}
-        cancel_terms = {"cancel", "cancelled", "canceled", "divert", "diverted", "diversion"}
-        compare_terms = {"compare", "comparison", "across", "vs", "versus", "between"}
+        _delay_terms = frozenset({"delay", "delays", "delayed", "late", "on-time", "on time", "punctuality", "otp",
+                                  "risk", "departure risk", "arrival risk"})
+        _cause_terms = frozenset({"cause", "reason", "breakdown", "weather", "carrier delay",
+                                  "nas delay", "security delay", "late aircraft"})
+        _cancel_terms = frozenset({"cancel", "cancellation", "cancellations", "cancelled", "canceled",
+                                   "divert", "diverted", "diversion"})
+        _compare_terms = frozenset({"compare", "comparison", "across", "vs", "versus", "between"})
 
-        has_delay = any(term in q for term in delay_terms)
-        has_cause = any(term in q for term in cause_terms)
-        has_cancel = any(term in q for term in cancel_terms)
-        has_compare = any(term in q for term in compare_terms)
+        has_delay = matches_any(q, _delay_terms)
+        has_cause = matches_any(q, _cause_terms)
+        has_cancel = matches_any(q, _cancel_terms)
+        has_compare = matches_any(q, _compare_terms)
 
         # -----------------------------------------------------------------
         # Branch 1: Delay comparison across airports
@@ -4059,16 +4126,23 @@ Notes:
         # Generate SQL using warehouse-specific schema.
         try:
             schema = self._get_fabric_sql_schema()
+            airports = self._extract_airports_from_query(query)
+            flight_ids = self._extract_explicit_flight_identifiers(query)
             sql = self.sql_writer.generate(
                 user_query=query,
                 evidence_type="generic",
                 sql_schema=schema,
-                entities={"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []},
+                entities={"airports": airports, "flight_ids": flight_ids, "routes": [], "stations": [], "alternates": []},
                 time_window={"horizon_min": 120, "start_utc": None, "end_utc": None},
-                constraints={"dialect": "tsql"},
+                constraints={"dialect": "tsql", "no_parameters": True},
             )
         except Exception as exc:
             return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
+
+        # Post-generation guard: reject @parameter placeholders (T-SQL inline only)
+        if re.search(r"@[A-Z]\w+", sql):
+            logger.warning("FABRIC_SQL TDS: generated SQL contains @parameters, falling to heuristic")
+            sql = "-- NEED_SCHEMA (parameterized)"
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
             fallback_sql = self._heuristic_fabric_sql_fallback(query, sql)
@@ -4188,16 +4262,23 @@ Notes:
 
         try:
             schema = self._get_fabric_sql_schema()
+            airports = self._extract_airports_from_query(query)
+            flight_ids = self._extract_explicit_flight_identifiers(query)
             sql = self.sql_writer.generate(
                 user_query=query,
                 evidence_type="generic",
                 sql_schema=schema,
-                entities={"airports": [], "flight_ids": [], "routes": [], "stations": [], "alternates": []},
+                entities={"airports": airports, "flight_ids": flight_ids, "routes": [], "stations": [], "alternates": []},
                 time_window={"horizon_min": 120, "start_utc": None, "end_utc": None},
-                constraints={"dialect": "tsql"},
+                constraints={"dialect": "tsql", "no_parameters": True},
             )
         except Exception as exc:
             return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
+
+        # Post-generation guard: reject @parameter placeholders (T-SQL inline only)
+        if re.search(r"@[A-Z]\w+", sql):
+            logger.warning("FABRIC_SQL REST: generated SQL contains @parameters, falling to heuristic")
+            sql = "-- NEED_SCHEMA (parameterized)"
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
             fallback_sql = self._heuristic_fabric_sql_fallback(query, sql)

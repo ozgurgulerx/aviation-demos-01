@@ -9,7 +9,7 @@ import logging
 import os
 
 from azure_openai_client import get_shared_client
-from shared_utils import OPENAI_API_VERSION
+from shared_utils import OPENAI_API_VERSION, matches_any
 
 logger = logging.getLogger(__name__)
 
@@ -425,23 +425,24 @@ class QueryRouter:
                 "reasoning": "Fallback to HYBRID due to routing error",
             }
 
+    _SQL_KEYWORDS = frozenset({
+        "top", "largest", "smallest", "compare", "list", "show",
+        "how many", "total", "sum", "average", "count",
+        "greater than", "less than", "between", "trend", "by year",
+        "flight phase", "aircraft type", "location",
+    })
+    _SEMANTIC_KEYWORDS = frozenset({
+        "describe", "summarize", "what happened", "example", "similar",
+        "narrative", "context", "why", "lessons learned",
+    })
+    _HYBRID_KEYWORDS = frozenset({"report", "asrs", "incident", "safety"})
+
     def quick_route(self, query: str) -> str:
         """Quick route classification using keyword heuristics."""
         query_lower = query.lower()
 
-        sql_keywords = [
-            "top", "largest", "smallest", "compare", "list", "show",
-            "how many", "total", "sum", "average", "count",
-            "greater than", "less than", "between", "trend", "by year",
-            "flight phase", "aircraft type", "location",
-        ]
-        has_sql = any(kw in query_lower for kw in sql_keywords)
-
-        semantic_keywords = [
-            "describe", "summarize", "what happened", "example", "similar",
-            "narrative", "context", "why", "lessons learned",
-        ]
-        has_semantic = any(kw in query_lower for kw in semantic_keywords)
+        has_sql = matches_any(query_lower, self._SQL_KEYWORDS)
+        has_semantic = matches_any(query_lower, self._SEMANTIC_KEYWORDS)
 
         if has_sql and has_semantic:
             return "HYBRID"
@@ -450,7 +451,7 @@ class QueryRouter:
         if has_semantic:
             return "SEMANTIC"
 
-        if any(kw in query_lower for kw in ["report", "asrs", "incident", "safety"]):
+        if matches_any(query_lower, self._HYBRID_KEYWORDS):
             return "HYBRID"
 
         return "HYBRID"
