@@ -129,9 +129,16 @@ _fabric_token_lock = threading.Lock()
 _fabric_token_cache: Dict[str, Dict[str, Any]] = {}  # scope -> {token, expires_at}
 
 _fabric_dac_lock = threading.Lock()
-_fabric_dac: Any = None  # lazily set to DefaultAzureCredential
+_FABRIC_DAC_UNSET = object()  # sentinel distinguishing "not yet tried" from "tried and failed"
+_fabric_dac: Any = _FABRIC_DAC_UNSET
 
 _FABRIC_DEFAULT_SCOPE = "https://api.fabric.microsoft.com/.default"
+
+_FABRIC_KQL_AUTH_HINT = (
+    "KQL auth failed (HTTP 401). Check: (1) DefaultAzureCredential / "
+    "workload identity binding, (2) FABRIC_CLIENT_ID/SECRET/TENANT_ID "
+    "credentials, (3) SP permissions on the Kusto database."
+)
 
 _FABRIC_SQL_AUTH_HINT = (
     "Fabric SQL TDS auth failed (18456). Check: (1) DefaultAzureCredential / "
@@ -141,12 +148,16 @@ _FABRIC_SQL_AUTH_HINT = (
 
 
 def _get_fabric_dac():
-    """Thread-safe lazy singleton for DefaultAzureCredential."""
+    """Thread-safe lazy singleton for DefaultAzureCredential.
+
+    Uses a sentinel so that a failed init (``None``) is cached and the lock
+    is never re-acquired after the first attempt.
+    """
     global _fabric_dac
-    if _fabric_dac is not None:
+    if _fabric_dac is not _FABRIC_DAC_UNSET:
         return _fabric_dac
     with _fabric_dac_lock:
-        if _fabric_dac is not None:
+        if _fabric_dac is not _FABRIC_DAC_UNSET:
             return _fabric_dac
         try:
             from azure.identity import DefaultAzureCredential
@@ -3318,11 +3329,7 @@ class UnifiedRetriever:
                 return rows, [citation]
             error_extra: Dict[str, Any] = {"csl": csl}
             if error and "http_401" in error:
-                error_extra["auth_hint"] = (
-                    "KQL auth failed (HTTP 401). Check: (1) DefaultAzureCredential / "
-                    "workload identity binding, (2) FABRIC_CLIENT_ID/SECRET/TENANT_ID "
-                    "credentials, (3) SP permissions on the Kusto database."
-                )
+                error_extra["auth_hint"] = _FABRIC_KQL_AUTH_HINT
             return [
                 self._source_error_row(
                     source="KQL",
@@ -3763,13 +3770,15 @@ Notes:
                 f"Connection Timeout={connect_timeout};"
             )
             conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=connect_timeout)
-            cur = conn.cursor()
-            cur.timeout = query_timeout
-            cur.execute(sql)
-            cols = [desc[0] for desc in cur.description] if cur.description else []
-            result = [dict(zip(cols, r)) for r in cur.fetchall()]
-            conn.close()
-            return result
+            try:
+                cur = conn.cursor()
+                cur.timeout = query_timeout
+                cur.execute(sql)
+                cols = [desc[0] for desc in cur.description] if cur.description else []
+                result = [dict(zip(cols, r)) for r in cur.fetchall()]
+                return result
+            finally:
+                conn.close()
 
         try:
             rows = _tds_connect_and_query(token)

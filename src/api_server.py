@@ -99,18 +99,21 @@ def health():
             tds_bundle = _acquire_fabric_token_bundle(
                 scope="https://database.windows.net/.default",
             )
-            payload["fabric_auth"] = {
-                "auth_mode": fabric_bundle.get("auth_mode"),
-                "auth_ready": fabric_bundle.get("auth_ready"),
-                "reason": fabric_bundle.get("reason"),
-                "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
-            }
-            payload["fabric_sql_tds_auth"] = {
-                "auth_mode": tds_bundle.get("auth_mode"),
-                "auth_ready": tds_bundle.get("auth_ready"),
-                "reason": tds_bundle.get("reason"),
-                "token_ttl_seconds": tds_bundle.get("token_ttl_seconds"),
-            }
+            def _auth_summary(bundle: dict) -> dict:
+                summary = {
+                    "auth_mode": bundle.get("auth_mode"),
+                    "auth_ready": bundle.get("auth_ready"),
+                    "reason": bundle.get("reason"),
+                    "token_ttl_seconds": bundle.get("token_ttl_seconds"),
+                    "dac_status": bundle.get("dac_status"),
+                }
+                dac_err = bundle.get("dac_error")
+                if dac_err:
+                    summary["dac_error"] = dac_err
+                return summary
+
+            payload["fabric_auth"] = _auth_summary(fabric_bundle)
+            payload["fabric_sql_tds_auth"] = _auth_summary(tds_bundle)
         except Exception:
             logger.exception("Failed to gather auth diagnostics")
             payload["fabric_auth"] = {"error": "diagnostics_unavailable"}
