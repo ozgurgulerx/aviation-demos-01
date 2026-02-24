@@ -3428,7 +3428,8 @@ class UnifiedRetriever:
                 is_weather_query = matches_any(query_lower, _weather_terms)
                 is_airport_risk_query = matches_any(query_lower, _airport_risk_terms)
                 if airports and (is_weather_query or is_airport_risk_query):
-                    iata_tokens = sorted(set(re.findall(r"\b[A-Z]{3}\b", (query or "").upper())))
+                    iata_tokens = [t for t in re.findall(r"\b[A-Z]{3}\b", (query or "").upper())
+                                   if t in IATA_TO_ICAO_MAP]
                     terms = sorted(set([*airports, *iata_tokens]))
                     values = ",".join(f"'{term}'" for term in terms)
 
@@ -3536,16 +3537,24 @@ class UnifiedRetriever:
                 )
                 return rows, [citation]
             error_extra: Dict[str, Any] = {"csl": csl}
-            if error and "http_401" in error:
-                error_extra["auth_hint"] = _FABRIC_KQL_AUTH_HINT
-            return [
-                self._source_error_row(
-                    source="KQL",
-                    code="kql_runtime_error",
-                    detail=error or "kql_query_returned_no_rows",
-                    extra=error_extra,
-                )
-            ], []
+            if error:
+                if "http_401" in error:
+                    error_extra["auth_hint"] = _FABRIC_KQL_AUTH_HINT
+                return [
+                    self._source_error_row(
+                        source="KQL",
+                        code="kql_runtime_error",
+                        detail=error,
+                        extra=error_extra,
+                    )
+                ], []
+            # No rows is a valid result — return info row, not error
+            return [{
+                "source": "KQL",
+                "info": "no_active_hazards",
+                "detail": "KQL query executed successfully but returned no rows — no matching weather hazards in the requested time window.",
+                "csl": csl,
+            }], []
         else:
             payload = {"query": query, "window_minutes": window_minutes}
             response = self._post_json(

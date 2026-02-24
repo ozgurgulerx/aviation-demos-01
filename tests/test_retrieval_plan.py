@@ -79,6 +79,17 @@ class RetrievalPlanTests(unittest.TestCase):
         sources = [s.source for s in plan.steps]
         self.assertIn("VECTOR_OPS", sources)
 
+    def test_ops_delay_query_prefers_sql_over_fabric_sql(self):
+        req = RetrievalRequest(
+            query="Show delay trend from ops_flight_legs for last 7 days",
+            retrieval_mode="code-rag",
+            query_profile="pilot-brief",
+        )
+        plan = build_retrieval_plan(req, route="HYBRID", route_reasoning="test")
+        sources = [s.source for s in plan.steps]
+        self.assertIn("SQL", sources)
+        self.assertNotIn("FABRIC_SQL", sources)
+
 
 if __name__ == "__main__":
     unittest.main()

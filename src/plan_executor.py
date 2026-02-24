@@ -566,6 +566,10 @@ class PlanExecutor:
         fallback_sql = self.retriever._heuristic_sql_fallback(user_query, sql_query)
         if fallback_sql:
             rows, citations = self._execute_sql_raw(fallback_sql)
+            if rows:
+                for row in rows:
+                    if isinstance(row, dict):
+                        row.setdefault("partial_schema", sql_query)
             if rows and not rows[0].get("error_code"):
                 logger.info("NEED_SCHEMA fallback succeeded: original=%s fallback=%s rows=%d",
                             sql_query[:120], fallback_sql[:120], len(rows))
