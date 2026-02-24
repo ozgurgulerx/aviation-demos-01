@@ -504,6 +504,27 @@ class PlanExecutor:
 
         if source == "FABRIC_SQL":
             rows, citations = self.retriever.query_fabric_sql(call_query)
+            if (
+                rows
+                and isinstance(rows[0], dict)
+                and rows[0].get("error_code") in {
+                    "fabric_sql_no_matching_data",
+                    "sql_schema_missing",
+                }
+            ):
+                _ops_signals = {"mel", "techlog", "tech log", "crew", "baggage",
+                                "turnaround", "milestone", "dispatch", "deferred",
+                                "flight leg", "ops_"}
+                if any(t in (call_query or "").lower() for t in _ops_signals):
+                    logger.info(
+                        "FABRIC_SQL->SQL cross-source fallback: query=%s error=%s",
+                        (call_query or "")[:100], rows[0].get("error_code"),
+                    )
+                    sql_rows, sql_query, sql_citations = self.retriever.query_sql(call_query)
+                    if sql_rows and not (
+                        isinstance(sql_rows[0], dict) and sql_rows[0].get("error_code")
+                    ):
+                        return sql_rows, sql_citations, sql_query
             return rows, citations, None
 
         if source in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:

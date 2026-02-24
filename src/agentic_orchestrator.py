@@ -475,13 +475,19 @@ class AgenticOrchestrator:
             "ltfm", "ltba", "ltfj", "sabiha", "istanbul airport",
         )):
             enrichments.append(("VECTOR_AIRPORT", "semantic_lookup", "Query mentions airport operations"))
-        # Delay analytics -> FABRIC_SQL
-        if any(m in query_l for m in (
+        # Delay analytics -> FABRIC_SQL (BTS data only, not ops_* tables)
+        _fabric_sql_delay_triggers = (
             "delay", "on-time", "cancellation", "schedule performance",
             "bts", "carrier performance", "on time",
             "average delay", "carrier delay", "weather delay",
             "nas delay", "delay cause",
-        )):
+        )
+        _ops_table_signals = ("mel", "techlog", "tech log", "crew", "baggage",
+                              "turnaround", "milestone", "dispatch", "deferred")
+        if (
+            any(m in query_l for m in _fabric_sql_delay_triggers)
+            and not any(m in query_l for m in _ops_table_signals)
+        ):
             enrichments.append(("FABRIC_SQL", "sql_lookup", "Query mentions delay/performance analytics"))
 
         for tool, op, reason in enrichments:

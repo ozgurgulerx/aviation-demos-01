@@ -2810,6 +2810,31 @@ class UnifiedRetriever:
                     f"ORDER BY events DESC"
                 )
 
+        # --- MEL / techlog queries ---
+        mel_terms = {"mel", "techlog", "tech log", "technical log", "minimum equipment",
+                     "dispatch", "dispatchab", "deferred", "jasc", "airworth"}
+        if any(term in q for term in mel_terms) and mel_cols:
+            tbl = _qual("ops_mel_techlog_events")
+            if {"mel_category", "severity", "deferred_flag"}.issubset(mel_cols):
+                return (
+                    f"SELECT mel_category, severity, "
+                    f"COUNT(*) AS events, "
+                    f"SUM(CAST(NULLIF(deferred_flag, '') AS INTEGER)) AS deferred_count "
+                    f"FROM {tbl} "
+                    f"WHERE deferred_flag IS NOT NULL "
+                    f"GROUP BY mel_category, severity "
+                    f"ORDER BY events DESC "
+                    f"LIMIT 50"
+                )
+            if "mel_category" in mel_cols:
+                return (
+                    f"SELECT mel_category, COUNT(*) AS events "
+                    f"FROM {tbl} "
+                    f"GROUP BY mel_category "
+                    f"ORDER BY events DESC "
+                    f"LIMIT 50"
+                )
+
         # --- Dependency chain / trace / multi-table queries ---
         chain_terms = {"dependency", "chain", "trace", "depend", "linked", "connection", "multi-table", "cross-table"}
         if any(term in q for term in chain_terms) and flight_leg_cols:
