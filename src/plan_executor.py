@@ -49,6 +49,8 @@ class CallResult:
 
 
 class PlanExecutor:
+    _TYPE_MISMATCH_PATTERNS = ("operator does not exist", "cannot cast type", "invalid input syntax")
+
     def __init__(self, retriever: UnifiedRetriever):
         self.retriever = retriever
         self.sql_writer: Optional[SQLWriter] = None
@@ -315,12 +317,25 @@ class PlanExecutor:
                 return rows, citations, resolved_sql
             rows, citations = self._execute_sql_raw(sql_query)
             first_error = rows[0].get("error_code") if rows and isinstance(rows[0], dict) else ""
-            if first_error in {"sql_validation_failed", "sql_schema_missing"}:
+            # Detect type-mismatch runtime errors that can be fixed by adding CASTs
+            _is_type_mismatch = False
+            if first_error == "sql_runtime_error":
+                _error_detail = str(rows[0].get("error", "")).lower() if rows and isinstance(rows[0], dict) else ""
+                _is_type_mismatch = any(pat in _error_detail for pat in self._TYPE_MISMATCH_PATTERNS)
+            if first_error in {"sql_validation_failed", "sql_schema_missing"} or _is_type_mismatch:
                 try:
                     constraints = dict(call.params or {})
                     constraints["previous_error_code"] = first_error
                     constraints["previous_error_detail"] = str(rows[0].get("error", ""))
                     constraints["previous_sql"] = sql_query
+                    if _is_type_mismatch:
+                        constraints["casting_hint"] = (
+                            "The previous SQL failed with a type mismatch. "
+                            "All demo.* and ops_* columns are stored as TEXT. "
+                            "Cast timestamp columns via column::timestamptz and "
+                            "numeric columns via column::numeric or column::integer "
+                            "before any comparison, arithmetic, or aggregation."
+                        )
                     regenerated = self._get_sql_writer().generate(
                         user_query=user_query,
                         evidence_type=evidence_type or "generic",
@@ -347,13 +362,14 @@ class PlanExecutor:
                             if retry_rows and isinstance(retry_rows[0], dict)
                             else ""
                         )
-                        if retry_error not in {"sql_validation_failed", "sql_schema_missing"}:
+                        if retry_error not in {"sql_validation_failed", "sql_schema_missing", "sql_runtime_error"}:
                             rows, citations, sql_query = retry_rows, retry_citations, regenerated
                             call.params = dict(call.params or {})
                             call.params["__runtime_rewrite_reason"] = (
                                 "sql_regenerated_after_validation_failed"
                             )
                         else:
+                            # Retry also failed — fall through to heuristic fallback
                             retry_detail = ""
                             if retry_rows and isinstance(retry_rows[0], dict):
                                 retry_detail = str(retry_rows[0].get("error") or retry_rows[0].get("error_code") or "")

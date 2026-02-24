@@ -2720,16 +2720,16 @@ class UnifiedRetriever:
                 tbl = _qual("ops_flight_legs")
                 return (
                     f"SELECT "
-                    f"CASE WHEN dep_delay_min <= 0 THEN 'On-time / Early' "
-                    f"WHEN dep_delay_min BETWEEN 1 AND 15 THEN '1-15 min' "
-                    f"WHEN dep_delay_min BETWEEN 16 AND 60 THEN '16-60 min' "
+                    f"CASE WHEN CAST(NULLIF(dep_delay_min, '') AS INTEGER) <= 0 THEN 'On-time / Early' "
+                    f"WHEN CAST(NULLIF(dep_delay_min, '') AS INTEGER) BETWEEN 1 AND 15 THEN '1-15 min' "
+                    f"WHEN CAST(NULLIF(dep_delay_min, '') AS INTEGER) BETWEEN 16 AND 60 THEN '16-60 min' "
                     f"ELSE '60+ min' END AS delay_bucket, "
                     f"COUNT(*) AS flights, "
-                    f"ROUND(AVG(dep_delay_min), 1) AS avg_dep_delay_min, "
-                    f"ROUND(AVG(arr_delay_min), 1) AS avg_arr_delay_min "
+                    f"ROUND(AVG(CAST(NULLIF(dep_delay_min, '') AS NUMERIC)), 1) AS avg_dep_delay_min, "
+                    f"ROUND(AVG(CAST(NULLIF(arr_delay_min, '') AS NUMERIC)), 1) AS avg_arr_delay_min "
                     f"FROM {tbl} "
                     f"GROUP BY delay_bucket "
-                    f"ORDER BY MIN(dep_delay_min)"
+                    f"ORDER BY MIN(CAST(NULLIF(dep_delay_min, '') AS INTEGER))"
                 )
             # Option B: fall back to turnaround milestones delay_cause_code
             if "delay_cause_code" in milestone_cols:
@@ -2770,8 +2770,8 @@ class UnifiedRetriever:
                 return (
                     f"SELECT role, "
                     f"COUNT(*) AS duties, "
-                    f"ROUND(AVG(cumulative_duty_hours), 1) AS avg_cumulative_hours, "
-                    f"SUM(legality_risk_flag) AS legality_risk_count "
+                    f"ROUND(AVG(CAST(NULLIF(cumulative_duty_hours, '') AS NUMERIC)), 1) AS avg_cumulative_hours, "
+                    f"SUM(CAST(NULLIF(legality_risk_flag, '') AS INTEGER)) AS legality_risk_count "
                     f"FROM {tbl} "
                     f"GROUP BY role "
                     f"ORDER BY legality_risk_count DESC"
@@ -2791,7 +2791,7 @@ class UnifiedRetriever:
                 return (
                     f"SELECT event_type, "
                     f"COUNT(*) AS events, "
-                    f"SUM(bag_count) AS total_bags, "
+                    f"SUM(CAST(NULLIF(bag_count, '') AS INTEGER)) AS total_bags, "
                     f"COUNT(CASE WHEN root_cause != '' THEN 1 END) AS with_root_cause "
                     f"FROM {tbl} "
                     f"GROUP BY event_type "

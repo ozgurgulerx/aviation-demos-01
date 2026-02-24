@@ -53,6 +53,11 @@ Rules:
 - If needed columns are missing, output exactly:
 -- NEED_SCHEMA: <what is missing>
 - Never generate INSERT/UPDATE/DELETE/DDL.
+- IMPORTANT: Many tables (especially demo.* and ops_*) store ALL columns as TEXT. When sql_schema shows columns as type "text" that are semantically numeric or timestamps:
+  * Cast timestamp columns (ending in _utc) via column::timestamptz before date/time comparisons or NOW().
+  * Cast numeric columns (dep_delay_min, arr_delay_min, cumulative_duty_hours, legality_risk_flag, bag_count, distance_nm, passengers, deferred_flag) via column::numeric or column::integer before arithmetic, aggregation (SUM, AVG, MIN, MAX), or comparison.
+  * Example: AVG(dep_delay_min::numeric), SUM(legality_risk_flag::integer), WHERE duty_end_utc::timestamptz >= NOW()
+- If constraints include a casting_hint, follow it to add explicit CAST or :: operators.
 """
         payload = {
             "user_query": user_query,

@@ -94,60 +94,60 @@ Columns (all TEXT):
 - issue_to_valid_hours, valid_time, hazard, geometry_type, due_to, points
 
 ### ops_flight_legs
-Columns:
+Columns (all stored as TEXT — cast before arithmetic/comparison):
 - leg_id (TEXT, PRIMARY KEY)
 - source (TEXT) — data source tag
 - carrier_code (TEXT)
 - flight_no (TEXT)
 - origin_iata (TEXT)
 - dest_iata (TEXT)
-- scheduled_dep_utc (TEXT, ISO-8601 timestamp)
-- scheduled_arr_utc (TEXT, ISO-8601 timestamp)
-- actual_dep_utc (TEXT, ISO-8601 timestamp)
-- actual_arr_utc (TEXT, ISO-8601 timestamp)
-- dep_delay_min (INTEGER) — departure delay in minutes (negative = early)
-- arr_delay_min (INTEGER) — arrival delay in minutes (negative = early)
+- scheduled_dep_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- scheduled_arr_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- actual_dep_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- actual_arr_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- dep_delay_min (TEXT, numeric — cast via ::integer or ::numeric for arithmetic)
+- arr_delay_min (TEXT, numeric — cast via ::integer or ::numeric for arithmetic)
 - tailnum (TEXT)
-- distance_nm (REAL)
-- passengers (INTEGER)
+- distance_nm (TEXT, numeric — cast via ::numeric for arithmetic)
+- passengers (TEXT, numeric — cast via ::integer for arithmetic)
 
 ### ops_turnaround_milestones
-Columns:
+Columns (all stored as TEXT — cast before arithmetic/comparison):
 - milestone_id (TEXT, PRIMARY KEY)
 - leg_id (TEXT, FK -> ops_flight_legs.leg_id)
 - milestone (TEXT) — e.g. GATE_OPEN, BOARDING_START, PUSHBACK, TAKEOFF
-- event_ts_utc (TEXT, ISO-8601 timestamp)
+- event_ts_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
 - status (TEXT)
 - delay_cause_code (TEXT) — e.g. NONE, WX, ATC, MX, BAG, CREW, SEC
 
 ### ops_crew_rosters
-Columns:
+Columns (all stored as TEXT — cast before arithmetic/comparison):
 - duty_id (TEXT, PRIMARY KEY)
 - crew_id (TEXT)
 - role (TEXT) — captain, first_officer, cabin_lead
 - leg_id (TEXT, FK -> ops_flight_legs.leg_id)
-- duty_start_utc (TEXT, ISO-8601 timestamp)
-- duty_end_utc (TEXT, ISO-8601 timestamp)
-- cumulative_duty_hours (REAL)
-- legality_risk_flag (INTEGER) — 1 if cumulative hours > 10.5
+- duty_start_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- duty_end_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- cumulative_duty_hours (TEXT, numeric — cast via ::numeric for arithmetic)
+- legality_risk_flag (TEXT, 0 or 1 — cast via ::integer for SUM/arithmetic)
 
 ### ops_mel_techlog_events
-Columns:
+Columns (all stored as TEXT — cast before arithmetic/comparison):
 - tech_event_id (TEXT, PRIMARY KEY)
 - leg_id (TEXT, FK -> ops_flight_legs.leg_id)
-- event_ts_utc (TEXT, ISO-8601 timestamp)
+- event_ts_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
 - jasc_code (TEXT)
 - mel_category (TEXT) — B or C
-- deferred_flag (INTEGER)
+- deferred_flag (TEXT, 0 or 1 — cast via ::integer for SUM/arithmetic)
 - severity (TEXT) — major or minor
 
 ### ops_baggage_events
-Columns:
+Columns (all stored as TEXT — cast before arithmetic/comparison):
 - bag_event_id (TEXT, PRIMARY KEY)
 - leg_id (TEXT, FK -> ops_flight_legs.leg_id)
 - event_type (TEXT) — CHECKIN_LOADED, TRANSFER_SORTED, UNLOADED_ARRIVAL, MISHANDLED_TRIAGE
-- event_ts_utc (TEXT, ISO-8601 timestamp)
-- bag_count (INTEGER)
+- event_ts_utc (TEXT, ISO-8601 timestamp — cast via ::timestamptz for date comparisons)
+- bag_count (TEXT, numeric — cast via ::integer for SUM/arithmetic)
 - status (TEXT)
 - root_cause (TEXT)
 
@@ -169,6 +169,8 @@ Generate SQL queries based on natural language questions.
 5. For aggregations, include clear aliases
 6. Prefer case-insensitive matching using LOWER(column) LIKE LOWER('%value%')
 7. Never generate INSERT/UPDATE/DELETE/DDL statements
+8. All ops_* and demo.ops_* timestamp TEXT columns (ending in _utc) must be cast via column::timestamptz before comparison with dates, timestamps, or NOW(). Example: WHERE duty_end_utc::timestamptz >= NOW()
+9. All ops_* and demo.ops_* numeric TEXT columns (dep_delay_min, arr_delay_min, cumulative_duty_hours, legality_risk_flag, bag_count, distance_nm, passengers, deferred_flag, length_ft, width_ft, elevation_ft) must be cast via column::numeric or column::integer for any arithmetic, aggregation (SUM, AVG, MIN, MAX), or comparison. Example: AVG(dep_delay_min::numeric), SUM(legality_risk_flag::integer)
 """
 
 
