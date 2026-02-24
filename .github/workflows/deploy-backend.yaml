@@ -84,6 +84,7 @@ env:
   FABRIC_SQL_SERVER: ${{ vars.FABRIC_SQL_SERVER }}
   FABRIC_SQL_DATABASE: ${{ vars.FABRIC_SQL_DATABASE }}
   FABRIC_SQL_MODE: ${{ vars.FABRIC_SQL_MODE || 'auto' }}
+  FABRIC_WORKLOAD_IDENTITY_CLIENT_ID: ${{ vars.FABRIC_WORKLOAD_IDENTITY_CLIENT_ID }}
   AZURE_COSMOS_ENDPOINT: ${{ vars.AZURE_COSMOS_ENDPOINT }}
   AZURE_COSMOS_DATABASE: ${{ vars.AZURE_COSMOS_DATABASE || 'aviationrag' }}
   AZURE_COSMOS_CONTAINER: ${{ vars.AZURE_COSMOS_CONTAINER || 'notams' }}
@@ -319,9 +320,10 @@ jobs:
       - name: Render Kubernetes manifests
         run: ./scripts/render-k8s-manifests.sh /tmp/k8s-rendered
 
-      - name: Apply namespace and service manifests
+      - name: Apply namespace, service account, and service manifests
         run: |
           kubectl apply -f /tmp/k8s-rendered/namespace.yaml
+          kubectl apply -f /tmp/k8s-rendered/backend-serviceaccount.yaml
           kubectl apply -f /tmp/k8s-rendered/backend-service.yaml
 
       - name: Create or update backend secrets

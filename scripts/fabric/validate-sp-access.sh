@@ -41,31 +41,59 @@ require_env "FABRIC_CLIENT_ID"
 require_env "FABRIC_CLIENT_SECRET"
 
 TOKEN_ENDPOINT="https://login.microsoftonline.com/${FABRIC_TENANT_ID}/oauth2/v2.0/token"
-SCOPE="https://api.fabric.microsoft.com/.default"
+FABRIC_SCOPE="https://api.fabric.microsoft.com/.default"
+TDS_SCOPE="https://database.windows.net/.default"
 
-echo "Requesting Fabric token with client credentials..."
-TOKEN_RESPONSE="$(curl -sS --max-time "${FABRIC_TIMEOUT_SECONDS}" \
-  --request POST "${TOKEN_ENDPOINT}" \
-  --header "Content-Type: application/x-www-form-urlencoded" \
-  --data-urlencode "client_id=${FABRIC_CLIENT_ID}" \
-  --data-urlencode "client_secret=${FABRIC_CLIENT_SECRET}" \
-  --data-urlencode "scope=${SCOPE}" \
-  --data-urlencode "grant_type=client_credentials")"
+acquire_token() {
+  local scope="$1"
+  local label="$2"
+  local response
 
-if echo "${TOKEN_RESPONSE}" | jq -e '.error' >/dev/null 2>&1; then
-  echo "Token request failed:" >&2
-  echo "${TOKEN_RESPONSE}" | jq -r '.error + ": " + (.error_description // "unknown")' >&2
+  echo "Requesting ${label} token (scope=${scope})..."
+  response="$(curl -sS --max-time "${FABRIC_TIMEOUT_SECONDS}" \
+    --request POST "${TOKEN_ENDPOINT}" \
+    --header "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "client_id=${FABRIC_CLIENT_ID}" \
+    --data-urlencode "client_secret=${FABRIC_CLIENT_SECRET}" \
+    --data-urlencode "scope=${scope}" \
+    --data-urlencode "grant_type=client_credentials")"
+
+  if echo "${response}" | jq -e '.error' >/dev/null 2>&1; then
+    echo "${label} token request failed:" >&2
+    echo "${response}" | jq -r '.error + ": " + (.error_description // "unknown")' >&2
+    return 1
+  fi
+
+  local token
+  token="$(echo "${response}" | jq -r '.access_token // empty')"
+  if [ -z "${token}" ]; then
+    echo "${label} token request did not return an access_token." >&2
+    return 1
+  fi
+
+  local expires_in
+  expires_in="$(echo "${response}" | jq -r '.expires_in // "unknown"')"
+  echo "${label} token acquired. Expires in ${expires_in} seconds."
+  echo "${token}"
+}
+
+# --- Fabric API scope (primary) ---
+FABRIC_TOKEN_OUTPUT="$(acquire_token "${FABRIC_SCOPE}" "Fabric API")" || {
+  echo "Fabric API token acquisition failed. Aborting." >&2
   exit 1
-fi
+}
+# Last line of output is the token; preceding lines are status messages.
+ACCESS_TOKEN="$(echo "${FABRIC_TOKEN_OUTPUT}" | tail -n 1)"
+echo "${FABRIC_TOKEN_OUTPUT}" | sed '$d'
 
-ACCESS_TOKEN="$(echo "${TOKEN_RESPONSE}" | jq -r '.access_token // empty')"
-if [ -z "${ACCESS_TOKEN}" ]; then
-  echo "Token request did not return an access_token." >&2
-  exit 1
-fi
-
-EXPIRES_IN="$(echo "${TOKEN_RESPONSE}" | jq -r '.expires_in // "unknown"')"
-echo "Token acquired. Expires in ${EXPIRES_IN} seconds."
+# --- TDS / Azure SQL Database scope ---
+TDS_TOKEN_OUTPUT="$(acquire_token "${TDS_SCOPE}" "TDS (database.windows.net)")" || {
+  echo ""
+  echo "WARNING: TDS scope token acquisition failed."
+  echo "  FABRIC_SQL queries using pyodbc (TDS mode) will fail with 'fabric_sql_auth_unavailable'."
+  echo "  Grant the SP the 'Azure SQL Database' API permission (https://database.windows.net) and admin-consent."
+  echo ""
+}
 
 fetch_json() {
   local url="$1"
@@ -120,4 +148,4 @@ if [ -n "${FABRIC_WORKSPACE_NAME:-}" ]; then
   echo "Workspace name check passed: ${FABRIC_WORKSPACE_NAME} (${MATCH_ID})"
 fi
 
-echo "Fabric service principal validation completed successfully."
+echo "Fabric service principal validation completed (scopes tested: Fabric API, TDS/database.windows.net)."

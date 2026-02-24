@@ -83,8 +83,40 @@ def get_runtime() -> AgentFrameworkRuntime:
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint."""
-    return jsonify({"status": "ok", "service": "aviation-rag-api"})
+    """Health check endpoint.
+
+    Query parameters:
+        detail=auth — include Fabric token status for both API and TDS scopes.
+    """
+    payload: dict = {"status": "ok", "service": "aviation-rag-api"}
+    detail = request.args.get("detail", "").lower()
+
+    if detail == "auth" and runtime is not None:
+        try:
+            from unified_retriever import _acquire_fabric_token_bundle
+
+            fabric_bundle = _acquire_fabric_token_bundle()
+            tds_bundle = _acquire_fabric_token_bundle(
+                scope="https://database.windows.net/.default",
+            )
+            payload["fabric_auth"] = {
+                "auth_mode": fabric_bundle.get("auth_mode"),
+                "auth_ready": fabric_bundle.get("auth_ready"),
+                "reason": fabric_bundle.get("reason"),
+                "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+            }
+            payload["fabric_sql_tds_auth"] = {
+                "auth_mode": tds_bundle.get("auth_mode"),
+                "auth_ready": tds_bundle.get("auth_ready"),
+                "reason": tds_bundle.get("reason"),
+                "token_ttl_seconds": tds_bundle.get("token_ttl_seconds"),
+            }
+        except Exception:
+            logger.exception("Failed to gather auth diagnostics")
+            payload["fabric_auth"] = {"error": "diagnostics_unavailable"}
+            payload["fabric_sql_tds_auth"] = {"error": "diagnostics_unavailable"}
+
+    return jsonify(payload)
 
 
 @app.route('/api/chat', methods=['POST'])

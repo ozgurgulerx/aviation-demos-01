@@ -21,7 +21,9 @@ spec:
     metadata:
       labels:
         app: aviation-rag-backend
+        azure.workload.identity/use: "true"
     spec:
+      serviceAccountName: aviation-rag-backend
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true

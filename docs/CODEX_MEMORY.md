@@ -1,12 +1,12 @@
 # Codex Memory: Tenant, Infra, and Fabric Context
 
-Last updated: 2026-02-23
+Last updated: 2026-02-24
 
 ## Freshness metadata (non-secret)
 
-- Runtime facts last verified: 2026-02-23
+- Runtime facts last verified: 2026-02-24
 - Runtime facts stale-after window: 7 days
-- Infrastructure topology last verified: 2026-02-23
+- Infrastructure topology last verified: 2026-02-24
 - Infrastructure topology stale-after window: 30 days
 - On stale/contradictory data: verify against repo truth and command output before risky execution.
 - Structure reference for future updates: `docs/CODEX_MEMORY_TEMPLATE.md`.
@@ -151,6 +151,11 @@ Current tracked status:
 
 ## Decision log (non-secret)
 
+- 2026-02-24: Rolled local `HEAD` to backend AKS and frontend App Service with baseline preflight gate.
+  - Decision: Built and pushed backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-583946c-manual-20260224074650` via `docker buildx --platform linux/amd64`, updated AKS deployment to that tag, synced frontend App Service runtime settings (including `CHAT_STREAM_TIMEOUT_MS=240000`), and deployed `/tmp/app.zip` through OneDeploy.
+  - Why: Deploy current local branch commits while preserving subscription guardrails and AKS architecture compatibility.
+  - Sources: `az account show --query "{user:user.name,tenantId:tenantId,id:id}" -o json`, `./scripts/aks/use-deploy-target-context.sh`, `./scripts/validate-tenant-lock.sh`, `docker buildx build --platform linux/amd64 -f Dockerfile.backend ... --push`, `az acr manifest list-metadata --registry avrag705508acr --name aviation-rag-backend --orderby time_desc --top 5 -o json`, `kubectl -n aviation-rag rollout status deployment/aviation-rag-backend --timeout=900s`, `az webapp deploy --resource-group rg-aviation-rag --name aviation-rag-frontend-705508 --src-path /tmp/app.zip --type zip --async true --restart true`, `az webapp log deployment list --resource-group rg-aviation-rag --name aviation-rag-frontend-705508 --query '[0].{status:status,...}' -o json`, `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/health`, `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/fabric/preflight`.
+  - Changed-from: Backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-3f1f4de-manual-20260224082048`; prior frontend OneDeploy ended `2026-02-24T07:09:23Z`.
 - 2026-02-23: Disabled Gunicorn control socket for read-only AKS pods and completed live frontend/backend rollout.
   - Decision: Added `--no-control-socket` to backend Gunicorn startup command in both `Dockerfile.backend` and `k8s/backend-deployment.yaml`, then rolled AKS backend to image tag `fix-risk-stream-20260223200655` and deployed frontend via App Service zip deploy.
   - Why: Gunicorn `25.1.0` control socket defaults to `gunicorn.ctl` under `/app`; with `readOnlyRootFilesystem=true` this caused startup probe timeouts (`Control server error: [Errno 30] Read-only file system`) and stalled backend rollout.

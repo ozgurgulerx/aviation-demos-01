@@ -128,7 +128,34 @@ def _get_fabric_bearer_token() -> str:
 _fabric_token_lock = threading.Lock()
 _fabric_token_cache: Dict[str, Dict[str, Any]] = {}  # scope -> {token, expires_at}
 
+_fabric_dac_lock = threading.Lock()
+_fabric_dac: Any = None  # lazily set to DefaultAzureCredential
+
 _FABRIC_DEFAULT_SCOPE = "https://api.fabric.microsoft.com/.default"
+
+_FABRIC_SQL_AUTH_HINT = (
+    "Fabric SQL TDS auth failed (18456). Check: (1) DefaultAzureCredential / "
+    "workload identity binding, (2) FABRIC_CLIENT_ID/SECRET/TENANT_ID "
+    "credentials, (3) SP permissions on the SQL endpoint."
+)
+
+
+def _get_fabric_dac():
+    """Thread-safe lazy singleton for DefaultAzureCredential."""
+    global _fabric_dac
+    if _fabric_dac is not None:
+        return _fabric_dac
+    with _fabric_dac_lock:
+        if _fabric_dac is not None:
+            return _fabric_dac
+        try:
+            from azure.identity import DefaultAzureCredential
+            _fabric_dac = DefaultAzureCredential()
+            logger.info("DefaultAzureCredential instance created (singleton)")
+        except Exception as exc:
+            logger.info("DefaultAzureCredential import/init failed: %s", exc)
+            _fabric_dac = None
+    return _fabric_dac
 
 
 def _fabric_token_min_ttl_seconds() -> int:
@@ -190,10 +217,49 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
     min_ttl = _fabric_token_min_ttl_seconds()
     allow_static = _allow_static_fabric_bearer()
 
-    # 1) SP client credentials (refreshable) — preferred.
+    # 0) DefaultAzureCredential (auto-refreshing, works with workload identity on AKS)
+    dac = _get_fabric_dac()
+    dac_status = "unavailable"  # default: azure.identity not installed or init failed
+    dac_error = None
+    if dac is not None:
+        try:
+            token_obj = dac.get_token(scope)
+            access_token = token_obj.token
+            ttl = int(token_obj.expires_on - time.time())
+            if ttl >= min_ttl:
+                with _fabric_token_lock:
+                    _fabric_token_cache[scope] = {"token": access_token, "expires_at": token_obj.expires_on}
+                logger.info("Fabric token via DefaultAzureCredential scope=%s ttl=%ds", scope, ttl)
+                return {
+                    "token": access_token,
+                    "auth_mode": "default_azure_credential",
+                    "reason": "dac",
+                    "token_ttl_seconds": ttl,
+                    "auth_ready": True,
+                    "dac_status": "active",
+                }
+            dac_status = "active"  # DAC works but token TTL too low
+            dac_error = f"token_ttl_below_min({ttl}s<{min_ttl}s)"
+        except Exception as dac_exc:
+            dac_status = "failed"
+            dac_error = str(dac_exc)
+            logger.info("DefaultAzureCredential failed for scope=%s: %s, falling back to SP", scope, dac_exc)
+    else:
+        dac_error = "azure.identity not available or DefaultAzureCredential init failed"
+
+    # 1) SP client credentials (refreshable) — fallback when DAC unavailable.
     client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
     client_secret = os.getenv("FABRIC_CLIENT_SECRET", "").strip()
     tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
+    static_token = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+
+    logger.debug(
+        "Fabric token acquisition: sp_configured=%s static_configured=%s static_allowed=%s scope=%s",
+        bool(client_id and client_secret and tenant_id),
+        bool(static_token),
+        allow_static,
+        scope,
+    )
     if client_id and client_secret and tenant_id:
         with _fabric_token_lock:
             entry = _fabric_token_cache.get(scope, {})
@@ -207,6 +273,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
                     "reason": "cached",
                     "token_ttl_seconds": ttl,
                     "auth_ready": True,
+                    "dac_status": dac_status,
+                    **({"dac_error": dac_error} if dac_error else {}),
                 }
 
             token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
@@ -219,8 +287,25 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
             req = urllib.request.Request(token_url, data=body, method="POST")
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read())
+                max_retries = 2
+                for attempt in range(1 + max_retries):
+                    try:
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            data = json.loads(resp.read())
+                        break
+                    except (urllib.error.URLError, urllib.error.HTTPError) as url_exc:
+                        is_server_error = isinstance(url_exc, urllib.error.HTTPError) and url_exc.code >= 500
+                        is_transient = not isinstance(url_exc, urllib.error.HTTPError) or is_server_error
+                        if not is_transient or attempt == max_retries:
+                            raise
+                        logger.warning(
+                            "Fabric SP token request transient failure (attempt %d/%d, scope=%s): %s",
+                            attempt + 1, 1 + max_retries, scope, url_exc,
+                        )
+                        time.sleep(0.5 * (attempt + 1))
+                        # Rebuild the request — urlopen consumes the body
+                        req = urllib.request.Request(token_url, data=body, method="POST")
+                        req.add_header("Content-Type", "application/x-www-form-urlencoded")
                 access_token = data["access_token"]
                 expires_in = int(data.get("expires_in", 3600))
                 ttl = _token_ttl_seconds(access_token)
@@ -231,6 +316,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
                         "reason": "sp_token_near_expiry",
                         "token_ttl_seconds": ttl,
                         "auth_ready": False,
+                        "dac_status": dac_status,
+                        **({"dac_error": dac_error} if dac_error else {}),
                     }
                 _fabric_token_cache[scope] = {
                     "token": access_token,
@@ -243,6 +330,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
                     "reason": "refreshed",
                     "token_ttl_seconds": int(ttl if ttl is not None else expires_in),
                     "auth_ready": True,
+                    "dac_status": dac_status,
+                    **({"dac_error": dac_error} if dac_error else {}),
                 }
             except Exception as exc:
                 logger.warning("MSAL token acquisition failed (scope=%s): %s", scope, exc)
@@ -254,6 +343,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
                         "reason": "cached_after_refresh_failure",
                         "token_ttl_seconds": int(ttl if ttl is not None else max(0, int(expires - time.time()))),
                         "auth_ready": (ttl is None) or (ttl >= min_ttl),
+                        "dac_status": dac_status,
+                        **({"dac_error": dac_error} if dac_error else {}),
                     }
                 return {
                     "token": "",
@@ -261,6 +352,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
                     "reason": f"sp_token_acquisition_failed:{exc}",
                     "token_ttl_seconds": None,
                     "auth_ready": False,
+                    "dac_status": dac_status,
+                    **({"dac_error": dac_error} if dac_error else {}),
                 }
 
     # 2) Optional static bearer fallback (explicit opt-in only).
@@ -272,6 +365,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
             "reason": "static_bearer_disabled",
             "token_ttl_seconds": _token_ttl_seconds(static),
             "auth_ready": False,
+            "dac_status": dac_status,
+            **({"dac_error": dac_error} if dac_error else {}),
         }
     if static and allow_static:
         ttl = _token_ttl_seconds(static)
@@ -283,6 +378,8 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
                 "reason": reason,
                 "token_ttl_seconds": ttl,
                 "auth_ready": False,
+                "dac_status": dac_status,
+                **({"dac_error": dac_error} if dac_error else {}),
             }
         return {
             "token": static,
@@ -290,20 +387,46 @@ def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str
             "reason": "static_bearer_allowed",
             "token_ttl_seconds": ttl,
             "auth_ready": True,
+            "dac_status": dac_status,
+            **({"dac_error": dac_error} if dac_error else {}),
         }
 
+    missing_vars = [
+        v for v in ("FABRIC_CLIENT_ID", "FABRIC_CLIENT_SECRET", "FABRIC_TENANT_ID")
+        if not os.getenv(v, "").strip()
+    ]
+    logger.warning(
+        "Fabric auth not configured — no SP credentials and no static bearer. "
+        "Missing env vars: %s  scope=%s",
+        ", ".join(missing_vars) or "none",
+        scope,
+    )
     return {
         "token": "",
         "auth_mode": "none",
         "reason": "fabric_auth_not_configured",
         "token_ttl_seconds": None,
         "auth_ready": False,
+        "dac_status": dac_status,
+        **({"dac_error": dac_error} if dac_error else {}),
     }
 
 
 def _acquire_fabric_token(scope: str = _FABRIC_DEFAULT_SCOPE) -> str:
     bundle = _acquire_fabric_token_bundle(scope)
+    if not bundle.get("auth_ready"):
+        logger.warning(
+            "Fabric token not auth_ready (reason=%s, auth_mode=%s) — returning empty token",
+            bundle.get("reason"), bundle.get("auth_mode"),
+        )
+        return ""
     return str(bundle.get("token") or "")
+
+
+def _invalidate_fabric_token_cache(scope: str = _FABRIC_DEFAULT_SCOPE) -> None:
+    """Remove cached token for *scope* so the next acquire triggers a fresh fetch."""
+    with _fabric_token_lock:
+        _fabric_token_cache.pop(scope, None)
 
 
 @dataclass
@@ -823,7 +946,27 @@ class UnifiedRetriever:
             timeout_seconds=timeout_seconds if timeout_seconds is not None else 30.0,
         )
         if isinstance(response, dict) and response.get("error"):
-            return [], str(response.get("error"))
+            error_code = str(response.get("error"))
+            detail = str(response.get("detail") or "")[:500]
+            enriched = f"{error_code}:{detail}" if detail else error_code
+
+            # On 401: invalidate cached token, re-acquire, and retry once.
+            if error_code == "http_401":
+                logger.warning("KQL 401 — invalidating token cache and retrying (scope=%s)", kusto_scope)
+                _invalidate_fabric_token_cache(kusto_scope)
+                retry_response = self._post_json(
+                    kql_endpoint,
+                    {"db": db_name, "csl": csl},
+                    token_scope=kusto_scope,
+                    timeout_seconds=timeout_seconds if timeout_seconds is not None else 30.0,
+                )
+                if isinstance(retry_response, dict) and retry_response.get("error"):
+                    retry_detail = str(retry_response.get("detail") or "")[:500]
+                    retry_enriched = f"{retry_response['error']}:{retry_detail}" if retry_detail else str(retry_response["error"])
+                    return [], f"{retry_enriched} (retry_after_401)"
+                response = retry_response
+            else:
+                return [], enriched
 
         # v1 response: {"Tables": [{"TableName": ..., "Columns": [...], "Rows": [[...]]}]}
         if isinstance(response, dict) and "Tables" in response:
@@ -1248,12 +1391,13 @@ class UnifiedRetriever:
             else:
                 auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("KQL")
                 if not auth_ready:
+                    no_token = not auth_bundle.get("token")
                     source_caps["KQL"] = self._source_capability_payload(
                         source="KQL",
-                        status="degraded",
+                        status="unavailable" if no_token else "degraded",
                         reason_code="fabric_auth_unavailable",
                         detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
-                        execution_mode="live",
+                        execution_mode="blocked" if no_token else "live",
                     )
                 else:
                     source_caps["KQL"] = self._source_capability_payload(
@@ -1266,12 +1410,13 @@ class UnifiedRetriever:
         else:
             auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("KQL")
             if not auth_ready:
+                no_token = not auth_bundle.get("token")
                 source_caps["KQL"] = self._source_capability_payload(
                     source="KQL",
-                    status="degraded",
+                    status="unavailable" if no_token else "degraded",
                     reason_code="fabric_auth_unavailable",
                     detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
-                    execution_mode="live",
+                    execution_mode="blocked" if no_token else "live",
                 )
             else:
                 source_caps["KQL"] = self._source_capability_payload(
@@ -1723,14 +1868,24 @@ class UnifiedRetriever:
         token = str(token_bundle.get("token") or "")
         if token:
             req.add_header("Authorization", f"Bearer {token}")
+        def _probe_auth_fields() -> Dict[str, Any]:
+            fields: Dict[str, Any] = {
+                "auth_mode": str(token_bundle.get("auth_mode") or "none"),
+                "auth_ready": bool(token_bundle.get("auth_ready")),
+                "token_ttl_seconds": token_bundle.get("token_ttl_seconds"),
+                "dac_status": str(token_bundle.get("dac_status") or "unknown"),
+            }
+            dac_err = token_bundle.get("dac_error")
+            if dac_err:
+                fields["dac_error"] = dac_err
+            return fields
+
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 return {
                     "status": "pass",
                     "detail": f"reachable_http_{resp.status}",
-                    "auth_mode": str(token_bundle.get("auth_mode") or "none"),
-                    "auth_ready": bool(token_bundle.get("auth_ready")),
-                    "token_ttl_seconds": token_bundle.get("token_ttl_seconds"),
+                    **_probe_auth_fields(),
                 }
         except urllib.error.HTTPError as exc:
             # Treat auth and method errors as reachable endpoint.
@@ -1738,24 +1893,18 @@ class UnifiedRetriever:
                 return {
                     "status": "warn",
                     "detail": f"reachable_http_{exc.code}",
-                    "auth_mode": str(token_bundle.get("auth_mode") or "none"),
-                    "auth_ready": bool(token_bundle.get("auth_ready")),
-                    "token_ttl_seconds": token_bundle.get("token_ttl_seconds"),
+                    **_probe_auth_fields(),
                 }
             return {
                 "status": "fail",
                 "detail": f"http_{exc.code}",
-                "auth_mode": str(token_bundle.get("auth_mode") or "none"),
-                "auth_ready": bool(token_bundle.get("auth_ready")),
-                "token_ttl_seconds": token_bundle.get("token_ttl_seconds"),
+                **_probe_auth_fields(),
             }
         except Exception as exc:
             return {
                 "status": "fail",
                 "detail": str(exc),
-                "auth_mode": str(token_bundle.get("auth_mode") or "none"),
-                "auth_ready": bool(token_bundle.get("auth_ready")),
-                "token_ttl_seconds": token_bundle.get("token_ttl_seconds"),
+                **_probe_auth_fields(),
             }
 
     def fabric_preflight(self) -> Dict[str, Any]:
@@ -1780,6 +1929,8 @@ class UnifiedRetriever:
         fabric_bundle = _acquire_fabric_token_bundle()
         fabric_token = str(fabric_bundle.get("token") or "")
         token_status = "pass" if fabric_bundle.get("auth_ready") else "fail"
+        dac_status_val = str(fabric_bundle.get("dac_status") or "unknown")
+        dac_error_val = fabric_bundle.get("dac_error")
         checks.append(
             {
                 "name": "fabric_bearer_token",
@@ -1787,20 +1938,25 @@ class UnifiedRetriever:
                 "detail": str(fabric_bundle.get("reason") or ("present" if fabric_token else "missing_optional_or_not_configured")),
                 "mode": "n/a",
                 "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+                "dac_status": dac_status_val,
+                **({"dac_error": dac_error_val} if dac_error_val else {}),
             }
         )
         auth_mode_effective = str(fabric_bundle.get("auth_mode") or "none")
         auth_ready = bool(fabric_bundle.get("auth_ready") and fabric_token)
+        auth_mode_pass = auth_mode_effective in {"sp_client_credentials", "default_azure_credential"} and auth_ready
         checks.append(
             {
                 "name": "fabric_auth_mode",
-                "status": "pass" if auth_mode_effective == "sp_client_credentials" and auth_ready else ("warn" if auth_mode_effective == "static_bearer" else "fail"),
+                "status": "pass" if auth_mode_pass else ("warn" if auth_mode_effective == "static_bearer" else "fail"),
                 "detail": auth_mode_effective,
                 "mode": "policy",
                 "auth_mode_effective": auth_mode_effective,
                 "auth_ready": auth_ready,
                 "allow_static_bearer": _allow_static_fabric_bearer(),
                 "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+                "dac_status": dac_status_val,
+                **({"dac_error": dac_error_val} if dac_error_val else {}),
             }
         )
         checks.append(
@@ -3160,12 +3316,19 @@ class UnifiedRetriever:
                     dataset="fabric-eventhouse",
                 )
                 return rows, [citation]
+            error_extra: Dict[str, Any] = {"csl": csl}
+            if error and "http_401" in error:
+                error_extra["auth_hint"] = (
+                    "KQL auth failed (HTTP 401). Check: (1) DefaultAzureCredential / "
+                    "workload identity binding, (2) FABRIC_CLIENT_ID/SECRET/TENANT_ID "
+                    "credentials, (3) SP permissions on the Kusto database."
+                )
             return [
                 self._source_error_row(
                     source="KQL",
                     code="kql_runtime_error",
                     detail=error or "kql_query_returned_no_rows",
-                    extra={"csl": csl},
+                    extra=error_extra,
                 )
             ], []
         else:
@@ -3565,22 +3728,32 @@ Notes:
         token_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
         token = str(token_bundle.get("token") or "")
         if not token or not bool(token_bundle.get("auth_ready")):
-            detail = str(token_bundle.get("reason") or "fabric_sql_tds_auth_not_ready")
-            return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {"sql": sql})], []
+            # Retry once: invalidate cache and re-acquire (mirrors KQL 401 pattern)
+            logger.warning("FABRIC_SQL auth not ready — invalidating cache and retrying (scope=%s)", sql_token_scope)
+            _invalidate_fabric_token_cache(sql_token_scope)
+            token_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
+            token = str(token_bundle.get("token") or "")
+            if not token or not bool(token_bundle.get("auth_ready")):
+                detail = str(token_bundle.get("reason") or "fabric_sql_tds_auth_not_ready")
+                return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
+                    "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+                })], []
         token_aud = str(_decode_jwt_payload(token).get("aud") or "")
         if token_aud and "database.windows.net" not in token_aud:
             detail = f"fabric_sql_tds_invalid_token_audience:{token_aud}"
-            return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {"sql": sql})], []
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
+                "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+            })], []
 
         connect_timeout = _env_int("FABRIC_SQL_TDS_CONNECT_TIMEOUT_SECONDS", 10, minimum=1)
         query_timeout = _env_int("FABRIC_SQL_TDS_QUERY_TIMEOUT_SECONDS", 15, minimum=1)
 
-        try:
-            import pyodbc
-            import struct
-            encoded = token.encode("UTF-16-LE")
-            token_bytes = struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
+        import pyodbc
+        import struct
 
+        def _tds_connect_and_query(tok: str) -> tuple:
+            encoded = tok.encode("UTF-16-LE")
+            token_bytes = struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
             conn_str = (
                 f"Driver={{ODBC Driver 18 for SQL Server}};"
                 f"Server={server},1433;"
@@ -3590,17 +3763,37 @@ Notes:
                 f"Connection Timeout={connect_timeout};"
             )
             conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=connect_timeout)
-            cursor = conn.cursor()
-            cursor.timeout = query_timeout
-            cursor.execute(sql)
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            cur = conn.cursor()
+            cur.timeout = query_timeout
+            cur.execute(sql)
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            result = [dict(zip(cols, r)) for r in cur.fetchall()]
             conn.close()
+            return result
+
+        try:
+            rows = _tds_connect_and_query(token)
         except Exception as exc:
             detail = str(exc)
             if "18456" in detail:
-                return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {"sql": sql})], []
-            return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", detail, {"sql": sql})], []
+                # Stale token — invalidate cache, re-acquire, retry once (mirrors KQL 401 pattern)
+                logger.warning("FABRIC_SQL 18456 — invalidating token cache and retrying (scope=%s)", sql_token_scope)
+                _invalidate_fabric_token_cache(sql_token_scope)
+                retry_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
+                retry_token = str(retry_bundle.get("token") or "")
+                if not retry_token or not bool(retry_bundle.get("auth_ready")):
+                    return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
+                        "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+                    })], []
+                try:
+                    rows = _tds_connect_and_query(retry_token)
+                except Exception as retry_exc:
+                    retry_detail = str(retry_exc)
+                    return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", f"{retry_detail} (retry_after_18456)", {
+                        "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+                    })], []
+            else:
+                return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", detail, {"sql": sql})], []
 
         if not rows:
             return [self._source_error_row("FABRIC_SQL", "fabric_sql_no_rows", "query returned no rows", {"sql": sql})], []

@@ -59,6 +59,7 @@ TARGET_SUBSCRIPTION_ID="6a539906-6ce2-4e3b-84ee-89f701de18d8"
 : "${FABRIC_SQL_SERVER:=}"
 : "${FABRIC_SQL_DATABASE:=}"
 : "${FABRIC_SQL_MODE:=auto}"
+: "${FABRIC_WORKLOAD_IDENTITY_CLIENT_ID:=}"
 : "${AZURE_COSMOS_ENDPOINT:=}"
 : "${AZURE_COSMOS_DATABASE:=aviationrag}"
 : "${AZURE_COSMOS_CONTAINER:=notams}"
@@ -92,7 +93,7 @@ export FABRIC_KQL_ENDPOINT FABRIC_KUSTO_CLUSTER_URL FABRIC_KQL_DATABASE FABRIC_G
 export FABRIC_GRAPH_DATABASE GRAPH_TIMEOUT_SECONDS GRAPH_MAX_RETRIES
 export GRAPH_RETRY_BACKOFF_SECONDS GRAPH_CIRCUIT_BREAKER_FAIL_THRESHOLD GRAPH_CIRCUIT_BREAKER_OPEN_SECONDS
 export ALLOW_SHARED_FABRIC_ENDPOINTS ALLOW_STATIC_FABRIC_BEARER FABRIC_TOKEN_MIN_TTL_SECONDS
-export FABRIC_SQL_ENDPOINT FABRIC_SQL_SERVER FABRIC_SQL_DATABASE FABRIC_SQL_MODE
+export FABRIC_SQL_ENDPOINT FABRIC_SQL_SERVER FABRIC_SQL_DATABASE FABRIC_SQL_MODE FABRIC_WORKLOAD_IDENTITY_CLIENT_ID
 export AZURE_COSMOS_ENDPOINT AZURE_COSMOS_DATABASE AZURE_COSMOS_CONTAINER
 export BACKEND_INGRESS_HOST ALLOWED_ORIGIN
 export EXPECTED_RUNTIME_ACCOUNT_UPN EXPECTED_RUNTIME_TENANT_ID EXPECTED_RUNTIME_SUBSCRIPTION_ID
@@ -152,7 +153,7 @@ done
 
 mkdir -p "${OUT_DIR}"
 
-for manifest in namespace.yaml backend-service.yaml backend-configmap.yaml backend-deployment.yaml backend-ingress.yaml backend-networkpolicy.yaml backend-pdb.yaml; do
+for manifest in namespace.yaml backend-serviceaccount.yaml backend-service.yaml backend-configmap.yaml backend-deployment.yaml backend-ingress.yaml backend-networkpolicy.yaml backend-pdb.yaml; do
   src="${K8S_DIR}/${manifest}"
   [ -f "${src}" ] || continue
   envsubst < "${src}" > "${OUT_DIR}/${manifest}"
