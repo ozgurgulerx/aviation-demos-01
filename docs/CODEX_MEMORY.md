@@ -151,6 +151,16 @@ Current tracked status:
 
 ## Decision log (non-secret)
 
+- 2026-02-24: Patched predictive API stability gaps and Fabric MI env compatibility.
+  - Decision: Fixed predictive delays to use a forward-looking window (`NOW()` to `NOW()+window`), preserved explicit `0.0` KPI deltas in predictive metrics, made predictive Postgres SSL/GSS behavior environment-driven (`PGSSLMODE`/`PGGSSENCMODE`), and added compatibility bridging so backend runtime can resolve MI client ID from either `FABRIC_MANAGED_IDENTITY_CLIENT_ID` or legacy `FABRIC_WORKLOAD_IDENTITY_CLIENT_ID`; aligned deploy workflow/configmap/render exports to pass both paths.
+  - Why: Prevent incorrect predictive panel data selection, avoid KPI misreporting, reduce local mirror false degradation, and keep managed-identity pinning deterministic after rollout.
+  - Sources: `src/predictive_delay_service.py`, `src/unified_retriever.py`, `.github/workflows/deploy-backend.yaml`, `k8s/backend-configmap.yaml`, `scripts/render-k8s-manifests.sh`, `tests/test_predictive_delay_service.py`.
+  - Changed-from: Predictive delay query used `std_utc >= now-window`, uplift deltas used falsy `or` fallback, predictive DB connector forced `sslmode=require`, and MI pinning depended on only one env var name.
+- 2026-02-24: Deployed frontend-only undeployed commit set after backend parity check.
+  - Decision: Confirmed backend image already matched deployed backend commit (`498c8bf`), then deployed frontend changes from `63a05cc` (plus memory-only `6ff84f9`) by rebuilding Next.js, packaging standalone output to `/tmp/app.zip`, and running App Service OneDeploy (`deploymentId=d705a574-5368-4a83-97ce-dfb383a276d5`, `status=RuntimeSuccessful`).
+  - Why: Publish follow-up chip UX changes without unnecessary backend redeploy.
+  - Sources: `git log --oneline -n 8`, `git diff --name-only 498c8bf..HEAD`, `kubectl -n aviation-rag get deployment aviation-rag-backend -o jsonpath=...`, `./scripts/validate-tenant-lock.sh`, `az account show --query "{user:user.name,tenantId:tenantId,id:id,name:name}" -o json`, `cd src && npm run build`, `az webapp deploy --resource-group rg-aviation-rag --name aviation-rag-frontend-705508 --src-path /tmp/app.zip --type zip --async true --restart true`, `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/health`, `curl https://aviation-rag-frontend-705508.azurewebsites.net/api/fabric/preflight`.
+  - Changed-from: Prior frontend deployment `deploymentId=86df6239-fe94-4d33-bcfb-a7157a516fb1`.
 - 2026-02-24: Deployed latest undeployed commits (`f7512f3`, `498c8bf`) to backend AKS and frontend App Service.
   - Decision: Built and pushed backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-498c8bf-manual-20260224164020` from committed `HEAD` (`498c8bf`) using `docker buildx --platform linux/amd64`, verified ACR manifest metadata (`os=linux`, `architecture=amd64`), rolled AKS deployment `aviation-rag-backend` to the new tag, rebuilt frontend (`npm run build`), packaged standalone output to `/tmp/app.zip`, and deployed frontend via App Service OneDeploy (`deploymentId=86df6239-fe94-4d33-bcfb-a7157a516fb1`, `status=RuntimeSuccessful`).
   - Why: Publish the new FollowUpChips fixes and predictive-ops dark-launch additions while preserving tenant/subscription and `amd64` platform guardrails.

@@ -127,15 +127,21 @@ class PredictiveDelayService:
         host = os.getenv("PGHOST", "").strip()
         if not host:
             raise RuntimeError("pg_host_not_configured")
-        conn = psycopg2.connect(
+        sslmode = (os.getenv("PGSSLMODE", "prefer") or "prefer").strip()
+        gssencmode = (os.getenv("PGGSSENCMODE", "") or "").strip()
+        connect_kwargs = dict(
             host=host,
             port=int(os.getenv("PGPORT", "5432")),
             database=os.getenv("PGDATABASE", "aviationrag"),
             user=os.getenv("PGUSER"),
             password=os.getenv("PGPASSWORD"),
-            sslmode="require",
             connect_timeout=5,
         )
+        if sslmode:
+            connect_kwargs["sslmode"] = sslmode
+        if gssencmode:
+            connect_kwargs["gssencmode"] = gssencmode
+        conn = psycopg2.connect(**connect_kwargs)
         conn.autocommit = True
         return conn
 
@@ -199,7 +205,8 @@ class PredictiveDelayService:
                         params.append(safe_model)
 
                     if "std_utc" in columns:
-                        where.append('"std_utc" >= (NOW() AT TIME ZONE \'UTC\') - (%s * INTERVAL \'1 hour\')')
+                        where.append('"std_utc" >= NOW()')
+                        where.append('"std_utc" <= NOW() + (%s * INTERVAL \'1 hour\')')
                         params.append(safe_window)
 
                     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
@@ -318,22 +325,22 @@ class PredictiveDelayService:
                         "mae": _to_float(_pick(row, ("optimized_mae", "mae_optimized"))),
                     }
 
+                    auroc_delta = _to_float(_pick(row, ("auroc_delta",)))
+                    if auroc_delta is None and optimized["auroc"] is not None and baseline["auroc"] is not None:
+                        auroc_delta = optimized["auroc"] - baseline["auroc"]
+
+                    brier_delta = _to_float(_pick(row, ("brier_delta",)))
+                    if brier_delta is None and optimized["brier"] is not None and baseline["brier"] is not None:
+                        brier_delta = optimized["brier"] - baseline["brier"]
+
+                    mae_delta = _to_float(_pick(row, ("mae_delta",)))
+                    if mae_delta is None and optimized["mae"] is not None and baseline["mae"] is not None:
+                        mae_delta = optimized["mae"] - baseline["mae"]
+
                     uplift = {
-                        "auroc_delta": _to_float(_pick(row, ("auroc_delta",))) or (
-                            (optimized["auroc"] - baseline["auroc"])
-                            if optimized["auroc"] is not None and baseline["auroc"] is not None
-                            else None
-                        ),
-                        "brier_delta": _to_float(_pick(row, ("brier_delta",))) or (
-                            (optimized["brier"] - baseline["brier"])
-                            if optimized["brier"] is not None and baseline["brier"] is not None
-                            else None
-                        ),
-                        "mae_delta": _to_float(_pick(row, ("mae_delta",))) or (
-                            (optimized["mae"] - baseline["mae"])
-                            if optimized["mae"] is not None and baseline["mae"] is not None
-                            else None
-                        ),
+                        "auroc_delta": auroc_delta,
+                        "brier_delta": brier_delta,
+                        "mae_delta": mae_delta,
                     }
 
                     return {
@@ -490,4 +497,3 @@ class PredictiveDelayService:
                 "Unable to query predictive decision metrics.",
                 extra={"error": str(exc), "metrics": {}},
             )
-

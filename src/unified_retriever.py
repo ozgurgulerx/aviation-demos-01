@@ -70,7 +70,10 @@ FABRIC_KUSTO_CLUSTER_URL = os.getenv("FABRIC_KUSTO_CLUSTER_URL", "").strip()
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 FABRIC_GRAPH_DATABASE = os.getenv("FABRIC_GRAPH_DATABASE", "").strip()
 FABRIC_SQL_DATABASE = os.getenv("FABRIC_SQL_DATABASE", "").strip()
-FABRIC_MANAGED_IDENTITY_CLIENT_ID = os.getenv("FABRIC_MANAGED_IDENTITY_CLIENT_ID", "").strip()
+FABRIC_MANAGED_IDENTITY_CLIENT_ID = (
+    os.getenv("FABRIC_MANAGED_IDENTITY_CLIENT_ID", "").strip()
+    or os.getenv("FABRIC_WORKLOAD_IDENTITY_CLIENT_ID", "").strip()
+)
 
 GUARDRAIL_ACCOUNT_UPN = "admin@MngEnvMCAP705508.onmicrosoft.com"
 GUARDRAIL_TENANT_ID = "52095a81-130f-4b06-83f1-9859b2c73de6"
@@ -105,6 +108,8 @@ _KQL_ALLOWED_FUNCTIONS = {
     "datetime", "datetime_utc_to_local",
 }
 
+_TSQL_PARAMETER_PLACEHOLDER_RE = re.compile(r"(?<!@)@[A-Za-z_]\w*")
+
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     raw = os.getenv(name)
@@ -127,6 +132,10 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 def _get_fabric_bearer_token() -> str:
     """Re-read bearer token from env on each call so rotated tokens take effect."""
     return os.getenv("FABRIC_BEARER_TOKEN", "")
+
+
+def _contains_tsql_parameter_placeholders(sql: str) -> bool:
+    return bool(_TSQL_PARAMETER_PLACEHOLDER_RE.search(str(sql or "")))
 
 
 _fabric_token_lock = threading.Lock()
@@ -2709,8 +2718,9 @@ class UnifiedRetriever:
         _crew_terms = frozenset({"crew", "duty", "fatigue", "legality", "captain", "first officer", "cabin"})
         _baggage_terms = frozenset({"baggage", "bag", "mishandled", "luggage"})
         _mel_terms = frozenset({"mel", "techlog", "tech log", "technical log", "minimum equipment",
-                                "dispatch", "dispatchab", "deferred", "jasc", "airworth"})
-        _chain_terms = frozenset({"dependency", "chain", "trace", "depend", "linked", "connection", "multi-table", "cross-table"})
+                                "dispatch", "dispatchable", "deferred", "jasc", "airworthiness"})
+        _chain_terms = frozenset({"dependency", "dependencies", "chain", "trace", "depends", "dependent",
+                                  "linked", "connection", "multi-table", "cross-table"})
 
         flight_leg_cols = tables.get("ops_flight_legs", set()) | tables.get("demo.ops_flight_legs", set())
         milestone_cols = tables.get("ops_turnaround_milestones", set()) | tables.get("demo.ops_turnaround_milestones", set())
@@ -4140,7 +4150,7 @@ class UnifiedRetriever:
             return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
 
         # Post-generation guard: reject @parameter placeholders (T-SQL inline only)
-        if re.search(r"@[A-Z]\w+", sql):
+        if _contains_tsql_parameter_placeholders(sql):
             logger.warning("FABRIC_SQL TDS: generated SQL contains @parameters, falling to heuristic")
             sql = "-- NEED_SCHEMA (parameterized)"
 
@@ -4276,7 +4286,7 @@ class UnifiedRetriever:
             return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
 
         # Post-generation guard: reject @parameter placeholders (T-SQL inline only)
-        if re.search(r"@[A-Z]\w+", sql):
+        if _contains_tsql_parameter_placeholders(sql):
             logger.warning("FABRIC_SQL REST: generated SQL contains @parameters, falling to heuristic")
             sql = "-- NEED_SCHEMA (parameterized)"
 
