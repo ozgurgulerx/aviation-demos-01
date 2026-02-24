@@ -66,8 +66,14 @@ export function ChatThread({
   const [expandedCategory, setExpandedCategory] = useState<QueryType | null>(null);
   const reducedMotion = useReducedMotion();
 
+  const lastScrollRef = useRef(0);
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth" });
+    const now = Date.now();
+    // During streaming, throttle scroll calls to every 150ms
+    if (streamingContent && now - lastScrollRef.current < 150) return;
+    lastScrollRef.current = now;
+    bottomRef.current?.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "end" });
   }, [messages, streamingContent, reducedMotion]);
 
   return (
@@ -170,7 +176,7 @@ export function ChatThread({
 
         <div ref={bottomRef} className="h-1" />
         {messages.length > 0 && (
-          <div className="min-h-[40vh]" aria-hidden="true" />
+          <div className="min-h-[10vh]" aria-hidden="true" />
         )}
       </div>
     </ScrollArea>
