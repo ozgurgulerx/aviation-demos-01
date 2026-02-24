@@ -238,3 +238,98 @@ export const SourceHealthSchema = z.object({
   mode: z.enum(["live", "fallback", "unknown"]).optional(),
   freshness: z.string().optional(),
 });
+
+// Predictive Optimization Types
+export interface PredictiveDelayRow {
+  flight_leg_id: string;
+  flight_number: string;
+  origin: string;
+  dest: string;
+  std_utc?: string | null;
+  risk_a15?: number | null;
+  expected_delay_minutes?: number | null;
+  prediction_interval?: {
+    low?: number | null;
+    high?: number | null;
+  };
+  top_drivers?: string[];
+  model_variant?: "baseline" | "optimized" | string;
+  model_version?: string | null;
+  data_freshness?: string | null;
+  degraded_sources?: string[];
+}
+
+export interface PredictiveDelaysResponse {
+  status: "ok" | "empty" | "degraded" | "disabled" | "error";
+  enabled?: boolean;
+  message?: string;
+  error?: string;
+  model?: "baseline" | "optimized" | string;
+  window_hours?: number;
+  as_of_utc?: string;
+  row_count?: number;
+  rows: PredictiveDelayRow[];
+}
+
+export interface PredictiveMetricsResponse {
+  status: "ok" | "degraded" | "disabled" | "error";
+  enabled?: boolean;
+  message?: string;
+  error?: string;
+  as_of_utc?: string;
+  sample_window?: string | null;
+  baseline?: {
+    auroc?: number | null;
+    brier?: number | null;
+    mae?: number | null;
+  };
+  optimized?: {
+    auroc?: number | null;
+    brier?: number | null;
+    mae?: number | null;
+  };
+  uplift?: {
+    auroc_delta?: number | null;
+    brier_delta?: number | null;
+    mae_delta?: number | null;
+  };
+}
+
+export interface PredictiveActionRow {
+  flight_leg_id: string;
+  flight_number: string;
+  action_rank?: number | null;
+  action_code?: string | null;
+  action_label?: string | null;
+  expected_delta_minutes?: number | null;
+  feasibility_status?: string | null;
+  confidence_band?: string | null;
+  constraint_notes?: string | null;
+  model_variant?: "baseline" | "optimized" | string;
+}
+
+export interface PredictiveActionsResponse {
+  status: "ok" | "empty" | "degraded" | "disabled" | "error";
+  enabled?: boolean;
+  message?: string;
+  error?: string;
+  model?: "baseline" | "optimized" | string;
+  as_of_utc?: string;
+  row_count?: number;
+  actions: PredictiveActionRow[];
+}
+
+export interface PredictiveDecisionMetricsResponse {
+  status: "ok" | "degraded" | "disabled" | "error";
+  enabled?: boolean;
+  message?: string;
+  error?: string;
+  as_of_utc?: string;
+  metrics?: {
+    total_decisions?: number;
+    override_count?: number;
+    approved_count?: number;
+    feasible_count?: number;
+    model_variant_count?: number;
+  };
+}

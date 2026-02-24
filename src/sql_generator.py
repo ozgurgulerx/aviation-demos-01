@@ -154,6 +154,39 @@ Columns (all stored as TEXT — cast before arithmetic/comparison):
 ### ops_graph_edges
 Columns (all TEXT):
 - src_type, src_id, edge_type, dst_type, dst_id
+
+## Foreign Key Relationships
+- ops_turnaround_milestones.leg_id -> ops_flight_legs.leg_id
+- ops_crew_rosters.leg_id -> ops_flight_legs.leg_id
+- ops_mel_techlog_events.leg_id -> ops_flight_legs.leg_id
+- ops_baggage_events.leg_id -> ops_flight_legs.leg_id
+
+IMPORTANT: carrier_code, flight_no, tailnum, distance_nm are columns of ops_flight_legs — there is NO separate "flights" table.
+
+## JOIN Examples
+
+-- Flight leg with crew:
+SELECT l.leg_id, l.carrier_code, l.flight_no, l.tailnum, c.crew_id, c.role
+FROM ops_flight_legs l
+JOIN ops_crew_rosters c ON c.leg_id = l.leg_id
+LIMIT 20;
+
+-- Flight leg with MEL/techlog events:
+SELECT l.leg_id, l.carrier_code, l.flight_no, t.jasc_code, t.mel_category, t.severity
+FROM ops_flight_legs l
+JOIN ops_mel_techlog_events t ON t.leg_id = l.leg_id
+LIMIT 20;
+
+-- Multi-table dependency chain (flight + crew + milestones + MEL):
+SELECT l.leg_id, l.carrier_code, l.flight_no, l.tailnum,
+       c.crew_id, c.role,
+       m.milestone, m.delay_cause_code,
+       t.jasc_code, t.mel_category
+FROM ops_flight_legs l
+LEFT JOIN ops_crew_rosters c ON c.leg_id = l.leg_id
+LEFT JOIN ops_turnaround_milestones m ON m.leg_id = l.leg_id
+LEFT JOIN ops_mel_techlog_events t ON t.leg_id = l.leg_id
+LIMIT 50;
 """
 
 SYSTEM_PROMPT = f"""You are an expert SQL generator for an aviation safety database.
@@ -171,6 +204,8 @@ Generate SQL queries based on natural language questions.
 7. Never generate INSERT/UPDATE/DELETE/DDL statements
 8. All ops_* and demo.ops_* timestamp TEXT columns (ending in _utc) must be cast via column::timestamptz before comparison with dates, timestamps, or NOW(). Example: WHERE duty_end_utc::timestamptz >= NOW()
 9. All ops_* and demo.ops_* numeric TEXT columns (dep_delay_min, arr_delay_min, cumulative_duty_hours, legality_risk_flag, bag_count, distance_nm, passengers, deferred_flag, length_ft, width_ft, elevation_ft) must be cast via column::numeric or column::integer for any arithmetic, aggregation (SUM, AVG, MIN, MAX), or comparison. Example: AVG(dep_delay_min::numeric), SUM(legality_risk_flag::integer)
+10. All ops_* child tables (ops_turnaround_milestones, ops_crew_rosters, ops_mel_techlog_events, ops_baggage_events) join to ops_flight_legs via leg_id. There is NO separate "flights" table — carrier_code, flight_no, tailnum, distance_nm live on ops_flight_legs.
+11. Alias conventions: l = ops_flight_legs, m = ops_turnaround_milestones, c = ops_crew_rosters, t = ops_mel_techlog_events, b = ops_baggage_events. Never use alias "f" for a flights table — it does not exist.
 """
 
 

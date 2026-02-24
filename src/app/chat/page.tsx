@@ -9,6 +9,7 @@ import { ChatThread } from "@/components/chat/chat-thread";
 import { TimelinePanel } from "@/components/chat/timeline-panel";
 import { MessageComposer } from "@/components/chat/message-composer";
 import { FollowUpChips } from "@/components/chat/follow-up-chips";
+import { PredictivePanel } from "@/components/predictive/predictive-panel";
 import { ToggleGroup } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import {
@@ -51,6 +52,11 @@ type VoiceMode = "off" | "tr-TR" | "en-US";
 type VoiceClipStatus = "idle" | "preparing" | "ready" | "error";
 const EMPTY_SUCCESS_TERMINAL_ERROR =
   "The briefing run completed without answer content. Please retry.";
+const ENABLE_PREDICTIVE_PANEL =
+  String(process.env.NEXT_PUBLIC_ENABLE_PREDICTIVE_PANEL || "false").toLowerCase() === "true";
+const ENABLE_PREDICTIVE_ACTIONS_TAB =
+  String(process.env.NEXT_PUBLIC_ENABLE_PREDICTIVE_ACTIONS_TAB || "false").toLowerCase() ===
+  "true";
 
 function createInitialSourceHealth(): SourceHealthStatus[] {
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
@@ -418,6 +424,7 @@ export default function ChatPage() {
   const [preflightLoading, setPreflightLoading] = useState(false);
   const [operationalAlert, setOperationalAlert] = useState<OperationalAlert | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [predictivePanelOpen, setPredictivePanelOpen] = useState(false);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>("off");
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [voiceStatuses, setVoiceStatuses] = useState<Record<string, VoiceClipStatus>>({});
@@ -1172,7 +1179,9 @@ export default function ChatPage() {
 
   const handleFollowUpSelect = useCallback(
     (suggestion: string) => {
-      void handleSendMessage(suggestion);
+      handleSendMessage(suggestion).catch((err) => {
+        console.error("FollowUpChip send failed:", err);
+      });
     },
     [handleSendMessage]
   );
@@ -1195,6 +1204,12 @@ export default function ChatPage() {
     ? "Data path health: checking"
     : `Data path health: ${preflightStatus.toUpperCase()}`;
 
+  useEffect(() => {
+    if (!ENABLE_PREDICTIVE_PANEL && predictivePanelOpen) {
+      setPredictivePanelOpen(false);
+    }
+  }, [predictivePanelOpen]);
+
   return (
     <div className="flex h-full flex-col bg-transparent">
       <div className="flex min-h-0 flex-1">
@@ -1205,6 +1220,8 @@ export default function ChatPage() {
         activeConversationId={activeConversationId ?? undefined}
         onNewChat={handleNewChat}
         onRunPreset={handleRunPreset}
+        showPredictiveOps={ENABLE_PREDICTIVE_PANEL}
+        onOpenPredictive={() => setPredictivePanelOpen(true)}
       />
 
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
@@ -1398,6 +1415,13 @@ export default function ChatPage() {
         confidenceLabel={confidenceLabel}
         groundingInfo={groundingInfo}
       />
+      {ENABLE_PREDICTIVE_PANEL && (
+        <PredictivePanel
+          open={predictivePanelOpen}
+          onOpenChange={setPredictivePanelOpen}
+          enableActionsTab={ENABLE_PREDICTIVE_ACTIONS_TAB}
+        />
+      )}
       </div>
     </div>
   );

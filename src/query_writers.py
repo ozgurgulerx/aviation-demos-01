@@ -58,6 +58,15 @@ Rules:
   * Cast numeric columns (dep_delay_min, arr_delay_min, cumulative_duty_hours, legality_risk_flag, bag_count, distance_nm, passengers, deferred_flag) via column::numeric or column::integer before arithmetic, aggregation (SUM, AVG, MIN, MAX), or comparison.
   * Example: AVG(dep_delay_min::numeric), SUM(legality_risk_flag::integer), WHERE duty_end_utc::timestamptz >= NOW()
 - If constraints include a casting_hint, follow it to add explicit CAST or :: operators.
+- ops_flight_legs contains carrier_code, flight_no, tailnum, distance_nm directly — there is NO separate "flights" table. All ops_* child tables join via leg_id.
+- Alias conventions: l = ops_flight_legs, m = ops_turnaround_milestones, c = ops_crew_rosters, t = ops_mel_techlog_events, b = ops_baggage_events. Never use alias "f" for a flights table.
+- Multi-table JOIN example:
+  SELECT l.leg_id, l.carrier_code, l.flight_no, c.crew_id, c.role, m.milestone, t.jasc_code
+  FROM ops_flight_legs l
+  LEFT JOIN ops_crew_rosters c ON c.leg_id = l.leg_id
+  LEFT JOIN ops_turnaround_milestones m ON m.leg_id = l.leg_id
+  LEFT JOIN ops_mel_techlog_events t ON t.leg_id = l.leg_id
+  LIMIT 50;
 """
         payload = {
             "user_query": user_query,

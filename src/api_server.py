@@ -42,6 +42,8 @@ except ImportError:
 
 runtime = None
 runtime_lock = threading.Lock()
+predictive_service = None
+predictive_service_lock = threading.Lock()
 
 
 def get_runtime() -> AgentFrameworkRuntime:
@@ -79,6 +81,20 @@ def get_runtime() -> AgentFrameworkRuntime:
                 logger.exception("Failed to initialize source capability snapshot")
             logger.info("Runtime ready (af_enabled=%s)", runtime.af_enabled)
     return runtime
+
+
+def get_predictive_service():
+    """Lazily initialize predictive service to avoid startup side effects."""
+    global predictive_service
+    if predictive_service is not None:
+        return predictive_service
+
+    with predictive_service_lock:
+        if predictive_service is None:
+            from predictive_delay_service import PredictiveDelayService
+
+            predictive_service = PredictiveDelayService()
+    return predictive_service
 
 
 @app.route('/health', methods=['GET'])
@@ -297,6 +313,80 @@ def fabric_preflight():
         return jsonify({"overall_status": "fail", "error": "Preflight check failed."}), 500
 
 
+@app.route('/api/predictive/delays', methods=['GET'])
+def predictive_delays():
+    """Return predictive risk + expected delay rows for near-term departures."""
+    try:
+        model = str(request.args.get("model", "optimized") or "optimized").strip().lower()
+        if model not in {"baseline", "optimized"}:
+            return jsonify({"error": "Invalid 'model'. Use 'baseline' or 'optimized'."}), 400
+
+        def _safe_int(name: str, default: int, minimum: int, maximum: int) -> int:
+            raw = request.args.get(name)
+            try:
+                value = int(str(raw).strip()) if raw not in (None, "") else default
+            except Exception:
+                value = default
+            return max(minimum, min(maximum, value))
+
+        window_hours = _safe_int("windowHours", 6, minimum=1, maximum=72)
+        limit = _safe_int("limit", 100, minimum=1, maximum=500)
+
+        svc = get_predictive_service()
+        payload = svc.get_delays(model=model, window_hours=window_hours, limit=limit)
+        return jsonify(payload), 200
+    except Exception:
+        logger.exception("Predictive delays endpoint failed")
+        return jsonify({"status": "error", "error": "Predictive delays endpoint failed."}), 500
+
+
+@app.route('/api/predictive/delay-metrics', methods=['GET'])
+def predictive_delay_metrics():
+    """Return baseline vs optimized KPI summary."""
+    try:
+        svc = get_predictive_service()
+        payload = svc.get_delay_metrics()
+        return jsonify(payload), 200
+    except Exception:
+        logger.exception("Predictive metrics endpoint failed")
+        return jsonify({"status": "error", "error": "Predictive metrics endpoint failed."}), 500
+
+
+@app.route('/api/predictive/actions', methods=['GET'])
+def predictive_actions():
+    """Return ranked intervention recommendations."""
+    try:
+        model = str(request.args.get("model", "optimized") or "optimized").strip().lower()
+        if model not in {"baseline", "optimized"}:
+            return jsonify({"error": "Invalid 'model'. Use 'baseline' or 'optimized'."}), 400
+
+        raw_limit = request.args.get("limit")
+        try:
+            limit = int(str(raw_limit).strip()) if raw_limit not in (None, "") else 100
+        except Exception:
+            limit = 100
+        limit = max(1, min(500, limit))
+
+        svc = get_predictive_service()
+        payload = svc.get_actions(model=model, limit=limit)
+        return jsonify(payload), 200
+    except Exception:
+        logger.exception("Predictive actions endpoint failed")
+        return jsonify({"status": "error", "error": "Predictive actions endpoint failed."}), 500
+
+
+@app.route('/api/predictive/decision-metrics', methods=['GET'])
+def predictive_decision_metrics():
+    """Return optimization decision trace summary metrics."""
+    try:
+        svc = get_predictive_service()
+        payload = svc.get_decision_metrics()
+        return jsonify(payload), 200
+    except Exception:
+        logger.exception("Predictive decision metrics endpoint failed")
+        return jsonify({"status": "error", "error": "Predictive decision metrics endpoint failed."}), 500
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("AVIATION RAG API SERVER")
@@ -306,6 +396,10 @@ if __name__ == '__main__':
     print("  POST /api/chat   - Chat with aviation RAG")
     print("  POST /api/query  - Direct query")
     print("  GET  /api/fabric/preflight - Fabric live-path readiness")
+    print("  GET  /api/predictive/delays - Predictive delay rows")
+    print("  GET  /api/predictive/delay-metrics - Predictive model KPIs")
+    print("  GET  /api/predictive/actions - Predictive action recommendations")
+    print("  GET  /api/predictive/decision-metrics - Predictive decision KPI summary")
     print("=" * 60)
 
     app.run(

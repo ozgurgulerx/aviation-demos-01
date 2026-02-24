@@ -220,3 +220,4 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - **Assume startup is free** — cold runtime initialization can be slow; keep first SSE byte fast
 - **Use `AZURE_OPENAI_API_KEY` in production** — prefer `DefaultAzureCredential` (managed identity)
 - **Disable `publicNetworkAccess` on Cosmos DB** — AKS pods connect via public IP (`135.116.249.200`); disabling it silently breaks NOSQL (NOTAM) queries with no clear error (pods fall back to Fabric REST which also fails). The `provision-azure.sh` script enforces this, but manual Azure Portal changes can override it.
+- **Use `void` on async callbacks** (e.g., `void handleSendMessage(...)`) — this silently swallows Promise rejections, making click handlers appear broken with zero console output. Always use `.catch()` or `try/catch` in async event handlers so errors surface. This has bitten FollowUpChips more than once.

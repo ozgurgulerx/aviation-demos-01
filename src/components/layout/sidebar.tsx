@@ -13,6 +13,7 @@ import {
   Bookmark,
   Radar,
   Database,
+  TrendingUp,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -33,6 +34,8 @@ interface SidebarProps {
   activeConversationId?: string;
   onNewChat: () => void;
   onRunPreset?: (prompt: string) => void;
+  onOpenPredictive?: () => void;
+  showPredictiveOps?: boolean;
 }
 
 export function Sidebar({
@@ -42,6 +45,8 @@ export function Sidebar({
   activeConversationId,
   onNewChat,
   onRunPreset,
+  onOpenPredictive,
+  showPredictiveOps = false,
 }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -145,11 +150,6 @@ export function Sidebar({
                   {conversation.isSaved ? <Star className="h-4 w-4" /> : <MessageCircle className="h-4 w-4" />}
                 </Button>
               ))}
-              <Button asChild variant="ghost" size="icon-sm" className="h-8 w-8">
-                <Link href="/data-sources" aria-label="Open data sources">
-                  <Database className="h-4 w-4" />
-                </Link>
-              </Button>
             </div>
           )}
 
@@ -165,6 +165,35 @@ export function Sidebar({
 
         </div>
       </ScrollArea>
+
+      <div className="border-t border-border/70 p-3">
+        <div className={cn("flex gap-2", isCollapsed ? "flex-col items-center" : "flex-col")}>
+          {showPredictiveOps && onOpenPredictive && (
+            <Button
+              onClick={onOpenPredictive}
+              variant="secondary"
+              className={cn("gap-2", isCollapsed ? "h-8 w-8 px-0" : "justify-start")}
+              size={isCollapsed ? "icon-sm" : "sm"}
+              aria-label="Open predictive operations panel"
+            >
+              <TrendingUp className="h-4 w-4" />
+              {!isCollapsed && <span>Predictive Ops</span>}
+            </Button>
+          )}
+
+          <Button
+            asChild
+            variant="ghost"
+            className={cn("gap-2", isCollapsed ? "h-8 w-8 px-0" : "justify-start")}
+            size={isCollapsed ? "icon-sm" : "sm"}
+          >
+            <Link href="/data-sources" aria-label="Open data sources">
+              <Database className="h-4 w-4" />
+              {!isCollapsed && <span>Data Sources</span>}
+            </Link>
+          </Button>
+        </div>
+      </div>
     </motion.aside>
   );
 }
@@ -238,4 +267,3 @@ function PresetItem({
     </button>
   );
 }
-
