@@ -2598,10 +2598,8 @@ class UnifiedRetriever:
             if fallback_sql:
                 results, citations = self.execute_sql_query(fallback_sql)
                 if results and not results[0].get("error_code"):
-                    for row in results:
-                        if isinstance(row, dict):
-                            row["partial_schema"] = sql
-                            row["fallback_sql"] = fallback_sql
+                    logger.info("NEED_SCHEMA fallback succeeded: original=%s fallback=%s rows=%d",
+                                sql[:120], fallback_sql[:120], len(results))
                 return results, fallback_sql, citations
             return [self._source_error_row("SQL", "sql_schema_missing", sql, {"sql": sql})], sql, []
 

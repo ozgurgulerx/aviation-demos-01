@@ -786,7 +786,7 @@ class AviationRagContextProvider:
         if not rows:
             return [], [], False
 
-        hidden_keys = {"content_vector"}
+        hidden_keys = {"content_vector", "partial_schema", "fallback_sql"}
         columns: List[str] = []
         for row in rows:
             if not isinstance(row, dict):
