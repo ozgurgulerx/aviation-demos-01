@@ -4014,8 +4014,7 @@ class UnifiedRetriever:
                 return ""
             return f"{col} IN (" + ", ".join(f"'{t}'" for t in tokens) + ")"
 
-        _delay_terms = frozenset({"delay", "delays", "delayed", "late", "on-time", "on time", "punctuality", "otp",
-                                  "risk", "departure risk", "arrival risk"})
+        _delay_terms = frozenset({"delay", "delays", "delayed", "late", "on-time", "on time", "punctuality", "otp"})
         _cause_terms = frozenset({"cause", "reason", "breakdown", "weather", "carrier delay",
                                   "nas delay", "security delay", "late aircraft"})
         _cancel_terms = frozenset({"cancel", "cancellation", "cancellations", "cancelled", "canceled",

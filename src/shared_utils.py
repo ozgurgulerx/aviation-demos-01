@@ -12,7 +12,7 @@ import os
 import re
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, FrozenSet, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -168,12 +168,12 @@ def build_rows_preview(
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=64)
-def _compile_keyword_pattern(keywords: frozenset) -> re.Pattern:
-    escaped = sorted((re.escape(k) for k in keywords), key=len, reverse=True)
+def _compile_keyword_pattern(keywords: FrozenSet[str]) -> re.Pattern:
+    escaped = sorted((re.escape(k) for k in keywords if k), key=len, reverse=True)
     return re.compile(r"(?<!\w)(?:" + "|".join(escaped) + r")(?!\w)", re.IGNORECASE)
 
 
-def matches_any(text: str, keywords: frozenset) -> bool:
+def matches_any(text: str, keywords: FrozenSet[str]) -> bool:
     """Word-boundary-aware keyword matching.
 
     Prevents false positives like 'dispatcher' matching 'dispatch' or
@@ -181,6 +181,8 @@ def matches_any(text: str, keywords: frozenset) -> bool:
     instead of ``\\b`` for better handling of multi-word phrases.
     The compiled regex is cached per unique keyword frozenset.
     """
+    if not text or not keywords:
+        return False
     return bool(_compile_keyword_pattern(keywords).search(text))
 
 
@@ -188,16 +190,18 @@ def matches_any(text: str, keywords: frozenset) -> bool:
 # Centralized keyword sets for query classification
 # ---------------------------------------------------------------------------
 
-OPS_TABLE_SIGNALS: frozenset = frozenset({
+OPS_TABLE_SIGNALS: FrozenSet[str] = frozenset({
     "mel", "techlog", "tech log", "technical log", "minimum equipment",
-    "dispatch", "dispatched", "deferred", "jasc",
+    "dispatch", "dispatched", "dispatchable", "deferred", "jasc",
     "crew", "duty", "fatigue", "legality",
     "baggage", "mishandled", "luggage",
     "turnaround", "milestones", "milestone", "ground handling",
-    "flight leg", "flight legs", "leg_id", "ops_",
+    "flight leg", "flight legs", "leg_id",
+    "ops_flight_legs", "ops_turnaround_milestones", "ops_crew_rosters",
+    "ops_mel_techlog_events", "ops_baggage_events",
     "tail", "tailnum", "inbound", "downstream",
-    "dependency", "chain", "trace",
-    "propagat",
+    "dependency", "dependencies", "chain", "trace",
+    "propagate", "propagation",
 })
 
 FABRIC_SQL_DELAY_TRIGGERS: frozenset = frozenset({
@@ -236,11 +240,16 @@ CITY_AIRPORT_MAP: Dict[str, List[str]] = {
 }
 
 IATA_TO_ICAO_MAP: Dict[str, str] = {
-    "JFK": "KJFK",
-    "LGA": "KLGA",
-    "EWR": "KEWR",
-    "IST": "LTFM",
-    "SAW": "LTFJ",
+    # US
+    "JFK": "KJFK", "LGA": "KLGA", "EWR": "KEWR",
+    "ATL": "KATL", "ORD": "KORD", "LAX": "KLAX",
+    "DFW": "KDFW", "DEN": "KDEN", "SFO": "KSFO",
+    # Turkey
+    "IST": "LTFM", "SAW": "LTFJ", "ESB": "LTAC",
+    "AYT": "LTAI", "ADB": "LTBJ",
+    # Europe
+    "LHR": "EGLL", "LGW": "EGKK",
+    "CDG": "LFPG", "FRA": "EDDF", "AMS": "EHAM",
 }
 
 

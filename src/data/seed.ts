@@ -129,7 +129,7 @@ export interface FollowUpSuggestion {
 export const ENHANCED_FOLLOW_UP_SUGGESTIONS: FollowUpSuggestion[] = [
   // --- Tier 1 (1-2 sources) ---
   {
-    text: "Compare next-90-minute departure risk across SAW, AYT, and ADB.",
+    text: "Compare next-90-minute departure risk across JFK, LGA, and EWR.",
     type: "ops-live",
     sources: 1,
   },
@@ -145,12 +145,12 @@ export const ENHANCED_FOLLOW_UP_SUGGESTIONS: FollowUpSuggestion[] = [
   },
   // --- Tier 2 (3-4 sources) ---
   {
-    text: "Compare BTS cancellation rates at SAW over past winters with current SIGMET coverage and turnaround bottlenecks.",
+    text: "Compare BTS cancellation rates at JFK over past winters with current SIGMET coverage and turnaround bottlenecks.",
     type: "ops-live",
     sources: 3,
   },
   {
-    text: "For carriers with the worst on-time record to ADB, surface matching ASRS safety narratives and delay root causes.",
+    text: "For carriers with the worst on-time record to EWR, surface matching ASRS safety narratives and delay root causes.",
     type: "safety",
     sources: 3,
   },
@@ -166,7 +166,7 @@ export const ENHANCED_FOLLOW_UP_SUGGESTIONS: FollowUpSuggestion[] = [
   },
   // --- Tier 3 (5+ sources) ---
   {
-    text: "Assess full operational risk for the IST evening bank: live weather hazards, BTS delay trends, active NOTAMs, crew legality status, and related ASRS incident history.",
+    text: "Assess full operational risk for the IST evening bank: live weather hazards, historical delay trends, active NOTAMs, crew legality status, and related ASRS incident history.",
     type: "ops-live",
     sources: 5,
   },
@@ -176,7 +176,7 @@ export const ENHANCED_FOLLOW_UP_SUGGESTIONS: FollowUpSuggestion[] = [
     sources: 5,
   },
   {
-    text: "Produce a go/no-go departure briefing for SAW: live SIGMETs, active NOTAMs, MEL and crew status, BTS on-time baseline, runway procedures, and related safety narratives.",
+    text: "Produce a go/no-go departure briefing for SAW: live SIGMETs, active NOTAMs, MEL and crew status, on-time baseline, runway procedures, and related safety narratives.",
     type: "ops-live",
     sources: 6,
   },
