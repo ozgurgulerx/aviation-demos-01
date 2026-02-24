@@ -891,6 +891,17 @@ class AgentFrameworkRuntime:
                 "failurePolicy": failure_policy,
                 "sourcePolicy": source_policy,
             }
+            yield self._build_partial_done_event(
+                route=ctx.route,
+                reasoning=ctx.reasoning,
+                session_id=session_id,
+                framework=self._framework_label,
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
             return
 
         if degraded_sources:
@@ -1043,6 +1054,17 @@ class AgentFrameworkRuntime:
                 "sourcePolicy": source_policy,
                 "partial": False,
             }
+            yield self._build_partial_done_event(
+                route=route,
+                reasoning="rag_lookup_failed",
+                session_id=session_id,
+                framework="local-fallback",
+                degraded_sources=[],
+                failed_required_sources=[],
+                required_sources_satisfied=len(required_sources) == 0,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
             return
         tool_result = result_holder[0]
 
@@ -1267,6 +1289,17 @@ class AgentFrameworkRuntime:
                 "failurePolicy": failure_policy,
                 "sourcePolicy": source_policy,
             }
+            yield self._build_partial_done_event(
+                route=route,
+                reasoning=reasoning,
+                session_id=session_id,
+                framework="local-fallback",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy,
+                source_policy=source_policy,
+            )
             return
 
         if degraded_sources:

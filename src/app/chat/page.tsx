@@ -724,6 +724,7 @@ export default function ChatPage() {
 
     for (const message of messages) {
       if (message.role !== "assistant") continue;
+      if (message.status && message.status !== "complete") continue;
       const text = toSpeechText(message.content);
       const language = voiceMode === "tr-TR" ? "tr-TR" : "en-US";
       const existingClip = voiceClipByMessageRef.current[message.id];
@@ -773,8 +774,16 @@ export default function ChatPage() {
         content,
         createdAt: new Date(),
       };
+      const assistantMessageId = generateId();
+      const placeholderAssistant: Message = {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        createdAt: new Date(),
+        status: "loading",
+      };
 
-      setMessages((previous) => [...previous, userMessage]);
+      setMessages((previous) => [...previous, userMessage, placeholderAssistant]);
       setIsLoading(true);
       setLoadingStartedAtMs(Date.now());
       setStreamingContent("");
@@ -791,6 +800,12 @@ export default function ChatPage() {
       emitReasoningEvent("pii_scan");
       emitReasoningEvent("understanding_request");
       stopVoicePlayback();
+
+      const updateAssistant = (updates: Partial<Message>) => {
+        setMessages((prev) =>
+          prev.map((m) => m.id === assistantMessageId ? { ...m, ...updates } : m)
+        );
+      };
 
       try {
         const response = await fetch("/api/chat", {
@@ -900,6 +915,9 @@ export default function ChatPage() {
           if (event.type === "agent_update" || event.type === "text") {
             const streamedChunk = extractStreamContent(event);
             if (streamedChunk) {
+              if (!fullContent) {
+                updateAssistant({ status: "streaming" });
+              }
               fullContent += streamedChunk;
               setStreamingContent(fullContent);
               emitReasoningEvent("drafting_brief", undefined, eventTs);
@@ -912,6 +930,9 @@ export default function ChatPage() {
 
           if (event.type === "agent_done" || event.type === "agent_partial_done" || event.type === "done") {
             sawSuccessfulTerminal = true;
+            if (terminalAgentError) {
+              terminalAgentError = null;
+            }
             isVerified = !!event.isVerified;
             hadPartialCompletion = event.type === "agent_partial_done" || !!event.partial;
             degradedSources = Array.isArray(event.degradedSources) ? event.degradedSources : degradedSources;
@@ -1036,16 +1057,13 @@ export default function ChatPage() {
           }
         }
 
-        const assistantMessage: Message = {
-          id: generateId(),
-          role: "assistant",
+        updateAssistant({
           content: fullContent,
-          createdAt: new Date(),
           citations: newCitations,
           isVerified,
-        };
-
-        setMessages((previous) => [...previous, assistantMessage]);
+          status: terminalAgentError ? "error" : "complete",
+          errorMessage: terminalAgentError || undefined,
+        });
 
         if (newCitations.length > 0) {
           setCitations((previous) => {
@@ -1089,16 +1107,12 @@ export default function ChatPage() {
           failOpen: true,
         });
 
-        const errorMessage: Message = {
-          id: generateId(),
-          role: "assistant",
-          content:
-            "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.",
-          createdAt: new Date(),
+        updateAssistant({
+          content: "I encountered an error while preparing the flight brief. Please retry.",
+          status: "error",
+          errorMessage: error instanceof Error ? error.message : "Unknown error",
           isVerified: false,
-        };
-
-        setMessages((previous) => [...previous, errorMessage]);
+        });
         setTimelineEvents((previous) => [
           ...previous,
           {
@@ -1124,6 +1138,15 @@ export default function ChatPage() {
         setIsLoading(false);
         setLoadingStartedAtMs(null);
         setStreamingContent("");
+        // Safety net: if the placeholder is still in a transient state (e.g. rapid
+        // re-query race), finalize it so it doesn't show a stuck loading spinner.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMessageId && m.status !== "complete" && m.status !== "error"
+              ? { ...m, status: m.content ? "complete" : "error", errorMessage: m.content ? undefined : "Request interrupted" }
+              : m
+          )
+        );
       }
     },
     [
