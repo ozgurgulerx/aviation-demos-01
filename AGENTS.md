@@ -146,6 +146,24 @@ For backend image build/deploy actions in this repository, enforce:
 5. Runtime compatibility note:
    - Current AKS nodepool runtime architecture is `amd64`; keep backend image architecture aligned.
 
+## Backend Container OS and Driver Baseline
+
+For any `Dockerfile.backend`, backend dependency, or backend deploy workflow change, enforce:
+
+1. Base OS pinning:
+   - Keep backend base image pinned to a Microsoft ODBC-supported Debian baseline (`python:3.11-slim-bookworm`).
+   - Treat floating tags (for example `python:3.11-slim`, `latest`) as out-of-policy for backend release images.
+2. ODBC runtime dependency floor:
+   - Keep unixODBC runtime/dev libraries and Microsoft SQL Server ODBC driver 18 installed in the backend image.
+   - If the Microsoft package repo stanza changes, keep it aligned to Debian 12/bookworm.
+3. Python dependency floor:
+   - Keep `pyodbc` in `requirements.txt` while Fabric SQL TDS mode remains supported.
+4. Regression test gate:
+   - Keep automated checks that verify backend image baseline assumptions (base image codename, ODBC driver install, `pyodbc` presence) in test coverage.
+   - If baseline changes are intentional, update tests in the same change.
+5. Deployment block conditions:
+   - If OS codename, ODBC driver major version, or `pyodbc` support is removed/changed without an explicit migration plan, stop rollout and surface blocker before deployment.
+
 ## Subscription Guardrail
 
 For any Azure action in this repository, use only this hardcoded tenant/account/subscription target:

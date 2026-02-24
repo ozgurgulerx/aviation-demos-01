@@ -208,7 +208,7 @@ class AviationRagContextProvider:
         precomputed_route: Optional[Dict[str, Any]] = None,
         on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AviationRagContext:
-        route, reasoning, sql_hint = self._resolve_route(
+        route, reasoning, sql_hint, router_sources = self._resolve_route(
             query, retrieval_mode, forced_route, precomputed_route=precomputed_route
         )
 
@@ -222,7 +222,6 @@ class AviationRagContextProvider:
             explain_retrieval=explain_retrieval,
             forced_route=forced_route,
         )
-        router_sources = list((precomputed_route or {}).get("sources", []))
         retrieval_plan = build_retrieval_plan(plan_request, route, reasoning, router_sources=router_sources)
 
         source_results, source_traces, all_citations, sql_query = self._execute_plan(
@@ -918,28 +917,35 @@ class AviationRagContextProvider:
         retrieval_mode: str,
         forced_route: Optional[str],
         precomputed_route: Optional[Dict[str, Any]] = None,
-    ) -> tuple[str, str, Optional[str]]:
+    ) -> tuple[str, str, Optional[str], List[str]]:
         if forced_route in ("SQL", "SEMANTIC", "HYBRID"):
-            return forced_route, "Route forced by caller", None
+            return forced_route, "Route forced by caller", None, []
 
         # Preserve existing product behavior: foundry-iq favors semantic retrieval.
         if retrieval_mode == "foundry-iq":
-            return "SEMANTIC", "Foundry IQ mode prefers semantic context", None
+            return "SEMANTIC", "Foundry IQ mode prefers semantic context", None, []
 
         # Use precomputed route from parallel PII+routing if available.
         if precomputed_route is not None:
             route = precomputed_route.get("route", "HYBRID")
             reasoning = precomputed_route.get("reasoning", "Route inferred by QueryRouter (parallel)")
             sql_hint = precomputed_route.get("sql_hint")
-            return route, reasoning, sql_hint
+            sources = list(precomputed_route.get("sources", []))
+            return route, reasoning, sql_hint, sources
+
+        # Load intent graph and feed it to the LLM router for optimal
+        # multi-source selection (mirrors the agentic path).
+        intent_graph = self.intent_graph_provider.load()
+        intent_graph_data = intent_graph.data if intent_graph else None
 
         _t0 = time.perf_counter()
-        route_result = self.retriever.router.route(query)
+        route_result = self.retriever.router.route(query, intent_graph=intent_graph_data)
         logger.info("perf stage=%s ms=%.1f", "routing", (time.perf_counter() - _t0) * 1000)
         route = route_result.get("route", "HYBRID")
         reasoning = route_result.get("reasoning", "Route inferred by QueryRouter")
         sql_hint = route_result.get("sql_hint")
-        return route, reasoning, sql_hint
+        sources = list(route_result.get("sources", []))
+        return route, reasoning, sql_hint, sources
 
     def _compose_context_text(
         self,
@@ -961,7 +967,7 @@ class AviationRagContextProvider:
         if sql_query:
             sections.append(f"SQL query:\n{sql_query}")
 
-        for source in ("KQL", "GRAPH", "NOSQL", "SQL", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT"):
+        for source in ("KQL", "GRAPH", "NOSQL", "SQL", "FABRIC_SQL", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT"):
             rows = source_results.get(source)
             if not rows:
                 continue

@@ -419,7 +419,9 @@ class AgentFrameworkRuntime:
             return self.retriever.check_pii(query)
 
         def _routing_task():
-            return self.retriever.router.smart_route(query)
+            intent_graph = self.context_provider.intent_graph_provider.load()
+            intent_graph_data = intent_graph.data if intent_graph else None
+            return self.retriever.router.smart_route(query, intent_graph=intent_graph_data)
 
         with _tracer.start_as_current_span("pipeline.pii_routing", attributes={"query.length": len(query), "session.id": sid}) as _pii_span:
             with ThreadPoolExecutor(max_workers=2) as pool:

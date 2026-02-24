@@ -186,15 +186,19 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"intent": "Disruption.Explain", "evidence": "METAR", "optional": True},
         {"intent": "Disruption.Explain", "evidence": "SOPClause", "optional": True},
         {"intent": "Policy.Check", "evidence": "SOPClause", "optional": False},
+        {"intent": "Policy.Check", "evidence": "NOTAM", "optional": True},
         {"intent": "Replay.History", "evidence": "METAR", "optional": False},
         {"intent": "Replay.History", "evidence": "Hazards", "optional": False},
         {"intent": "Replay.History", "evidence": "NOTAM", "optional": True},
+        {"intent": "Replay.History", "evidence": "IncidentNarrative", "optional": False},
+        {"intent": "Replay.History", "evidence": "SafetyStats", "optional": True},
         # Analytics.Compare
         {"intent": "Analytics.Compare", "evidence": "SafetyStats", "optional": False},
         {"intent": "Analytics.Compare", "evidence": "AirportData", "optional": True},
         # Fleet.Status
         {"intent": "Fleet.Status", "evidence": "FleetData", "optional": False},
         {"intent": "Fleet.Status", "evidence": "SOPClause", "optional": True},
+        {"intent": "Fleet.Status", "evidence": "DelayAnalytics", "optional": True},
         # RouteNetwork.Query
         {"intent": "RouteNetwork.Query", "evidence": "RouteData", "optional": False},
         {"intent": "RouteNetwork.Query", "evidence": "AirportData", "optional": True},
@@ -242,6 +246,14 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"evidence": "RegulatoryDoc", "tool": "NOSQL", "priority": 2},
         {"evidence": "DelayAnalytics", "tool": "FABRIC_SQL", "priority": 1},
         {"evidence": "DelayAnalytics", "tool": "SQL", "priority": 2},
+        # Historical fallbacks — structured data for analysis/trends when KQL is unavailable
+        {"evidence": "METAR", "tool": "SQL", "priority": 2},
+        {"evidence": "TAF", "tool": "SQL", "priority": 2},
+        {"evidence": "Hazards", "tool": "SQL", "priority": 2},
+        # Supplementary vector/document sources
+        {"evidence": "RunwayConstraints", "tool": "VECTOR_AIRPORT", "priority": 2},
+        {"evidence": "FleetData", "tool": "FABRIC_SQL", "priority": 2},
+        {"evidence": "SOPClause", "tool": "NOSQL", "priority": 2},
     ],
     "expansion_rules": [
         {"intent": "PilotBrief.Departure", "tool": "GRAPH", "reason": "airport->runway/navaid/notam/alternate expansion"},
