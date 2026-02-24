@@ -245,7 +245,8 @@ DEFAULT_INTENT_GRAPH: Dict[str, Any] = {
         {"evidence": "RegulatoryDoc", "tool": "VECTOR_REG", "priority": 1},
         {"evidence": "RegulatoryDoc", "tool": "NOSQL", "priority": 2},
         {"evidence": "DelayAnalytics", "tool": "FABRIC_SQL", "priority": 1},
-        {"evidence": "DelayAnalytics", "tool": "SQL", "priority": 2},
+        {"evidence": "DelayAnalytics", "tool": "SQL", "priority": 2,
+         "hint_tables": ["demo.ops_flight_legs", "demo.ops_turnaround_milestones", "demo.schedule_delay_causes"]},
         # Historical fallbacks — structured data for analysis/trends when KQL is unavailable
         {"evidence": "METAR", "tool": "SQL", "priority": 2},
         {"evidence": "TAF", "tool": "SQL", "priority": 2},

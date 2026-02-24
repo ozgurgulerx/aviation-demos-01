@@ -30,20 +30,25 @@ Tables and key columns:
     asrs_report_id, event_date, location, aircraft_type, flight_phase,
     narrative_type, title, report_text
 
-  ops_flight_legs — Flight schedule and status
-    flight_id, airline, flight_number, dep_icao, arr_icao,
-    scheduled_dep, scheduled_arr, actual_dep, actual_arr,
-    aircraft_type, registration, status
+  ops_flight_legs — Flight schedule, actuals, and delay metrics
+    leg_id, source, carrier_code, flight_no, origin_iata, dest_iata,
+    scheduled_dep_utc, scheduled_arr_utc, actual_dep_utc, actual_arr_utc,
+    dep_delay_min, arr_delay_min, tailnum, distance_nm, passengers
 
-  ops_turnaround_milestones — Ground handling milestones
-    flight_id, milestone, scheduled_time, actual_time, station
+  ops_turnaround_milestones — Ground handling milestones with delay cause
+    milestone_id, leg_id, milestone, event_ts_utc, status, delay_cause_code
 
-  ops_crew_rosters — Crew duty assignments
-    crew_id, name, role, flight_id, duty_start, duty_end, base
+  ops_crew_rosters — Crew duty assignments and legality tracking
+    duty_id, crew_id, role, leg_id, duty_start_utc, duty_end_utc,
+    cumulative_duty_hours, legality_risk_flag
 
   ops_mel_techlog_events — MEL and technical log entries
-    event_id, registration, ata_chapter, description,
-    opened_date, closed_date, mel_category, status
+    tech_event_id, leg_id, event_ts_utc, jasc_code,
+    mel_category, deferred_flag, severity
+
+  ops_baggage_events — Baggage handling events
+    bag_event_id, leg_id, event_type, event_ts_utc,
+    bag_count, status, root_cause
 
   ourairports_airports — Airport reference data
     ident, type, name, latitude_deg, longitude_deg, elevation_ft,

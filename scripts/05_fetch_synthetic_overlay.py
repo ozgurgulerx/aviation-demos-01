@@ -329,6 +329,10 @@ def synthesize_tables(
                 "dest_iata": dst,
                 "scheduled_dep_utc": dep.isoformat(),
                 "scheduled_arr_utc": (dep + timedelta(minutes=block_min)).isoformat(),
+                "actual_dep_utc": "",
+                "actual_arr_utc": "",
+                "dep_delay_min": 0,
+                "arr_delay_min": 0,
                 "tailnum": f"N{5200 + i}TX",
                 "distance_nm": round(dist_nm, 1),
                 "passengers": 80 + (i * 9) % 240,
@@ -357,6 +361,10 @@ def synthesize_tables(
                 "dest_iata": dest_iata,
                 "scheduled_dep_utc": dep_dt.isoformat(),
                 "scheduled_arr_utc": (dep_dt + timedelta(minutes=block)).isoformat(),
+                "actual_dep_utc": "",
+                "actual_arr_utc": "",
+                "dep_delay_min": 0,
+                "arr_delay_min": 0,
                 "tailnum": (dep_evt.get("icao24") or f"os{i:04d}").upper(),
                 "distance_nm": float(200 + (i * 31) % 900),
                 "passengers": 90 + (i * 7) % 210,
@@ -409,6 +417,12 @@ def synthesize_tables(
             dep_delay = rnd.randint(12, 65)
         else:
             dep_delay = rnd.randint(8, 30)
+
+        arr_delay = dep_delay + rnd.randint(-8, 12)
+        leg["actual_dep_utc"] = (dep + timedelta(minutes=dep_delay)).isoformat()
+        leg["actual_arr_utc"] = (arr + timedelta(minutes=arr_delay)).isoformat()
+        leg["dep_delay_min"] = dep_delay
+        leg["arr_delay_min"] = arr_delay
 
         event_points = [
             ("GATE_OPEN", -55),

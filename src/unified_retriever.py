@@ -2694,6 +2694,117 @@ class UnifiedRetriever:
                     "LIMIT 200"
                 )
 
+        # -----------------------------------------------------------------
+        # Delay / OPS fallback branches (schema-aware)
+        # -----------------------------------------------------------------
+        delay_terms = {"delay", "late", "on-time", "on time", "punctuality", "otp"}
+        turnaround_terms = {"turnaround", "milestone", "ground handling", "pushback", "gate", "boarding"}
+        crew_terms = {"crew", "duty", "fatigue", "legality", "captain", "first officer", "cabin"}
+        baggage_terms = {"baggage", "bag", "mishandled", "luggage"}
+
+        flight_leg_cols = tables.get("ops_flight_legs", set()) | tables.get("demo.ops_flight_legs", set())
+        milestone_cols = tables.get("ops_turnaround_milestones", set()) | tables.get("demo.ops_turnaround_milestones", set())
+        crew_cols = tables.get("ops_crew_rosters", set()) | tables.get("demo.ops_crew_rosters", set())
+        bag_cols = tables.get("ops_baggage_events", set()) | tables.get("demo.ops_baggage_events", set())
+
+        def _qual(table_base: str) -> str:
+            """Return the best qualified table name (prefer demo.X if present)."""
+            if f"demo.{table_base}" in tables:
+                return f"demo.{table_base}"
+            return table_base
+
+        # --- Delay queries ---
+        if any(term in q for term in delay_terms):
+            # Option A: delay columns exist in ops_flight_legs
+            if {"dep_delay_min", "arr_delay_min"}.issubset(flight_leg_cols):
+                tbl = _qual("ops_flight_legs")
+                return (
+                    f"SELECT "
+                    f"CASE WHEN dep_delay_min <= 0 THEN 'On-time / Early' "
+                    f"WHEN dep_delay_min BETWEEN 1 AND 15 THEN '1-15 min' "
+                    f"WHEN dep_delay_min BETWEEN 16 AND 60 THEN '16-60 min' "
+                    f"ELSE '60+ min' END AS delay_bucket, "
+                    f"COUNT(*) AS flights, "
+                    f"ROUND(AVG(dep_delay_min), 1) AS avg_dep_delay_min, "
+                    f"ROUND(AVG(arr_delay_min), 1) AS avg_arr_delay_min "
+                    f"FROM {tbl} "
+                    f"GROUP BY delay_bucket "
+                    f"ORDER BY MIN(dep_delay_min)"
+                )
+            # Option B: fall back to turnaround milestones delay_cause_code
+            if "delay_cause_code" in milestone_cols:
+                tbl = _qual("ops_turnaround_milestones")
+                return (
+                    f"SELECT delay_cause_code, COUNT(*) AS occurrences "
+                    f"FROM {tbl} "
+                    f"WHERE delay_cause_code IS NOT NULL AND delay_cause_code != 'NONE' "
+                    f"GROUP BY delay_cause_code "
+                    f"ORDER BY occurrences DESC "
+                    f"LIMIT 10"
+                )
+
+        # --- Turnaround queries ---
+        if any(term in q for term in turnaround_terms) and milestone_cols:
+            tbl = _qual("ops_turnaround_milestones")
+            if {"milestone", "delay_cause_code"}.issubset(milestone_cols):
+                return (
+                    f"SELECT milestone, delay_cause_code, COUNT(*) AS cnt "
+                    f"FROM {tbl} "
+                    f"GROUP BY milestone, delay_cause_code "
+                    f"ORDER BY milestone, cnt DESC "
+                    f"LIMIT 50"
+                )
+            if "milestone" in milestone_cols:
+                return (
+                    f"SELECT milestone, COUNT(*) AS cnt "
+                    f"FROM {tbl} "
+                    f"GROUP BY milestone "
+                    f"ORDER BY cnt DESC "
+                    f"LIMIT 20"
+                )
+
+        # --- Crew / duty queries ---
+        if any(term in q for term in crew_terms) and crew_cols:
+            tbl = _qual("ops_crew_rosters")
+            if {"role", "cumulative_duty_hours", "legality_risk_flag"}.issubset(crew_cols):
+                return (
+                    f"SELECT role, "
+                    f"COUNT(*) AS duties, "
+                    f"ROUND(AVG(cumulative_duty_hours), 1) AS avg_cumulative_hours, "
+                    f"SUM(legality_risk_flag) AS legality_risk_count "
+                    f"FROM {tbl} "
+                    f"GROUP BY role "
+                    f"ORDER BY legality_risk_count DESC"
+                )
+            if "role" in crew_cols:
+                return (
+                    f"SELECT role, COUNT(*) AS duties "
+                    f"FROM {tbl} "
+                    f"GROUP BY role "
+                    f"ORDER BY duties DESC"
+                )
+
+        # --- Baggage queries ---
+        if any(term in q for term in baggage_terms) and bag_cols:
+            tbl = _qual("ops_baggage_events")
+            if {"event_type", "bag_count", "root_cause"}.issubset(bag_cols):
+                return (
+                    f"SELECT event_type, "
+                    f"COUNT(*) AS events, "
+                    f"SUM(bag_count) AS total_bags, "
+                    f"COUNT(CASE WHEN root_cause != '' THEN 1 END) AS with_root_cause "
+                    f"FROM {tbl} "
+                    f"GROUP BY event_type "
+                    f"ORDER BY total_bags DESC"
+                )
+            if "event_type" in bag_cols:
+                return (
+                    f"SELECT event_type, COUNT(*) AS events "
+                    f"FROM {tbl} "
+                    f"GROUP BY event_type "
+                    f"ORDER BY events DESC"
+                )
+
         if not asrs_cols:
             return None
 

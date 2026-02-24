@@ -94,23 +94,62 @@ Columns (all TEXT):
 - issue_to_valid_hours, valid_time, hazard, geometry_type, due_to, points
 
 ### ops_flight_legs
-Columns (all TEXT):
-- flight_id, airline, flight_number, dep_icao, arr_icao
-- scheduled_dep, scheduled_arr, actual_dep, actual_arr
-- aircraft_type, registration, status
+Columns:
+- leg_id (TEXT, PRIMARY KEY)
+- source (TEXT) — data source tag
+- carrier_code (TEXT)
+- flight_no (TEXT)
+- origin_iata (TEXT)
+- dest_iata (TEXT)
+- scheduled_dep_utc (TEXT, ISO-8601 timestamp)
+- scheduled_arr_utc (TEXT, ISO-8601 timestamp)
+- actual_dep_utc (TEXT, ISO-8601 timestamp)
+- actual_arr_utc (TEXT, ISO-8601 timestamp)
+- dep_delay_min (INTEGER) — departure delay in minutes (negative = early)
+- arr_delay_min (INTEGER) — arrival delay in minutes (negative = early)
+- tailnum (TEXT)
+- distance_nm (REAL)
+- passengers (INTEGER)
 
 ### ops_turnaround_milestones
-Columns (all TEXT):
-- flight_id, milestone, scheduled_time, actual_time, station
+Columns:
+- milestone_id (TEXT, PRIMARY KEY)
+- leg_id (TEXT, FK -> ops_flight_legs.leg_id)
+- milestone (TEXT) — e.g. GATE_OPEN, BOARDING_START, PUSHBACK, TAKEOFF
+- event_ts_utc (TEXT, ISO-8601 timestamp)
+- status (TEXT)
+- delay_cause_code (TEXT) — e.g. NONE, WX, ATC, MX, BAG, CREW, SEC
 
 ### ops_crew_rosters
-Columns (all TEXT):
-- crew_id, name, role, flight_id, duty_start, duty_end, base
+Columns:
+- duty_id (TEXT, PRIMARY KEY)
+- crew_id (TEXT)
+- role (TEXT) — captain, first_officer, cabin_lead
+- leg_id (TEXT, FK -> ops_flight_legs.leg_id)
+- duty_start_utc (TEXT, ISO-8601 timestamp)
+- duty_end_utc (TEXT, ISO-8601 timestamp)
+- cumulative_duty_hours (REAL)
+- legality_risk_flag (INTEGER) — 1 if cumulative hours > 10.5
 
 ### ops_mel_techlog_events
-Columns (all TEXT):
-- event_id, registration, ata_chapter, description
-- opened_date, closed_date, mel_category, status
+Columns:
+- tech_event_id (TEXT, PRIMARY KEY)
+- leg_id (TEXT, FK -> ops_flight_legs.leg_id)
+- event_ts_utc (TEXT, ISO-8601 timestamp)
+- jasc_code (TEXT)
+- mel_category (TEXT) — B or C
+- deferred_flag (INTEGER)
+- severity (TEXT) — major or minor
+
+### ops_baggage_events
+Columns:
+- bag_event_id (TEXT, PRIMARY KEY)
+- leg_id (TEXT, FK -> ops_flight_legs.leg_id)
+- event_type (TEXT) — CHECKIN_LOADED, TRANSFER_SORTED, UNLOADED_ARRIVAL, MISHANDLED_TRIAGE
+- event_ts_utc (TEXT, ISO-8601 timestamp)
+- bag_count (INTEGER)
+- status (TEXT)
+- root_cause (TEXT)
 
 ### ops_graph_edges
 Columns (all TEXT):
