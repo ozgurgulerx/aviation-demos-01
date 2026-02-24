@@ -1,13 +1,15 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   Radar,
   ShieldAlert,
   Workflow,
   Wrench,
   BookCheck,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { QueryType } from "@/data/seed";
@@ -81,8 +83,11 @@ function inferQueryType(text: string): QueryType {
   return "ops-live";
 }
 
+const DEFAULT_VISIBLE_COUNT = 3;
+
 export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChipsProps) {
   const [isHydrated, setIsHydrated] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   useEffect(() => setIsHydrated(true), []);
 
   if (!isVisible || suggestions.length === 0) return null;
@@ -99,42 +104,76 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
     return suggestion;
   });
 
+  const visibleSuggestions = normalizedSuggestions.slice(0, DEFAULT_VISIBLE_COUNT);
+  const overflowSuggestions = normalizedSuggestions.slice(DEFAULT_VISIBLE_COUNT);
+  const hasOverflow = overflowSuggestions.length > 0;
+
   const Container = isHydrated ? motion.div : "div";
   const containerProps = isHydrated
     ? { initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 }, exit: { opacity: 0, y: 10 } }
     : {};
 
+  function renderChip(suggestion: FollowUpSuggestion, index: number) {
+    const Icon = iconMap[suggestion.type];
+    const tier = getComplexityTier(suggestion.sources ?? 1);
+    const palette = tierColorMap[tier];
+    const Chip = isHydrated ? motion.div : "div";
+    const chipProps = isHydrated
+      ? { initial: { opacity: 0, scale: 0.94 }, animate: { opacity: 1, scale: 1 }, transition: { delay: index * 0.04 } }
+      : {};
+    return (
+      <Chip key={suggestion.text} {...chipProps}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            console.log("[FollowUpChip] clicked:", suggestion.text);
+            onSelect(suggestion.text);
+          }}
+          className={`h-auto border ${palette.border} ${palette.bg} ${palette.glow ?? ""} px-3 py-2 text-xs transition-all hover:-translate-y-0.5`}
+        >
+          <Icon className={`h-3.5 w-3.5 ${palette.text}`} />
+          <span className="text-left">{suggestion.text}</span>
+        </Button>
+      </Chip>
+    );
+  }
+
   return (
     <Container {...containerProps} className="px-4 pb-3">
-      <div className="mx-auto max-w-5xl flex flex-wrap gap-2">
-        {normalizedSuggestions.map((suggestion, index) => {
-          const Icon = iconMap[suggestion.type];
-          const tier = getComplexityTier(suggestion.sources ?? 1);
-          const palette = tierColorMap[tier];
-          const Chip = isHydrated ? motion.div : "div";
-          const chipProps = isHydrated
-            ? { initial: { opacity: 0, scale: 0.94 }, animate: { opacity: 1, scale: 1 }, transition: { delay: index * 0.04 } }
-            : {};
-          return (
-            <Chip
-              key={suggestion.text}
-              {...chipProps}
+      <div className="mx-auto max-w-5xl">
+        <div className="flex flex-wrap gap-2">
+          {visibleSuggestions.map((s, i) => renderChip(s, i))}
+          {hasOverflow && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setExpanded((prev) => !prev)}
+              className="h-auto px-2.5 py-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
             >
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  console.log("[FollowUpChip] clicked:", suggestion.text);
-                  onSelect(suggestion.text);
-                }}
-                className={`h-auto border ${palette.border} ${palette.bg} ${palette.glow ?? ""} px-3 py-2 text-xs transition-all hover:-translate-y-0.5`}
-              >
-                <Icon className={`h-3.5 w-3.5 ${palette.text}`} />
-                <span className="text-left">{suggestion.text}</span>
-              </Button>
-            </Chip>
-          );
-        })}
+              {expanded ? (
+                <>Show less <ChevronUp className="ml-1 h-3 w-3" /></>
+              ) : (
+                <>+{overflowSuggestions.length} more <ChevronDown className="ml-1 h-3 w-3" /></>
+              )}
+            </Button>
+          )}
+        </div>
+        <AnimatePresence initial={false}>
+          {expanded && hasOverflow && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.22, ease: "easeOut" }}
+              className="overflow-hidden"
+            >
+              <div className="flex flex-wrap gap-2 pt-2">
+                {overflowSuggestions.map((s, i) => renderChip(s, i + DEFAULT_VISIBLE_COUNT))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </Container>
   );
