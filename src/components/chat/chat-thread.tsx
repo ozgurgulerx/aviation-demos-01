@@ -168,10 +168,10 @@ export function ChatThread({
           </AnimatePresence>
         )}
 
+        <div ref={bottomRef} className="h-1" />
         {messages.length > 0 && (
           <div className="min-h-[40vh]" aria-hidden="true" />
         )}
-        <div ref={bottomRef} className="h-1" />
       </div>
     </ScrollArea>
   );
