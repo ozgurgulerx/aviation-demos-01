@@ -34,6 +34,92 @@ class _DummyRetriever:
         return [{"id": "vec1", "title": "sample"}], []
 
 
+class _RepairingRetriever(_DummyRetriever):
+    def execute_sql_query(self, sql_query: str):
+        normalized = str(sql_query or "").strip().lower()
+        if "bad_col" in normalized:
+            return [
+                {
+                    "error": "missing columns in current schema: bad_col",
+                    "error_code": "sql_schema_missing",
+                }
+            ], []
+        if "coalesce(nullif(location" in normalized:
+            return [{"facility": "KJFK", "report_count": 3}], []
+        return [{"error": "unexpected_sql", "error_code": "sql_runtime_error"}], []
+
+
+class _RepairingSQLWriter:
+    def __init__(self):
+        self.last_constraints = {}
+
+    def generate(self, **kwargs):
+        self.last_constraints = dict(kwargs.get("constraints") or {})
+        return (
+            "SELECT COALESCE(NULLIF(location, ''), 'UNKNOWN') AS facility, "
+            "COUNT(*) AS report_count "
+            "FROM asrs_reports GROUP BY facility ORDER BY report_count DESC LIMIT 5"
+        )
+
+
+class _StillBrokenRetriever(_DummyRetriever):
+    def execute_sql_query(self, sql_query: str):
+        normalized = str(sql_query or "").strip().lower()
+        if "bad_col" in normalized:
+            return [
+                {
+                    "error": "missing columns in current schema: bad_col",
+                    "error_code": "sql_schema_missing",
+                }
+            ], []
+        if "still_bad" in normalized:
+            return [
+                {
+                    "error": "missing columns in current schema: still_bad",
+                    "error_code": "sql_schema_missing",
+                }
+            ], []
+        if "ltfj" in normalized:
+            return [{"airport": "LTFJ", "runway_id": 1, "surface": "asphalt"}], []
+        return [{"error": "unexpected_sql", "error_code": "sql_runtime_error"}], []
+
+    def _heuristic_sql_fallback(self, _query: str, _detail: str):
+        return "SELECT 'LTFJ' AS airport, 1 AS runway_id, 'asphalt' AS surface"
+
+
+class _StillBrokenSQLWriter:
+    def generate(self, **_kwargs):
+        return "SELECT still_bad FROM demo.ourairports_runways LIMIT 5"
+
+
+class _KqlFallbackRetriever(_DummyRetriever):
+    def prepare_kql_query(self, query: str, window_minutes: int = 120):
+        return query, {"query_rewritten": False}
+
+    def query_kql(self, query: str, window_minutes: int = 120, kql_schema=None):
+        normalized = str(query or "").strip().lower()
+        if "invalid_generated_kql" in normalized or "invalid_retry_kql" in normalized:
+            return [
+                {
+                    "error": "kql_unknown_columns:airport,total_risk",
+                    "error_code": "kql_validation_failed",
+                }
+            ], []
+        if "compare next-90-minute flight risk across saw, ayt, adb" in normalized:
+            return [
+                {
+                    "error": "airport identifiers cannot be mapped to opensky_states without explicit callsign or icao24 values",
+                    "error_code": "kql_unmappable_airport_filter",
+                }
+            ], []
+        return [{"status": "unexpected_query_path"}], []
+
+
+class _RetryBrokenKQLWriter:
+    def generate(self, **_kwargs):
+        return "invalid_retry_kql | project airport, total_risk"
+
+
 class PlanExecutorTests(unittest.TestCase):
     def test_execute_preserves_multiple_calls_same_source(self):
         retriever = _DummyRetriever()
@@ -98,6 +184,148 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertIn("VECTOR_OPS", result.source_results)
         self.assertEqual(result.source_results["VECTOR_OPS"][0].get("id"), "vec1")
         self.assertTrue(any("shared_embedding_failed:" in warning for warning in result.warnings))
+
+    def test_vector_call_with_non_string_query_coerces_to_user_query(self):
+        retriever = _DummyRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        plan = AgenticPlan.from_dict(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_vec_bad_query",
+                        "tool": "VECTOR_OPS",
+                        "operation": "lookup",
+                        "query": {"text": "structured payload should not crash"},
+                    }
+                ]
+            }
+        )
+
+        result = executor.execute(user_query="runway risk", plan=plan, schemas={})
+
+        self.assertIn("VECTOR_OPS", result.source_results)
+        self.assertEqual(result.source_results["VECTOR_OPS"][0].get("id"), "vec1")
+        call = plan.tool_calls[0]
+        self.assertEqual(call.params.get("__raw_query_type"), "dict")
+        self.assertIsNone(call.query)
+
+        direct_plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(  # type: ignore[arg-type]
+                    id="call_vec_runtime_coercion",
+                    tool="VECTOR_OPS",
+                    operation="lookup",
+                    query={"text": "dict payload"},
+                )
+            ]
+        )
+        executor.execute(user_query="runway risk", plan=direct_plan, schemas={})
+        self.assertEqual(
+            direct_plan.tool_calls[0].params.get("__runtime_query_coercion"),
+            "invalid_query_type:dict",
+        )
+
+    def test_sql_validation_failure_regenerates_and_executes_repaired_query(self):
+        retriever = _RepairingRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        writer = _RepairingSQLWriter()
+        executor.sql_writer = writer  # type: ignore[assignment]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_sql_repair",
+                    tool="SQL",
+                    operation="aggregate",
+                    query="SELECT bad_col FROM asrs_reports LIMIT 5",
+                    params={"evidence_type": "generic"},
+                )
+            ]
+        )
+
+        result = executor.execute(
+            user_query="Top facilities by ASRS report count",
+            plan=plan,
+            schemas={"sql_schema": {"tables": [{"table": "asrs_reports", "columns": [{"name": "location"}]}]}},
+        )
+
+        self.assertIn("SQL", result.source_results)
+        rows = result.source_results["SQL"]
+        self.assertEqual(rows[0].get("facility"), "KJFK")
+        self.assertEqual(rows[0].get("report_count"), 3)
+        self.assertEqual(writer.last_constraints.get("previous_error_code"), "sql_schema_missing")
+        self.assertIn("missing columns", writer.last_constraints.get("previous_error_detail", ""))
+        done_events = [e for e in result.source_traces if e.get("type") == "source_call_done" and e.get("source") == "SQL"]
+        self.assertTrue(done_events)
+        self.assertTrue(done_events[0].get("query_rewritten"))
+        self.assertEqual(done_events[0].get("rewrite_reason"), "sql_regenerated_after_validation_failed")
+
+    def test_sql_validation_failure_regeneration_can_fall_back_to_heuristic_sql(self):
+        retriever = _StillBrokenRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        executor.sql_writer = _StillBrokenSQLWriter()  # type: ignore[assignment]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_sql_fallback",
+                    tool="SQL",
+                    operation="aggregate",
+                    query="SELECT bad_col FROM demo.ourairports_runways LIMIT 5",
+                    params={"evidence_type": "generic"},
+                )
+            ]
+        )
+
+        result = executor.execute(
+            user_query="compare next-90-minute flight risk across SAW, AYT, ADB",
+            plan=plan,
+            schemas={"sql_schema": {"tables": [{"table": "ourairports_runways", "columns": [{"name": "id"}]}]}},
+        )
+
+        self.assertIn("SQL", result.source_results)
+        rows = result.source_results["SQL"]
+        self.assertEqual(rows[0].get("airport"), "LTFJ")
+        self.assertEqual(rows[0].get("runway_id"), 1)
+        done_events = [e for e in result.source_traces if e.get("type") == "source_call_done" and e.get("source") == "SQL"]
+        self.assertTrue(done_events)
+        self.assertEqual(
+            done_events[0].get("rewrite_reason"),
+            "sql_regenerated_after_validation_failed+heuristic_fallback",
+        )
+
+    def test_kql_validation_failure_regeneration_falls_back_to_natural_language_query(self):
+        retriever = _KqlFallbackRetriever()
+        executor = PlanExecutor(retriever)  # type: ignore[arg-type]
+        executor.kql_writer = _RetryBrokenKQLWriter()  # type: ignore[assignment]
+        plan = AgenticPlan(
+            tool_calls=[
+                ToolCall(
+                    id="call_kql_fallback",
+                    tool="KQL",
+                    operation="lookup",
+                    query="invalid_generated_kql | project airport, total_risk",
+                    params={"evidence_type": "Hazards"},
+                )
+            ]
+        )
+
+        result = executor.execute(
+            user_query="compare next-90-minute flight risk across SAW, AYT, ADB",
+            plan=plan,
+            schemas={"kql_schema": {"tables": []}},
+        )
+
+        self.assertIn("KQL", result.source_results)
+        rows = result.source_results["KQL"]
+        self.assertEqual(rows[0].get("error_code"), "kql_unmappable_airport_filter")
+        done_events = [
+            e for e in result.source_traces
+            if e.get("type") == "source_call_done" and e.get("source") == "KQL"
+        ]
+        self.assertTrue(done_events)
+        self.assertEqual(
+            done_events[0].get("rewrite_reason"),
+            "kql_regenerated_then_nl_fallback",
+        )
 
 
 if __name__ == "__main__":

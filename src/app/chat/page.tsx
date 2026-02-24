@@ -49,6 +49,8 @@ type QueryProfile = "pilot-brief" | "ops-live" | "compliance";
 type DemoScenario = "none" | "weather-spike" | "runway-notam" | "ground-bottleneck";
 type VoiceMode = "off" | "tr-TR" | "en-US";
 type VoiceClipStatus = "idle" | "preparing" | "ready" | "error";
+const EMPTY_SUCCESS_TERMINAL_ERROR =
+  "The briefing run completed without answer content. Please retry.";
 
 function createInitialSourceHealth(): SourceHealthStatus[] {
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
@@ -131,6 +133,38 @@ function resolveStreamEventTimestamp(event: StreamEvent): string {
     return new Date().toISOString();
   }
   return parsed.toISOString();
+}
+
+function extractStreamContent(event: StreamEvent): string {
+  if (typeof event.content === "string" && event.content) {
+    return event.content;
+  }
+
+  const rawContent = (event as { content?: unknown }).content;
+  if (Array.isArray(rawContent)) {
+    const parts = rawContent
+      .map((item) => {
+        if (!isRecord(item)) return "";
+        const text = item.text;
+        return typeof text === "string" ? text : "";
+      })
+      .filter(Boolean);
+    if (parts.length > 0) {
+      return parts.join("");
+    }
+  }
+
+  if (event.type === "text") {
+    const rawText = (event as { text?: unknown }).text;
+    if (typeof rawText === "string" && rawText) {
+      return rawText;
+    }
+    if (typeof event.message === "string" && event.message) {
+      return event.message;
+    }
+  }
+
+  return "";
 }
 
 function extractIntentPayloadFromPlan(plan?: Record<string, unknown>): ReasoningEventPayload {
@@ -366,6 +400,8 @@ export default function ChatPage() {
   const [activeCitationId, setActiveCitationId] = useState<number | null>(null);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStartedAtMs, setLoadingStartedAtMs] = useState<number | null>(null);
+  const [, setLoadingTick] = useState(0);
   const [streamingContent, setStreamingContent] = useState("");
   const [timelineEvents, setTimelineEvents] = useState<TelemetryEvent[]>([]);
   const [reasoningEvents, setReasoningEvents] = useState<ReasoningSseEvent[]>([]);
@@ -396,6 +432,16 @@ export default function ChatPage() {
   });
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isLoading) {
+      return;
+    }
+    const timer = setInterval(() => {
+      setLoadingTick((value) => value + 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isLoading]);
 
   const emitReasoningEvent = useCallback(
     (stage: ReasoningStage, payload?: ReasoningEventPayload, ts?: string) => {
@@ -678,6 +724,7 @@ export default function ChatPage() {
 
     for (const message of messages) {
       if (message.role !== "assistant") continue;
+      if (message.status && message.status !== "complete") continue;
       const text = toSpeechText(message.content);
       const language = voiceMode === "tr-TR" ? "tr-TR" : "en-US";
       const existingClip = voiceClipByMessageRef.current[message.id];
@@ -727,9 +774,18 @@ export default function ChatPage() {
         content,
         createdAt: new Date(),
       };
+      const assistantMessageId = generateId();
+      const placeholderAssistant: Message = {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        createdAt: new Date(),
+        status: "loading",
+      };
 
-      setMessages((previous) => [...previous, userMessage]);
+      setMessages((previous) => [...previous, userMessage, placeholderAssistant]);
       setIsLoading(true);
+      setLoadingStartedAtMs(Date.now());
       setStreamingContent("");
       setTimelineEvents([]);
       setReasoningEvents([]);
@@ -744,6 +800,12 @@ export default function ChatPage() {
       emitReasoningEvent("pii_scan");
       emitReasoningEvent("understanding_request");
       stopVoicePlayback();
+
+      const updateAssistant = (updates: Partial<Message>) => {
+        setMessages((prev) =>
+          prev.map((m) => m.id === assistantMessageId ? { ...m, ...updates } : m)
+        );
+      };
 
       try {
         const response = await fetch("/api/chat", {
@@ -779,6 +841,7 @@ export default function ChatPage() {
         let terminalAgentError: string | null = null;
         let hadPartialCompletion = false;
         let degradedSources: string[] = [];
+        let sawSuccessfulTerminal = false;
 
         const processEvent = (event: ReturnType<typeof parseSSEFrames>["events"][number]) => {
           const eventTs = resolveStreamEventTimestamp(event);
@@ -849,10 +912,16 @@ export default function ChatPage() {
             emitReasoningEvent("drafting_brief", route ? { route } : undefined, eventTs);
           }
 
-          if ((event.type === "agent_update" || event.type === "text") && event.content) {
-            fullContent += event.content;
-            setStreamingContent(fullContent);
-            emitReasoningEvent("drafting_brief", undefined, eventTs);
+          if (event.type === "agent_update" || event.type === "text") {
+            const streamedChunk = extractStreamContent(event);
+            if (streamedChunk) {
+              if (!fullContent) {
+                updateAssistant({ status: "streaming" });
+              }
+              fullContent += streamedChunk;
+              setStreamingContent(fullContent);
+              emitReasoningEvent("drafting_brief", undefined, eventTs);
+            }
           }
 
           if (event.type === "citations" && event.citations) {
@@ -860,6 +929,10 @@ export default function ChatPage() {
           }
 
           if (event.type === "agent_done" || event.type === "agent_partial_done" || event.type === "done") {
+            sawSuccessfulTerminal = true;
+            if (terminalAgentError) {
+              terminalAgentError = null;
+            }
             isVerified = !!event.isVerified;
             hadPartialCompletion = event.type === "agent_partial_done" || !!event.partial;
             degradedSources = Array.isArray(event.degradedSources) ? event.degradedSources : degradedSources;
@@ -910,6 +983,10 @@ export default function ChatPage() {
             isVerified = false;
             setRouteLabel("Error");
             setConfidenceLabel("Unavailable");
+            if (!fullContent.trim() && terminalAgentError) {
+              fullContent = terminalAgentError;
+              setStreamingContent(fullContent);
+            }
             emitReasoningEvent(
               "evidence_check_complete",
               {
@@ -954,22 +1031,39 @@ export default function ChatPage() {
           }
         }
 
-        if (!fullContent.trim() && terminalAgentError) {
-          fullContent =
-            "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.";
-          setRouteLabel("Error");
+        if (!fullContent.trim()) {
+          if (terminalAgentError) {
+            fullContent = terminalAgentError;
+            setRouteLabel("Error");
+          } else {
+            const protocolViolationMessage = sawSuccessfulTerminal
+              ? EMPTY_SUCCESS_TERMINAL_ERROR
+              : "The stream ended before an answer was generated. Please retry.";
+            terminalAgentError = protocolViolationMessage;
+            fullContent = protocolViolationMessage;
+            setRouteLabel("Error");
+            setConfidenceLabel("Unavailable");
+            setTimelineEvents((previous) => [
+              ...previous,
+              {
+                id: generateId(),
+                type: "agent_error",
+                stage: "error",
+                message: protocolViolationMessage,
+                status: "error",
+                timestamp: new Date().toISOString(),
+              },
+            ]);
+          }
         }
 
-        const assistantMessage: Message = {
-          id: generateId(),
-          role: "assistant",
+        updateAssistant({
           content: fullContent,
-          createdAt: new Date(),
           citations: newCitations,
           isVerified,
-        };
-
-        setMessages((previous) => [...previous, assistantMessage]);
+          status: terminalAgentError ? "error" : "complete",
+          errorMessage: terminalAgentError || undefined,
+        });
 
         if (newCitations.length > 0) {
           setCitations((previous) => {
@@ -1013,16 +1107,12 @@ export default function ChatPage() {
           failOpen: true,
         });
 
-        const errorMessage: Message = {
-          id: generateId(),
-          role: "assistant",
-          content:
-            "I encountered an error while preparing the flight brief. Please retry or narrow the required data sources.",
-          createdAt: new Date(),
+        updateAssistant({
+          content: "I encountered an error while preparing the flight brief. Please retry.",
+          status: "error",
+          errorMessage: error instanceof Error ? error.message : "Unknown error",
           isVerified: false,
-        };
-
-        setMessages((previous) => [...previous, errorMessage]);
+        });
         setTimelineEvents((previous) => [
           ...previous,
           {
@@ -1046,7 +1136,17 @@ export default function ChatPage() {
         });
       } finally {
         setIsLoading(false);
+        setLoadingStartedAtMs(null);
         setStreamingContent("");
+        // Safety net: if the placeholder is still in a transient state (e.g. rapid
+        // re-query race), finalize it so it doesn't show a stuck loading spinner.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMessageId && m.status !== "complete" && m.status !== "error"
+              ? { ...m, status: m.content ? "complete" : "error", errorMessage: m.content ? undefined : "Request interrupted" }
+              : m
+          )
+        );
       }
     },
     [
@@ -1238,6 +1338,11 @@ export default function ChatPage() {
           messages={messages}
           isLoading={isLoading}
           streamingContent={streamingContent}
+          loadingElapsedMs={
+            isLoading && loadingStartedAtMs
+              ? Math.max(0, Date.now() - loadingStartedAtMs)
+              : 0
+          }
           onCitationClick={handleCitationClick}
           activeCitationId={activeCitationId}
           onSpeakMessage={(messageId, content) => {

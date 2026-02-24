@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -207,7 +208,7 @@ class AviationRagContextProvider:
         precomputed_route: Optional[Dict[str, Any]] = None,
         on_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AviationRagContext:
-        route, reasoning, sql_hint = self._resolve_route(
+        route, reasoning, sql_hint, router_sources = self._resolve_route(
             query, retrieval_mode, forced_route, precomputed_route=precomputed_route
         )
 
@@ -221,7 +222,6 @@ class AviationRagContextProvider:
             explain_retrieval=explain_retrieval,
             forced_route=forced_route,
         )
-        router_sources = list((precomputed_route or {}).get("sources", []))
         retrieval_plan = build_retrieval_plan(plan_request, route, reasoning, router_sources=router_sources)
 
         source_results, source_traces, all_citations, sql_query = self._execute_plan(
@@ -315,6 +315,12 @@ class AviationRagContextProvider:
         )
         if (source_policy or "include").strip().lower() == "exact":
             plan = self._enforce_exact_source_policy(plan, required_sources, query=query)
+        plan = self._prune_non_viable_tool_calls(
+            plan=plan,
+            required_sources=required_sources,
+            source_policy=source_policy,
+            query=query,
+        )
         execution = self.plan_executor.execute(query, plan, schemas, on_trace=on_trace)
         verification = self.evidence_verifier.verify(
             plan=plan,
@@ -516,6 +522,102 @@ class AviationRagContextProvider:
         )
         return plan
 
+    def _prune_non_viable_tool_calls(
+        self,
+        plan: "AgenticPlan",
+        required_sources: List[str],
+        source_policy: str,
+        query: str,
+    ) -> "AgenticPlan":
+        source_policy_norm = (source_policy or "include").strip().lower()
+        if source_policy_norm == "exact":
+            return plan
+
+        required: set[str] = set()
+        for raw in required_sources:
+            src = _canon_tool(str(raw))
+            if src:
+                required.add(src)
+
+        capabilities = {
+            str(cap.get("source", "")).upper(): cap
+            for cap in self.retriever.source_capabilities(refresh=True)
+            if isinstance(cap, dict)
+        }
+
+        kept: List[ToolCall] = []
+        kept_ids: set[str] = set()
+        for call in plan.tool_calls:
+            tool = _canon_tool(call.tool)
+            if not tool:
+                kept.append(call)
+                kept_ids.add(call.id)
+                continue
+
+            if tool not in required:
+                capability = capabilities.get(tool, {})
+                status = str(capability.get("status", "")).strip().lower()
+                if status == "unavailable":
+                    reason = str(capability.get("reason_code") or "unavailable")
+                    plan.warnings.append(f"tool_pruned_unavailable:{tool}:{reason}")
+                    continue
+                if tool == "KQL" and self._is_airport_only_kql_call(call.query or query):
+                    plan.warnings.append("tool_pruned_unmappable_airport_kql:KQL")
+                    continue
+                if tool == "FABRIC_SQL" and self._is_short_horizon_departure_risk_query(call.query or query):
+                    plan.warnings.append("tool_pruned_short_horizon_departure_risk_fabric_sql:FABRIC_SQL")
+                    continue
+
+            kept.append(call)
+            kept_ids.add(call.id)
+
+        dropped_dependency_count = 0
+        for call in kept:
+            original_depends = list(call.depends_on or [])
+            filtered = [dep for dep in original_depends if dep in kept_ids]
+            dropped_dependency_count += max(0, len(original_depends) - len(filtered))
+            call.depends_on = filtered
+
+        if dropped_dependency_count:
+            plan.warnings.append(f"tool_prune_dropped_dependencies:{dropped_dependency_count}")
+
+        plan.tool_calls = kept
+        return plan
+
+    def _is_airport_only_kql_call(self, query: str) -> bool:
+        text = str(query or "")
+        airports = self.retriever._extract_airports_from_query(text)
+        if not airports:
+            return False
+
+        lower = text.lower()
+        weather_terms = ("weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm")
+        if any(term in lower for term in weather_terms):
+            return False
+
+        explicit_ids = self.retriever._extract_explicit_flight_identifiers(text)
+        if explicit_ids:
+            return False
+        if "callsign" in lower or "icao24" in lower:
+            return False
+        return True
+
+    def _is_short_horizon_departure_risk_query(self, query: str) -> bool:
+        text = str(query or "")
+        lower = text.lower()
+        airports = self.retriever._extract_airports_from_query(text)
+        if len(airports) < 2:
+            return False
+
+        horizon_pattern = re.compile(
+            r"\bnext[-\s]?\d{1,3}\s*(?:[-\s]?minute(?:s)?|[-\s]?min|m)\b",
+            flags=re.IGNORECASE,
+        )
+        has_short_horizon = bool(horizon_pattern.search(text))
+        has_departure_risk = ("departure" in lower and "risk" in lower) or ("flight risk" in lower)
+        has_compare = any(token in lower for token in ("compare", "across", "versus", "vs"))
+        return has_short_horizon and has_departure_risk and has_compare
+
     def _execute_plan(
         self,
         query: str,
@@ -684,7 +786,7 @@ class AviationRagContextProvider:
         if not rows:
             return [], [], False
 
-        hidden_keys = {"content_vector"}
+        hidden_keys = {"content_vector", "partial_schema", "fallback_sql"}
         columns: List[str] = []
         for row in rows:
             if not isinstance(row, dict):
@@ -815,28 +917,35 @@ class AviationRagContextProvider:
         retrieval_mode: str,
         forced_route: Optional[str],
         precomputed_route: Optional[Dict[str, Any]] = None,
-    ) -> tuple[str, str, Optional[str]]:
+    ) -> tuple[str, str, Optional[str], List[str]]:
         if forced_route in ("SQL", "SEMANTIC", "HYBRID"):
-            return forced_route, "Route forced by caller", None
+            return forced_route, "Route forced by caller", None, []
 
         # Preserve existing product behavior: foundry-iq favors semantic retrieval.
         if retrieval_mode == "foundry-iq":
-            return "SEMANTIC", "Foundry IQ mode prefers semantic context", None
+            return "SEMANTIC", "Foundry IQ mode prefers semantic context", None, []
 
         # Use precomputed route from parallel PII+routing if available.
         if precomputed_route is not None:
             route = precomputed_route.get("route", "HYBRID")
             reasoning = precomputed_route.get("reasoning", "Route inferred by QueryRouter (parallel)")
             sql_hint = precomputed_route.get("sql_hint")
-            return route, reasoning, sql_hint
+            sources = list(precomputed_route.get("sources", []))
+            return route, reasoning, sql_hint, sources
+
+        # Load intent graph and feed it to the LLM router for optimal
+        # multi-source selection (mirrors the agentic path).
+        intent_graph = self.intent_graph_provider.load()
+        intent_graph_data = intent_graph.data if intent_graph else None
 
         _t0 = time.perf_counter()
-        route_result = self.retriever.router.route(query)
+        route_result = self.retriever.router.route(query, intent_graph=intent_graph_data)
         logger.info("perf stage=%s ms=%.1f", "routing", (time.perf_counter() - _t0) * 1000)
         route = route_result.get("route", "HYBRID")
         reasoning = route_result.get("reasoning", "Route inferred by QueryRouter")
         sql_hint = route_result.get("sql_hint")
-        return route, reasoning, sql_hint
+        sources = list(route_result.get("sources", []))
+        return route, reasoning, sql_hint, sources
 
     def _compose_context_text(
         self,
@@ -858,7 +967,7 @@ class AviationRagContextProvider:
         if sql_query:
             sections.append(f"SQL query:\n{sql_query}")
 
-        for source in ("KQL", "GRAPH", "NOSQL", "SQL", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT"):
+        for source in ("KQL", "GRAPH", "NOSQL", "SQL", "FABRIC_SQL", "VECTOR_REG", "VECTOR_OPS", "VECTOR_AIRPORT"):
             rows = source_results.get(source)
             if not rows:
                 continue
@@ -954,6 +1063,7 @@ class AviationRagContextProvider:
         return "\n\n".join(all_sections)
 
     def _format_rows(self, rows: List[Dict[str, Any]], source: str, max_rows: int = 8) -> str:
+        _hidden = {"content_vector", "partial_schema", "fallback_sql"}
         lines: List[str] = []
         for idx, row in enumerate(rows[:max_rows], start=1):
             # Build metadata prefix from fusion/evidence annotations.
@@ -972,10 +1082,10 @@ class AviationRagContextProvider:
                 snippet = str(row.get("content", ""))[:220].replace("\n", " ")
                 lines.append(f"{idx}. {meta_prefix}{title} ({doc_id})\n   {snippet}")
                 continue
-            # Filter out __-prefixed internal keys from compact output.
+            # Filter out __-prefixed internal keys and debug columns from compact output.
             compact = ", ".join(
                 f"{k}={v}" for k, v in list(row.items())[:10]
-                if not str(k).startswith("__")
+                if not str(k).startswith("__") and k not in _hidden
             )
             lines.append(f"{idx}. {meta_prefix}{compact}")
         return "\n".join(lines) if lines else "No rows returned."

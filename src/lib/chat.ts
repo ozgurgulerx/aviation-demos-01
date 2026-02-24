@@ -82,6 +82,7 @@ export interface StreamEvent {
   rows_truncated?: boolean;
   error?: string;
   error_code?: string;
+  terminal_reason?: string;
   contract_status?: "planned" | "met" | "degraded" | "failed";
   citations?: Array<{
     id: number;
@@ -363,6 +364,8 @@ export function toTelemetryEvent(event: StreamEvent): TelemetryEvent | null {
         message: event.message || event.error || "Unexpected error",
         status: "error",
         timestamp,
+        errorCode: event.error_code,
+        terminalReason: event.terminal_reason,
       };
     case "pii_redacted":
       return {

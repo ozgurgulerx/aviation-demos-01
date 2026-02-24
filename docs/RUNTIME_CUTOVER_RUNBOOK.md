@@ -15,17 +15,23 @@ Data platform migration is handled separately.
 
 - Confirm target login and subscription:
   - `az account show --query "{user:user.name,tenantId:tenantId,id:id}" -o table`
-- Align local kubectl context with deploy target before any verification:
+  - Expected hard guardrail:
+    - user: `admin@MngEnvMCAP705508.onmicrosoft.com`
+    - tenantId: `52095a81-130f-4b06-83f1-9859b2c73de6`
+    - subscriptionId: `6a539906-6ce2-4e3b-84ee-89f701de18d8`
+- Validate local Azure and kubectl targeting before any verification:
   - `./scripts/aks/use-deploy-target-context.sh`
+- Validate tenant-lock end-to-end (account + resources + live AKS guardrail config):
+  - `./scripts/validate-tenant-lock.sh`
 - Freeze deploys to `main` during migration window.
 - Prepare GitHub secrets (target values):
-  - `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
+  - `AZURE_CLIENT_ID`
   - `AZURE_OPENAI_API_KEY`, `AZURE_SEARCH_ADMIN_KEY`, `PGPASSWORD`
   - Optional: `APPLICATIONINSIGHTS_CONNECTION_STRING`, `FABRIC_BEARER_TOKEN`
 - Prepare GitHub variables (target values):
-  - `AZURE_RESOURCE_GROUP`, `AZURE_WEBAPP_NAME`
-  - `AKS_RESOURCE_GROUP`, `AKS_CLUSTER`, `AKS_NAMESPACE`
-  - `AZURE_CONTAINER_REGISTRY_NAME`, `AZURE_CONTAINER_REGISTRY`
+  - `AZURE_RESOURCE_GROUP`, `AZURE_WEBAPP_NAME` (only if intentionally changing hardcoded workflow target)
+  - `AKS_RESOURCE_GROUP`, `AKS_CLUSTER`, `AKS_NAMESPACE` (only if intentionally changing hardcoded workflow target)
+  - `AZURE_CONTAINER_REGISTRY_NAME`, `AZURE_CONTAINER_REGISTRY` (only if intentionally changing hardcoded workflow target)
   - `BACKEND_URL`, `PII_ENDPOINT`, `PII_CONTAINER_ENDPOINT`
   - `PG_SERVER_NAME`, `PG_RESOURCE_GROUP`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`
   - `AZURE_OPENAI_ENDPOINT`, `AZURE_SEARCH_ENDPOINT`
@@ -38,7 +44,7 @@ Example:
 SUBSCRIPTION_ID="<target-subscription-id>" \
 RESOURCE_GROUP="rg-aviation-rag" \
 LOCATION="westeurope" \
-ACR_NAME="aviationragacr" \
+ACR_NAME="avrag705508acr" \
 ACR_RESOURCE_GROUP="rg-aviation-rag" \
 PG_SERVER_RG="<postgres-rg>" \
 PG_SERVER="<postgres-server>" \

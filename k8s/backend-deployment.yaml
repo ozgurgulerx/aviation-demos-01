@@ -21,7 +21,9 @@ spec:
     metadata:
       labels:
         app: aviation-rag-backend
+        azure.workload.identity/use: "true"
     spec:
+      serviceAccountName: aviation-rag-backend
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
@@ -49,6 +51,7 @@ spec:
         args:
         - >
           exec gunicorn --bind 0.0.0.0:5001
+          --no-control-socket
           --worker-class "${GUNICORN_WORKER_CLASS}"
           --workers "${GUNICORN_WORKERS}"
           --threads "${GUNICORN_THREADS}"

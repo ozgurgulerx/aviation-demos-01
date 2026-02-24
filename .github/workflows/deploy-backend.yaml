@@ -20,30 +20,36 @@ permissions:
   contents: read
 
 env:
-  AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME || 'avrag705508acr' }}
-  AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY || 'avrag705508acr.azurecr.io' }}
+  TARGET_ACCOUNT_UPN: admin@MngEnvMCAP705508.onmicrosoft.com
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+  EXPECTED_RUNTIME_ACCOUNT_UPN: admin@MngEnvMCAP705508.onmicrosoft.com
+  EXPECTED_RUNTIME_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  EXPECTED_RUNTIME_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+  AZURE_CONTAINER_REGISTRY_NAME: avrag705508acr
+  AZURE_CONTAINER_REGISTRY: avrag705508acr.azurecr.io
   IMAGE_NAME: ${{ vars.BACKEND_IMAGE_NAME || 'aviation-rag-backend' }}
   IMAGE_TAG: ${{ github.sha }}
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER || 'aks-aviation-rag' }}
-  AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || 'rg-aviation-rag' }}
-  K8S_NAMESPACE: ${{ vars.AKS_NAMESPACE || 'aviation-rag' }}
+  AKS_CLUSTER: aks-aviation-rag
+  AKS_RESOURCE_GROUP: rg-aviation-rag
+  K8S_NAMESPACE: aviation-rag
   EXPECTED_AKS_RESOURCE_ID: ${{ vars.EXPECTED_AKS_RESOURCE_ID || '' }}
   EXPECTED_ACR_RESOURCE_ID: ${{ vars.EXPECTED_ACR_RESOURCE_ID || '' }}
 
-  AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+  AZURE_OPENAI_ENDPOINT: https://swedencentral.api.cognitive.microsoft.com/
   AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION || '2024-10-21' }}
   AZURE_OPENAI_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'gpt-5-nano' }}
   AZURE_OPENAI_WORKER_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_WORKER_DEPLOYMENT_NAME || vars.AZURE_OPENAI_DEPLOYMENT_NAME || 'gpt-5-nano' }}
   AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT_NAME || vars.AZURE_OPENAI_REASONING_DEPLOYMENT_NAME || 'gpt-5-mini' }}
   AZURE_OPENAI_REASONING_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_REASONING_DEPLOYMENT_NAME || 'gpt-5-mini' }}
   AZURE_REASONING_OPENAI_API_VERSION: ${{ vars.AZURE_REASONING_OPENAI_API_VERSION || 'v1' }}
-  AZURE_OPENAI_PROJECT_ENDPOINT: ${{ vars.AZURE_OPENAI_PROJECT_ENDPOINT || vars.AZURE_FOUNDRY_PROJECT_ENDPOINT }}
-  AZURE_FOUNDRY_PROJECT_ENDPOINT: ${{ vars.AZURE_FOUNDRY_PROJECT_ENDPOINT || vars.AZURE_OPENAI_PROJECT_ENDPOINT }}
+  AZURE_OPENAI_PROJECT_ENDPOINT: ""
+  AZURE_FOUNDRY_PROJECT_ENDPOINT: ""
   AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME: ${{ vars.AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME || 'text-embedding-3-small' }}
-  AZURE_SEARCH_ENDPOINT: ${{ vars.AZURE_SEARCH_ENDPOINT }}
+  AZURE_SEARCH_ENDPOINT: https://aisearchozguler.search.windows.net
   PII_ENDPOINT: ${{ vars.PII_ENDPOINT }}
   PII_CONTAINER_ENDPOINT: ${{ vars.PII_CONTAINER_ENDPOINT }}
-  PGHOST: ${{ vars.PGHOST }}
+  PGHOST: aviationragpg705508.postgres.database.azure.com
   PGPORT: ${{ vars.PGPORT || '5432' }}
   PGDATABASE: ${{ vars.PGDATABASE || 'aviationrag' }}
   PGUSER: ${{ vars.PGUSER || 'aviationrag_readonly' }}
@@ -65,11 +71,20 @@ env:
   GUNICORN_KEEPALIVE_SECONDS: ${{ vars.GUNICORN_KEEPALIVE_SECONDS || '5' }}
   GUNICORN_MAX_REQUESTS: ${{ vars.GUNICORN_MAX_REQUESTS || '1000' }}
   GUNICORN_MAX_REQUESTS_JITTER: ${{ vars.GUNICORN_MAX_REQUESTS_JITTER || '200' }}
+  FABRIC_KUSTO_CLUSTER_URL: ${{ vars.FABRIC_KUSTO_CLUSTER_URL }}
   FABRIC_KQL_ENDPOINT: ${{ vars.FABRIC_KQL_ENDPOINT }}
+  FABRIC_KQL_DATABASE: ${{ vars.FABRIC_KQL_DATABASE }}
   FABRIC_GRAPH_ENDPOINT: ${{ vars.FABRIC_GRAPH_ENDPOINT }}
+  FABRIC_GRAPH_DATABASE: ${{ vars.FABRIC_GRAPH_DATABASE || vars.FABRIC_KQL_DATABASE }}
   FABRIC_NOSQL_ENDPOINT: ${{ vars.FABRIC_NOSQL_ENDPOINT }}
+  ALLOW_SHARED_FABRIC_ENDPOINTS: ${{ vars.ALLOW_SHARED_FABRIC_ENDPOINTS || 'false' }}
+  ALLOW_STATIC_FABRIC_BEARER: ${{ vars.ALLOW_STATIC_FABRIC_BEARER || 'false' }}
+  FABRIC_TOKEN_MIN_TTL_SECONDS: ${{ vars.FABRIC_TOKEN_MIN_TTL_SECONDS || '120' }}
   FABRIC_SQL_ENDPOINT: ${{ vars.FABRIC_SQL_ENDPOINT }}
+  FABRIC_SQL_SERVER: ${{ vars.FABRIC_SQL_SERVER }}
   FABRIC_SQL_DATABASE: ${{ vars.FABRIC_SQL_DATABASE }}
+  FABRIC_SQL_MODE: ${{ vars.FABRIC_SQL_MODE || 'auto' }}
+  FABRIC_WORKLOAD_IDENTITY_CLIENT_ID: ${{ vars.FABRIC_WORKLOAD_IDENTITY_CLIENT_ID }}
   AZURE_COSMOS_ENDPOINT: ${{ vars.AZURE_COSMOS_ENDPOINT }}
   AZURE_COSMOS_DATABASE: ${{ vars.AZURE_COSMOS_DATABASE || 'aviationrag' }}
   AZURE_COSMOS_CONTAINER: ${{ vars.AZURE_COSMOS_CONTAINER || 'notams' }}
@@ -108,25 +123,25 @@ jobs:
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ env.TARGET_TENANT_ID }}
+          subscription-id: ${{ env.TARGET_SUBSCRIPTION_ID }}
 
       - name: Validate Azure account target
         run: |
           actual_subscription="$(az account show --query id -o tsv)"
           actual_tenant="$(az account show --query tenantId -o tsv)"
 
-          if [ "$actual_subscription" != "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]; then
-            echo "::error::Azure subscription mismatch. Expected '${{ secrets.AZURE_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
+          if [ "$actual_subscription" != "${{ env.TARGET_SUBSCRIPTION_ID }}" ]; then
+            echo "::error::Azure subscription mismatch. Expected '${{ env.TARGET_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
             exit 1
           fi
 
-          if [ "$actual_tenant" != "${{ secrets.AZURE_TENANT_ID }}" ]; then
-            echo "::error::Azure tenant mismatch. Expected '${{ secrets.AZURE_TENANT_ID }}' but got '$actual_tenant'."
+          if [ "$actual_tenant" != "${{ env.TARGET_TENANT_ID }}" ]; then
+            echo "::error::Azure tenant mismatch. Expected '${{ env.TARGET_TENANT_ID }}' but got '$actual_tenant'."
             exit 1
           fi
 
-          echo "Azure target context verified: subscription=$actual_subscription tenant=$actual_tenant"
+          echo "Azure target context verified for account=${{ env.TARGET_ACCOUNT_UPN }} subscription=$actual_subscription tenant=$actual_tenant"
 
       - name: Validate ACR target
         run: |
@@ -173,25 +188,25 @@ jobs:
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ env.TARGET_TENANT_ID }}
+          subscription-id: ${{ env.TARGET_SUBSCRIPTION_ID }}
 
       - name: Validate Azure account target
         run: |
           actual_subscription="$(az account show --query id -o tsv)"
           actual_tenant="$(az account show --query tenantId -o tsv)"
 
-          if [ "$actual_subscription" != "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]; then
-            echo "::error::Azure subscription mismatch. Expected '${{ secrets.AZURE_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
+          if [ "$actual_subscription" != "${{ env.TARGET_SUBSCRIPTION_ID }}" ]; then
+            echo "::error::Azure subscription mismatch. Expected '${{ env.TARGET_SUBSCRIPTION_ID }}' but got '$actual_subscription'."
             exit 1
           fi
 
-          if [ "$actual_tenant" != "${{ secrets.AZURE_TENANT_ID }}" ]; then
-            echo "::error::Azure tenant mismatch. Expected '${{ secrets.AZURE_TENANT_ID }}' but got '$actual_tenant'."
+          if [ "$actual_tenant" != "${{ env.TARGET_TENANT_ID }}" ]; then
+            echo "::error::Azure tenant mismatch. Expected '${{ env.TARGET_TENANT_ID }}' but got '$actual_tenant'."
             exit 1
           fi
 
-          echo "Azure target context verified: subscription=$actual_subscription tenant=$actual_tenant"
+          echo "Azure target context verified for account=${{ env.TARGET_ACCOUNT_UPN }} subscription=$actual_subscription tenant=$actual_tenant"
 
       - name: Validate required runtime variables
         run: |
@@ -305,9 +320,10 @@ jobs:
       - name: Render Kubernetes manifests
         run: ./scripts/render-k8s-manifests.sh /tmp/k8s-rendered
 
-      - name: Apply namespace and service manifests
+      - name: Apply namespace, service account, and service manifests
         run: |
           kubectl apply -f /tmp/k8s-rendered/namespace.yaml
+          kubectl apply -f /tmp/k8s-rendered/backend-serviceaccount.yaml
           kubectl apply -f /tmp/k8s-rendered/backend-service.yaml
 
       - name: Create or update backend secrets
@@ -543,3 +559,44 @@ jobs:
             echo "::error::Deployment image mismatch. Expected '$expected_image' but found '$actual_image'."
             exit 1
           fi
+
+      - name: Verify datastore baseline guardrails
+        run: |
+          set -euo pipefail
+          kubectl -n "${{ env.K8S_NAMESPACE }}" port-forward deployment/aviation-rag-backend 18081:5001 >/tmp/backend-port-forward.log 2>&1 &
+          pf_pid=$!
+          cleanup() {
+            kill "$pf_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          health_ready=false
+          for _ in $(seq 1 40); do
+            if curl -fsS --max-time 2 "http://127.0.0.1:18081/health" >/dev/null; then
+              health_ready=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${health_ready}" != "true" ]; then
+            echo "::error::Backend health probe did not become reachable via deployment port-forward."
+            cat /tmp/backend-port-forward.log || true
+            exit 1
+          fi
+
+          if ! preflight_payload="$(curl -fsS --max-time 30 "http://127.0.0.1:18081/api/fabric/preflight")"; then
+            echo "::error::Failed to fetch backend /api/fabric/preflight via deployment port-forward."
+            cat /tmp/backend-port-forward.log || true
+            exit 1
+          fi
+          echo "${preflight_payload}" | jq '.'
+
+          baseline_unavailable="$(echo "${preflight_payload}" | jq -r '.baseline_unavailable_sources | join(",")')"
+          if [ -n "${baseline_unavailable}" ] && [ "${baseline_unavailable}" != "null" ]; then
+            echo "::error::Baseline sources unavailable after deploy: ${baseline_unavailable}"
+            exit 1
+          fi
+
+          overall_status="$(echo "${preflight_payload}" | jq -r '.overall_status')"
+          echo "Post-deploy preflight overall_status=${overall_status}"

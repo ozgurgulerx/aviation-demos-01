@@ -16,6 +16,8 @@ export interface PiiCheckResult {
 }
 
 // Chat Types
+export type MessageStatus = "loading" | "streaming" | "complete" | "error";
+
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
@@ -24,6 +26,8 @@ export interface Message {
   citations?: Citation[];
   isVerified?: boolean;
   toolCalls?: ToolCall[];
+  status?: MessageStatus;      // undefined = "complete" (backward compat)
+  errorMessage?: string;       // populated when status is "error"
 }
 
 export interface Citation {
@@ -134,6 +138,7 @@ export interface TelemetryEvent {
   alertSeverity?: OperationalAlertSeverity;
   contractStatus?: "planned" | "met" | "degraded" | "failed";
   errorCode?: string;
+  terminalReason?: string;
   degradedSources?: string[];
   failedRequiredSources?: string[];
   requiredSourcesSatisfied?: boolean;

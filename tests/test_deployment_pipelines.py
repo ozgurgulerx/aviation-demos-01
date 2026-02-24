@@ -141,8 +141,6 @@ class TestDeployBackendWorkflow:
         raw = _read(os.path.join(WORKFLOWS_DIR, "deploy-backend.yaml"))
         for secret in [
             "AZURE_CLIENT_ID",
-            "AZURE_TENANT_ID",
-            "AZURE_SUBSCRIPTION_ID",
             "AZURE_OPENAI_API_KEY",
             "AZURE_SEARCH_ADMIN_KEY",
             "PGPASSWORD",
@@ -180,6 +178,12 @@ class TestDeployFrontendWorkflow:
         """Workflow file changes should trigger a re-deploy."""
         paths = self.wf["on"]["push"]["paths"]
         assert any("deploy-frontend" in p for p in paths)
+
+    def test_token_auth_supports_client_id_secret_fallback_and_validation(self):
+        raw = _read(os.path.join(WORKFLOWS_DIR, "deploy-frontend.yaml"))
+        assert "AZURE_OPENAI_CLIENT_ID_SECRET" in raw
+        assert "effective_client_id=" in raw
+        assert "AZURE_OPENAI_AUTH_MODE=token requires client credentials" in raw
 
 
 class TestInfraHealthCheckWorkflow:
@@ -297,6 +301,9 @@ class TestDockerfileBackend:
     def test_gunicorn_binds_to_5001(self):
         assert "0.0.0.0:5001" in self.content
 
+    def test_gunicorn_disables_control_socket(self):
+        assert "--no-control-socket" in self.content
+
     def test_env_defaults_set(self):
         assert "GUNICORN_WORKER_CLASS=gthread" in self.content
         assert "GUNICORN_WORKERS=" in self.content
@@ -314,6 +321,10 @@ class TestDockerfileBackend:
     def test_pip_installs_requirements(self):
         assert "pip install" in self.content
         assert "requirements.txt" in self.content
+
+    def test_installs_sqlserver_odbc_driver(self):
+        assert "msodbcsql18" in self.content
+        assert "unixodbc" in self.content
 
 
 class TestDockerfileFrontend:
@@ -858,6 +869,10 @@ class TestPortConsistency:
         raw = _read(os.path.join(K8S_DIR, "backend-deployment.yaml"))
         assert "0.0.0.0:5001" in raw
 
+    def test_gunicorn_control_socket_disabled_in_deployment(self):
+        raw = _read(os.path.join(K8S_DIR, "backend-deployment.yaml"))
+        assert "--no-control-socket" in raw
+
     def test_all_probes_use_port_5001(self):
         docs = _load_yaml_docs(os.path.join(K8S_DIR, "backend-deployment.yaml"))
         deploy = next(d for d in docs if d["kind"] == "Deployment")
@@ -998,6 +1013,9 @@ class TestRequirementsTxt:
         pkgs = self._req_packages()
         assert "psycopg2-binary" in pkgs or "psycopg2" in pkgs
 
+    def test_pyodbc_in_requirements(self):
+        assert "pyodbc" in self._req_packages()
+
     def test_duplicate_installs_flagged(self):
         """Packages installed separately in Dockerfile that are already in requirements.txt."""
         req_pkgs = self._req_packages()
@@ -1037,6 +1055,21 @@ class TestDeploymentSafety:
         for secret_var in ["API_KEY", "ADMIN_KEY", "PGPASSWORD", "SECRET"]:
             # These should NOT appear as keys in the configmap
             assert f"  {secret_var}:" not in cm_raw or "PGPASSWORD" not in cm_raw
+
+    def test_runtime_identity_envs_are_not_wired_to_expected_guardrail_values(self):
+        cm_raw = _read(os.path.join(K8S_DIR, "backend-configmap.yaml"))
+        assert 'AZURE_ACCOUNT_UPN: "${AZURE_ACCOUNT_UPN}"' in cm_raw
+        assert 'AZURE_TENANT_ID: "${AZURE_TENANT_ID}"' in cm_raw
+        assert 'AZURE_SUBSCRIPTION_ID: "${AZURE_SUBSCRIPTION_ID}"' in cm_raw
+        assert 'AZURE_ACCOUNT_UPN: "${EXPECTED_RUNTIME_ACCOUNT_UPN}"' not in cm_raw
+        assert 'AZURE_TENANT_ID: "${EXPECTED_RUNTIME_TENANT_ID}"' not in cm_raw
+        assert 'AZURE_SUBSCRIPTION_ID: "${EXPECTED_RUNTIME_SUBSCRIPTION_ID}"' not in cm_raw
+
+    def test_render_script_does_not_default_runtime_identity_from_expected_values(self):
+        content = _read(os.path.join(SCRIPTS_DIR, "render-k8s-manifests.sh"))
+        assert ': "${AZURE_ACCOUNT_UPN:=${EXPECTED_RUNTIME_ACCOUNT_UPN}}"' not in content
+        assert ': "${AZURE_TENANT_ID:=${EXPECTED_RUNTIME_TENANT_ID}}"' not in content
+        assert ': "${AZURE_SUBSCRIPTION_ID:=${EXPECTED_RUNTIME_SUBSCRIPTION_ID}}"' not in content
 
     def test_provision_script_has_strict_mode(self):
         content = _read(os.path.join(SCRIPTS_DIR, "provision-azure.sh"))
@@ -1136,8 +1169,8 @@ class TestKnownGaps:
         deploy_raw = _read(os.path.join(WORKFLOWS_DIR, "deploy-backend.yaml"))
         # Migrate: secrets.PGHOST
         assert "secrets.PGHOST" in migrate_raw
-        # Deploy: vars.PGHOST
-        assert "vars.PGHOST" in deploy_raw
+        # Deploy: vars.PGHOST or hardcoded PGHOST
+        assert "vars.PGHOST" in deploy_raw or "PGHOST:" in deploy_raw
 
     def test_ingress_uses_deprecated_annotation(self):
         """Ingress uses annotation-based class instead of spec.ingressClassName."""

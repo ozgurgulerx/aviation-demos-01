@@ -99,12 +99,80 @@ Before finalizing tenant/infra/fabric/runtime changes, confirm:
 
 If any preflight check fails, stop and surface the blocker.
 
+## Fabric Regression Guardrails
+
+For any Fabric datastore change (KQL, Graph, NoSQL, Fabric SQL), enforce:
+
+1. Kusto endpoint path normalization:
+   - Accept either cluster root (`https://<cluster>.kusto.fabric.microsoft.com`) or explicit query paths ending with `/v1/rest/query` or `/v2/rest/query`.
+   - Reject duplicate query path suffixes (for example, `.../v2/rest/query/v1/rest/query`).
+2. Auth mode precedence:
+   - Prefer service principal credentials (`FABRIC_CLIENT_ID`, `FABRIC_CLIENT_SECRET`, `FABRIC_TENANT_ID`).
+   - Treat `FABRIC_BEARER_TOKEN` as fallback only.
+3. Fabric SQL mode policy:
+   - Default to REST-first execution when `FABRIC_SQL_ENDPOINT` is configured.
+   - Use TDS only as fallback when REST is unavailable and prerequisites are present.
+4. Preflight quality bar:
+   - Do not claim Fabric source health from endpoint reachability alone.
+   - Require preflight query-readiness fields (`path_valid_for_runtime`, `query_ready`) to be healthy for configured sources.
+5. Regression tests:
+   - Any Fabric runtime path/mode/auth change must include or update tests covering endpoint normalization, auth behavior, and execution-mode selection.
+6. Static bearer fallback discipline:
+   - `FABRIC_BEARER_TOKEN` is ignored unless `ALLOW_STATIC_FABRIC_BEARER=true`.
+   - If static bearer fallback is enabled, rotate token proactively and validate TTL/readiness in preflight.
+   - For KQL/Graph/NoSQL, static bearer token audience must match the Kusto cluster endpoint (`https://<cluster>.kusto.fabric.microsoft.com`), not only `https://api.fabric.microsoft.com`.
+7. Strict required-source semantics:
+   - In strict mode, treat a required source as satisfied when at least one call for that source succeeds.
+   - Do not fail strict mode solely because an additional call for the same source returned an error.
+8. Fabric SQL container dependency baseline:
+   - Backend image must include `pyodbc` and `msodbcsql18` (plus unixODBC libs) for TDS mode.
+   - Pin a Microsoft-supported Debian base (currently `python:3.11-slim-bookworm`) to avoid package-feed drift on newer distros.
+9. Frontend probe payload contract:
+   - Frontend `/api/chat` validation requires `messages` array; runbooks/scripts should send both `message` and `messages` for compatibility.
+
+## AKS Backend Image Platform Guardrail
+
+For backend image build/deploy actions in this repository, enforce:
+
+1. Platform lock:
+   - `aviation-rag-backend` release images must be built and pushed as `linux/amd64`.
+2. Build command discipline:
+   - Use explicit platform pinning for backend builds (for example, `docker buildx build --platform linux/amd64 ...`).
+   - Treat unqualified `docker build` on non-`amd64` hosts as out-of-policy for release images.
+3. Manifest verification before rollout:
+   - Verify ACR manifest metadata for the target tag/digest reports `os=linux` and `architecture=amd64`.
+4. Block on mismatch:
+   - If target image is not `linux/amd64`, stop deployment and rebuild with the correct platform.
+5. Runtime compatibility note:
+   - Current AKS nodepool runtime architecture is `amd64`; keep backend image architecture aligned.
+
+## Backend Container OS and Driver Baseline
+
+For any `Dockerfile.backend`, backend dependency, or backend deploy workflow change, enforce:
+
+1. Base OS pinning:
+   - Keep backend base image pinned to a Microsoft ODBC-supported Debian baseline (`python:3.11-slim-bookworm`).
+   - Treat floating tags (for example `python:3.11-slim`, `latest`) as out-of-policy for backend release images.
+2. ODBC runtime dependency floor:
+   - Keep unixODBC runtime/dev libraries and Microsoft SQL Server ODBC driver 18 installed in the backend image.
+   - If the Microsoft package repo stanza changes, keep it aligned to Debian 12/bookworm.
+3. Python dependency floor:
+   - Keep `pyodbc` in `requirements.txt` while Fabric SQL TDS mode remains supported.
+4. Regression test gate:
+   - Keep automated checks that verify backend image baseline assumptions (base image codename, ODBC driver install, `pyodbc` presence) in test coverage.
+   - If baseline changes are intentional, update tests in the same change.
+5. Deployment block conditions:
+   - If OS codename, ODBC driver major version, or `pyodbc` support is removed/changed without an explicit migration plan, stop rollout and surface blocker before deployment.
+
 ## Subscription Guardrail
 
-For any Azure action in this repository, use only the subscription tied to `admin@MngEnvMCAP705508.onmicrosoft.com`.
+For any Azure action in this repository, use only this hardcoded tenant/account/subscription target:
 
-- Treat any other subscription as out of policy unless the active user conversation explicitly overrides this rule.
-- If docs, memory, scripts, CLI context, or environment values conflict with this guardrail, stop and surface the mismatch before proceeding.
+- Account: `admin@MngEnvMCAP705508.onmicrosoft.com`
+- Tenant ID: `52095a81-130f-4b06-83f1-9859b2c73de6`
+- Subscription ID: `6a539906-6ce2-4e3b-84ee-89f701de18d8`
+
+Treat any other tenant/subscription/account as out of policy. If docs, memory, scripts, CLI context, workflow values, or environment values conflict with this guardrail, stop and surface the mismatch before proceeding.
 
 ## Local Change Policy
 

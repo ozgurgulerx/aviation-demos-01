@@ -29,20 +29,22 @@ require_cmd envsubst
 
 CURRENT_SUBSCRIPTION="$(az account show --query id -o tsv)"
 CURRENT_TENANT="$(az account show --query tenantId -o tsv)"
+TARGET_SUBSCRIPTION_ID="6a539906-6ce2-4e3b-84ee-89f701de18d8"
+TARGET_TENANT_ID="52095a81-130f-4b06-83f1-9859b2c73de6"
 
 APP_NAME="${APP_NAME:-aviation-rag}"
 LOCATION="${LOCATION:-westeurope}"
-SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-$CURRENT_SUBSCRIPTION}"
+SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-$TARGET_SUBSCRIPTION_ID}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-aviation-rag}"
 
 # Runtime infra names
 VNET_NAME="${VNET_NAME:-vnet-aviation-rag}"
 AKS_NAME="${AKS_NAME:-aks-aviation-rag}"
-ACR_NAME="${ACR_NAME:-aviationragacr}"
+ACR_NAME="${ACR_NAME:-avrag705508acr}"
 ACR_RESOURCE_GROUP="${ACR_RESOURCE_GROUP:-$RESOURCE_GROUP}"
 APP_SERVICE_PLAN="${APP_SERVICE_PLAN:-plan-aviation-rag-frontend}"
 APP_SERVICE_PLAN_SKU="${APP_SERVICE_PLAN_SKU:-P1V3}"
-WEBAPP_NAME="${WEBAPP_NAME:-aviation-rag-frontend}"
+WEBAPP_NAME="${WEBAPP_NAME:-aviation-rag-frontend-705508}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-aviation-rag}"
 IMAGE_NAME="${IMAGE_NAME:-aviation-rag-backend}"
 
@@ -101,6 +103,9 @@ AF_MAX_SESSIONS="${AF_MAX_SESSIONS:-500}"
 FABRIC_KQL_ENDPOINT="${FABRIC_KQL_ENDPOINT:-}"
 FABRIC_GRAPH_ENDPOINT="${FABRIC_GRAPH_ENDPOINT:-}"
 FABRIC_NOSQL_ENDPOINT="${FABRIC_NOSQL_ENDPOINT:-}"
+FABRIC_SQL_ENDPOINT="${FABRIC_SQL_ENDPOINT:-}"
+FABRIC_SQL_SERVER="${FABRIC_SQL_SERVER:-}"
+FABRIC_SQL_DATABASE="${FABRIC_SQL_DATABASE:-}"
 FABRIC_GRAPH_DATABASE="${FABRIC_GRAPH_DATABASE:-}"
 GRAPH_TIMEOUT_SECONDS="${GRAPH_TIMEOUT_SECONDS:-3}"
 GRAPH_MAX_RETRIES="${GRAPH_MAX_RETRIES:-1}"
@@ -129,12 +134,28 @@ echo "============================================="
 echo " Aviation RAG — Runtime Provisioning"
 echo "============================================="
 echo "Target subscription : ${SUBSCRIPTION_ID}"
-echo "Target tenant       : ${CURRENT_TENANT}"
+echo "Target tenant       : ${TARGET_TENANT_ID}"
 echo "Resource group      : ${RESOURCE_GROUP}"
 echo "Location            : ${LOCATION}"
 echo
 
+if [ "${SUBSCRIPTION_ID}" != "${TARGET_SUBSCRIPTION_ID}" ]; then
+  echo "Provisioning is hard-locked to subscription ${TARGET_SUBSCRIPTION_ID}. Received ${SUBSCRIPTION_ID}." >&2
+  exit 1
+fi
+
 az account set --subscription "$SUBSCRIPTION_ID"
+
+ACTIVE_SUBSCRIPTION="$(az account show --query id -o tsv)"
+ACTIVE_TENANT="$(az account show --query tenantId -o tsv)"
+if [ "${ACTIVE_SUBSCRIPTION}" != "${TARGET_SUBSCRIPTION_ID}" ]; then
+  echo "Active subscription mismatch: expected ${TARGET_SUBSCRIPTION_ID}, got ${ACTIVE_SUBSCRIPTION}." >&2
+  exit 1
+fi
+if [ "${ACTIVE_TENANT}" != "${TARGET_TENANT_ID}" ]; then
+  echo "Active tenant mismatch: expected ${TARGET_TENANT_ID}, got ${ACTIVE_TENANT}." >&2
+  exit 1
+fi
 
 AKS_SUBNET_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/subnet-aks"
 PG_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${PG_SERVER_RG}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${PG_SERVER}"
@@ -324,6 +345,48 @@ if bool_true "$CREATE_COSMOS"; then
     echo "[7/11] Created Cosmos container: ${COSMOS_CONTAINER_NAME}"
   fi
 
+  # Ensure public network access is enabled so AKS pods can reach Cosmos DB.
+  # The account uses disableLocalAuth=true (AAD-only), so the AKS kubelet
+  # identity must also have Cosmos RBAC roles assigned (see below).
+  COSMOS_PUBLIC_ACCESS="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query publicNetworkAccess -o tsv)"
+  if [ "$COSMOS_PUBLIC_ACCESS" != "Enabled" ]; then
+    echo "[7/11] Enabling Cosmos DB public network access (was: ${COSMOS_PUBLIC_ACCESS})..."
+    az cosmosdb update -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --public-network-access ENABLED -o none
+  fi
+
+  # Whitelist AKS outbound IP in Cosmos DB firewall (idempotent).
+  AKS_OUTBOUND_IP_IDS="$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query 'networkProfile.loadBalancerProfile.effectiveOutboundIPs[].id' -o tsv 2>/dev/null || true)"
+  if [ -n "$AKS_OUTBOUND_IP_IDS" ]; then
+    AKS_OUTBOUND_IP=""
+    for ip_id in $AKS_OUTBOUND_IP_IDS; do
+      AKS_OUTBOUND_IP="$(az network public-ip show --ids "$ip_id" --query ipAddress -o tsv 2>/dev/null || true)"
+      [ -n "$AKS_OUTBOUND_IP" ] && break
+    done
+    if [ -n "$AKS_OUTBOUND_IP" ]; then
+      EXISTING_IPS="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query 'ipRules[].ipAddressOrRange' -o tsv 2>/dev/null || true)"
+      if ! echo "$EXISTING_IPS" | grep -qF "$AKS_OUTBOUND_IP"; then
+        echo "[7/11] Adding AKS outbound IP ${AKS_OUTBOUND_IP} to Cosmos DB firewall..."
+        az cosmosdb update -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" \
+          --ip-range-filter "${AKS_OUTBOUND_IP},0.0.0.0" -o none
+      fi
+    fi
+  fi
+
+  # Grant AKS kubelet identity Cosmos DB RBAC (Data Contributor) so
+  # DefaultAzureCredential works from pods (idempotent — errors on duplicate are suppressed).
+  AKS_KUBELET_OBJECT_ID="$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query identityProfile.kubeletidentity.objectId -o tsv 2>/dev/null || true)"
+  COSMOS_ACCOUNT_ID="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query id -o tsv)"
+  if [ -n "$AKS_KUBELET_OBJECT_ID" ] && [ -n "$COSMOS_ACCOUNT_ID" ]; then
+    az cosmosdb sql role assignment create \
+      --account-name "$COSMOS_ACCOUNT_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --principal-id "$AKS_KUBELET_OBJECT_ID" \
+      --role-definition-id "00000000-0000-0000-0000-000000000002" \
+      --scope "$COSMOS_ACCOUNT_ID" \
+      -o none 2>/dev/null || true
+    echo "[7/11] Cosmos DB RBAC: AKS kubelet identity has Data Contributor role"
+  fi
+
   COSMOS_PRIMARY_KEY="$(az cosmosdb keys list -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query primaryMasterKey -o tsv)"
   COSMOS_ENDPOINT="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query documentEndpoint -o tsv)"
   export AZURE_COSMOS_ENDPOINT="$COSMOS_ENDPOINT"
@@ -430,6 +493,9 @@ if bool_true "$DEPLOY_K8S"; then
   export FABRIC_KQL_ENDPOINT
   export FABRIC_GRAPH_ENDPOINT
   export FABRIC_NOSQL_ENDPOINT
+  export FABRIC_SQL_ENDPOINT
+  export FABRIC_SQL_SERVER
+  export FABRIC_SQL_DATABASE
   export FABRIC_GRAPH_DATABASE
   export GRAPH_TIMEOUT_SECONDS
   export GRAPH_MAX_RETRIES

@@ -13,6 +13,9 @@ const API_VERSION = process.env.AZURE_OPENAI_VOICE_API_VERSION || "2025-03-01-pr
 const API_KEY = process.env.AZURE_OPENAI_API_KEY;
 const BEARER_TOKEN = process.env.AZURE_OPENAI_BEARER_TOKEN;
 const AUTH_MODE = (process.env.AZURE_OPENAI_AUTH_MODE || "token").toLowerCase();
+const ALLOW_STATIC_BEARER =
+  (process.env.ALLOW_STATIC_AZURE_OPENAI_BEARER || "false").toLowerCase() === "true";
+const TOKEN_MIN_TTL_SECONDS = Number(process.env.AZURE_OPENAI_TOKEN_MIN_TTL_SECONDS || "120");
 const OPENAI_SCOPE = "https://cognitiveservices.azure.com/.default";
 const OPENAI_RESOURCE = "https://cognitiveservices.azure.com/";
 const APP_SERVICE_MI_API_VERSION = "2019-08-01";
@@ -24,6 +27,20 @@ function defaultVoice(language: "tr-TR" | "en-US") {
     return process.env.AZURE_OPENAI_VOICE_TURKISH || "alloy";
   }
   return process.env.AZURE_OPENAI_VOICE_ENGLISH || "alloy";
+}
+
+function isTokenFreshEnough(token: string, minTtlSeconds: number): boolean {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return false;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { exp?: number };
+    const exp = Number(payload.exp || 0);
+    if (!exp) return false;
+    const now = Math.floor(Date.now() / 1000);
+    return exp - now >= Math.max(0, minTtlSeconds);
+  } catch {
+    return false;
+  }
 }
 
 async function getTokenViaClientCredentials(): Promise<string | null> {
@@ -132,10 +149,6 @@ async function getTokenViaImdsManagedIdentity(): Promise<string | null> {
 }
 
 async function getEntraToken(): Promise<string> {
-  if (BEARER_TOKEN) {
-    return BEARER_TOKEN;
-  }
-
   const tokenErrors: string[] = [];
 
   try {
@@ -159,9 +172,18 @@ async function getEntraToken(): Promise<string> {
     tokenErrors.push(error instanceof Error ? error.message : "IMDS token failed");
   }
 
+  if (ALLOW_STATIC_BEARER && BEARER_TOKEN) {
+    if (isTokenFreshEnough(BEARER_TOKEN, TOKEN_MIN_TTL_SECONDS)) {
+      return BEARER_TOKEN;
+    }
+    tokenErrors.push("Static bearer token is expired or near expiry");
+  } else if (BEARER_TOKEN && !ALLOW_STATIC_BEARER) {
+    tokenErrors.push("Static bearer token is disabled by policy");
+  }
+
   if (tokenErrors.length === 0) {
     throw new Error(
-      "No token auth path configured. Provide AZURE_OPENAI_CLIENT_ID/SECRET/TENANT_ID, managed identity, or AZURE_OPENAI_BEARER_TOKEN."
+      "No token auth path configured. Provide AZURE_OPENAI_CLIENT_ID/SECRET/TENANT_ID or managed identity."
     );
   }
 

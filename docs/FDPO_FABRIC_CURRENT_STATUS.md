@@ -2,6 +2,9 @@
 
 Last updated: 2026-02-18
 
+> Historical note: this document tracks a separate FDPO tenant flow and is out of policy for runtime/deploy in this repository.
+> Active guardrail tenant/subscription are `52095a81-130f-4b06-83f1-9859b2c73de6` / `6a539906-6ce2-4e3b-84ee-89f701de18d8`.
+
 ## Scope
 
 Track current progress for assigning workspace `fdpo-access-check-ws-20260218-171328` to FDPO Fabric F2 capacity.

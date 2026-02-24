@@ -81,6 +81,12 @@ export function TimelinePanel({
     }
   }, [isLoading, events.length]);
 
+  useEffect(() => {
+    if (!isLoading) {
+      setSelectedSource(null);
+    }
+  }, [isLoading]);
+
   const selectedSnapshot = selectedSource ? sourceSnapshots[selectedSource] : null;
   const latestEventMessage = latestEvents.length > 0 ? latestEvents[latestEvents.length - 1]?.message : null;
 

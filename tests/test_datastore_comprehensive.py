@@ -40,7 +40,23 @@ from query_router import QueryRouter  # noqa: E402
 from pg_mock import patch_pg_pool  # noqa: E402
 
 
+def _set_runtime_identity_defaults() -> None:
+    os.environ.setdefault(
+        "AZURE_ACCOUNT_UPN",
+        os.getenv("EXPECTED_RUNTIME_ACCOUNT_UPN", ur.GUARDRAIL_ACCOUNT_UPN),
+    )
+    os.environ.setdefault(
+        "AZURE_TENANT_ID",
+        os.getenv("EXPECTED_RUNTIME_TENANT_ID", ur.GUARDRAIL_TENANT_ID),
+    )
+    os.environ.setdefault(
+        "AZURE_SUBSCRIPTION_ID",
+        os.getenv("EXPECTED_RUNTIME_SUBSCRIPTION_ID", ur.GUARDRAIL_SUBSCRIPTION_ID),
+    )
+
+
 def _build_retriever() -> UnifiedRetriever:
+    _set_runtime_identity_defaults()
     retriever = object.__new__(UnifiedRetriever)
     patch_pg_pool(retriever)
     retriever.search_clients = {}
@@ -287,6 +303,20 @@ class TestSQLValidation(unittest.TestCase):
             "SELECT * FROM nonexistent_table LIMIT 1"
         )
         self.assertEqual(rows[0]["error_code"], "sql_schema_missing")
+
+    def test_rejects_unknown_column_in_existing_table(self):
+        rows, _ = self.retriever.execute_sql_query(
+            "SELECT runway_id FROM asrs_reports LIMIT 1"
+        )
+        self.assertEqual(rows[0]["error_code"], "sql_schema_missing")
+        self.assertIn("missing columns", rows[0].get("error", ""))
+
+    def test_rejects_unknown_qualified_column_in_existing_table(self):
+        rows, _ = self.retriever.execute_sql_query(
+            "SELECT r.runway_id FROM asrs_reports r LIMIT 1"
+        )
+        self.assertEqual(rows[0]["error_code"], "sql_schema_missing")
+        self.assertIn("r.runway_id", rows[0].get("error", ""))
 
     def test_allows_select_statement(self):
         rows, _ = self.retriever.execute_sql_query(
@@ -569,6 +599,81 @@ class TestKQLValidation(unittest.TestCase):
         )
         self.assertIsNotNone(result, "Dot-command after let should be blocked")
 
+    def test_rejects_unsupported_time_now_function(self):
+        result = self.retriever._validate_kql_query(
+            "opensky_states | where time_now() <= time_position + 90m | take 5"
+        )
+        self.assertEqual(result, "kql_unsupported_function:time_now")
+
+    def test_schema_validation_rejects_unknown_kql_table(self):
+        schema = {
+            "tables": [
+                {"table": "opensky_states", "columns": ["icao24", "callsign", "time_position"]},
+            ]
+        }
+        result = self.retriever._validate_kql_query(
+            "airport in ('SAW','AYT','ADB') | project airport | take 5",
+            kql_schema=schema,
+        )
+        self.assertTrue(str(result).startswith("kql_unknown_table:"))
+
+    def test_schema_validation_rejects_unknown_kql_columns(self):
+        schema = {
+            "tables": [
+                {"table": "opensky_states", "columns": ["icao24", "callsign", "time_position"]},
+            ]
+        }
+        result = self.retriever._validate_kql_query(
+            "opensky_states | project callsign, runway_id | take 5",
+            kql_schema=schema,
+        )
+        self.assertTrue(str(result).startswith("kql_unknown_columns:"))
+
+    def test_schema_validation_allows_let_alias_resolving_to_known_table(self):
+        schema = {
+            "tables": [
+                {"table": "opensky_states", "columns": ["icao24", "callsign", "time_position"]},
+            ]
+        }
+        result = self.retriever._validate_kql_query(
+            "let recent = opensky_states | where time_position > ago(30m); recent | project callsign, time_position | take 5",
+            kql_schema=schema,
+        )
+        self.assertIsNone(result)
+
+    def test_schema_validation_allows_project_function_identifier(self):
+        schema = {
+            "tables": [
+                {"table": "opensky_states", "columns": ["icao24", "callsign", "time_position"]},
+            ]
+        }
+        result = self.retriever._validate_kql_query(
+            "opensky_states | project callsign, ts_epoch=toint(time_position) | take 5",
+            kql_schema=schema,
+        )
+        self.assertIsNone(result)
+
+    def test_schema_validation_rejects_unknown_column_inside_function(self):
+        schema = {
+            "tables": [
+                {"table": "opensky_states", "columns": ["icao24", "callsign", "time_position"]},
+            ]
+        }
+        result = self.retriever._validate_kql_query(
+            "opensky_states | project callsign, bad=toint(runway_id) | take 5",
+            kql_schema=schema,
+        )
+        self.assertTrue(str(result).startswith("kql_unknown_columns:"))
+
+    def test_prepare_kql_query_repairs_semicolon_before_pipe(self):
+        prepared, meta = self.retriever.prepare_kql_query(
+            "opensky_states | project callsign; | sort by callsign",
+            window_minutes=60,
+        )
+        self.assertTrue(meta.get("query_rewritten"))
+        self.assertIn("semicolon_before_pipe_removed", meta.get("rewrite_reason", ""))
+        self.assertNotIn("; |", prepared)
+
     def test_ensures_window_when_no_time_column(self):
         csl = self.retriever._ensure_kql_window("some_table | take 10", 60)
         # Should not add window if no known time column is referenced
@@ -648,7 +753,11 @@ class TestGraphSourceBehavior(unittest.TestCase):
         with patch.object(ur, "FABRIC_GRAPH_ENDPOINT", ""):
             rows, citations = retriever.query_graph("IST dependency", hops=1)
             self.assertEqual(rows[0].get("error_code"), "source_unavailable")
-            self.assertIn("SQL unavailable", rows[0].get("error", ""))
+            err = rows[0].get("error", "")
+            self.assertTrue(
+                ("SQL unavailable" in err) or ("SQL fallback is unavailable" in err),
+                f"unexpected graph unavailable error: {err}",
+            )
 
 
 # ====================================================================
@@ -1144,7 +1253,26 @@ class TestFabricPreflight(unittest.TestCase):
         self.assertIn("timestamp", result)
         self.assertIn("overall_status", result)
         self.assertIn("checks", result)
+        self.assertIn("auth_mode_effective", result)
+        self.assertIn("auth_ready", result)
         self.assertIn(result["overall_status"], {"pass", "warn", "fail"})
+
+    def test_preflight_endpoint_checks_include_query_readiness_fields(self):
+        result = self.retriever.fabric_preflight()
+        endpoint_checks = [
+            c for c in result["checks"]
+            if c.get("name") in {
+                "fabric_kql_endpoint",
+                "fabric_graph_endpoint",
+                "fabric_nosql_endpoint",
+                "fabric_sql_endpoint",
+            }
+        ]
+        self.assertTrue(endpoint_checks)
+        for check in endpoint_checks:
+            self.assertIn("path_valid_for_runtime", check)
+            self.assertIn("path_detail", check)
+            self.assertIn("query_ready", check)
 
     def test_preflight_includes_sql_check(self):
         result = self.retriever.fabric_preflight()
@@ -1349,7 +1477,11 @@ class TestVectorSearchMocked(unittest.TestCase):
                 source="VECTOR_OPS",
             )
             self.assertEqual(rows[0]["error_code"], "source_unavailable")
-            self.assertIn("idx_ops_narratives", rows[0]["error"])
+            err = rows[0]["error"]
+            self.assertTrue(
+                ("idx_ops_narratives" in err) or ("search_index_unavailable" in err),
+                f"unexpected semantic unavailable error: {err}",
+            )
 
     def test_semantic_query_all_sources_without_client(self):
         if not self.retriever.search_clients:

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import base64
 import threading
 import time
 import urllib.error
@@ -62,14 +63,43 @@ FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_SQL_ENDPOINT = os.getenv("FABRIC_SQL_ENDPOINT")
+FABRIC_KUSTO_CLUSTER_URL = os.getenv("FABRIC_KUSTO_CLUSTER_URL", "").strip()
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 FABRIC_GRAPH_DATABASE = os.getenv("FABRIC_GRAPH_DATABASE", "").strip()
 FABRIC_SQL_DATABASE = os.getenv("FABRIC_SQL_DATABASE", "").strip()
+
+GUARDRAIL_ACCOUNT_UPN = "admin@MngEnvMCAP705508.onmicrosoft.com"
+GUARDRAIL_TENANT_ID = "52095a81-130f-4b06-83f1-9859b2c73de6"
+GUARDRAIL_SUBSCRIPTION_ID = "6a539906-6ce2-4e3b-84ee-89f701de18d8"
+
+_RUNTIME_ACCOUNT_ENV_KEYS = ("AZURE_ACCOUNT_UPN", "AZURE_CLIENT_UPN")
+_RUNTIME_TENANT_ENV_KEYS = ("AZURE_TENANT_ID", "FABRIC_TENANT_ID", "AZURE_OPENAI_TENANT_ID")
+_RUNTIME_SUBSCRIPTION_ENV_KEYS = ("AZURE_SUBSCRIPTION_ID", "SUBSCRIPTION_ID")
 
 AZURE_COSMOS_ENDPOINT = os.getenv("AZURE_COSMOS_ENDPOINT", "").strip()
 AZURE_COSMOS_KEY = os.getenv("AZURE_COSMOS_KEY", "").strip()
 AZURE_COSMOS_DATABASE = os.getenv("AZURE_COSMOS_DATABASE", "aviationrag").strip()
 AZURE_COSMOS_CONTAINER = os.getenv("AZURE_COSMOS_CONTAINER", "notams").strip()
+
+_SQL_RESERVED_WORDS = {
+    "as", "and", "or", "on", "where", "group", "order", "by", "limit", "offset",
+    "join", "left", "right", "inner", "outer", "full", "cross", "having",
+    "union", "all", "distinct", "asc", "desc", "case", "when", "then", "else",
+    "end", "from", "select", "with", "into", "over", "partition",
+}
+
+_KQL_RESERVED_WORDS = {
+    "where", "project", "extend", "summarize", "by", "sort", "order", "top",
+    "take", "distinct", "count", "as", "and", "or", "not", "in", "in~",
+    "has", "has_any", "contains", "between", "asc", "desc", "true", "false",
+    "let", "mv-expand", "join", "on", "kind", "limit",
+}
+
+_KQL_ALLOWED_FUNCTIONS = {
+    "ago", "now", "todatetime", "tolower", "toupper", "coalesce", "isempty",
+    "isnotempty", "strlen", "trim", "extract", "format_datetime", "bin", "iff",
+    "datetime", "datetime_utc_to_local",
+}
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -98,31 +128,154 @@ def _get_fabric_bearer_token() -> str:
 _fabric_token_lock = threading.Lock()
 _fabric_token_cache: Dict[str, Dict[str, Any]] = {}  # scope -> {token, expires_at}
 
+_fabric_dac_lock = threading.Lock()
+_fabric_dac: Any = None  # lazily set to DefaultAzureCredential
+
 _FABRIC_DEFAULT_SCOPE = "https://api.fabric.microsoft.com/.default"
 
+_FABRIC_SQL_AUTH_HINT = (
+    "Fabric SQL TDS auth failed (18456). Check: (1) DefaultAzureCredential / "
+    "workload identity binding, (2) FABRIC_CLIENT_ID/SECRET/TENANT_ID "
+    "credentials, (3) SP permissions on the SQL endpoint."
+)
 
-def _acquire_fabric_token(scope: str = _FABRIC_DEFAULT_SCOPE) -> str:
-    """Acquire Fabric bearer token via MSAL client credentials, with caching.
 
-    Prefers MSAL client credentials (auto-refreshing) over static
-    ``FABRIC_BEARER_TOKEN`` env var, which expires after ~1 hour.
+def _get_fabric_dac():
+    """Thread-safe lazy singleton for DefaultAzureCredential."""
+    global _fabric_dac
+    if _fabric_dac is not None:
+        return _fabric_dac
+    with _fabric_dac_lock:
+        if _fabric_dac is not None:
+            return _fabric_dac
+        try:
+            from azure.identity import DefaultAzureCredential
+            _fabric_dac = DefaultAzureCredential()
+            logger.info("DefaultAzureCredential instance created (singleton)")
+        except Exception as exc:
+            logger.info("DefaultAzureCredential import/init failed: %s", exc)
+            _fabric_dac = None
+    return _fabric_dac
 
-    Args:
-        scope: OAuth2 scope for the token request. Defaults to the Fabric API
-            scope. Pass a cluster-specific scope for Kusto endpoints
-            (e.g. ``https://trd-xxx.z2.kusto.fabric.microsoft.com/.default``).
-    """
-    # 1. Try MSAL client credentials (auto-refreshing) first.
+
+def _fabric_token_min_ttl_seconds() -> int:
+    return _env_int("FABRIC_TOKEN_MIN_TTL_SECONDS", 120, minimum=0)
+
+
+def _source_call_timeout_seconds() -> float:
+    return _env_float("SOURCE_CALL_TIMEOUT_SECONDS", 20.0, minimum=1.0)
+
+
+def _allow_static_fabric_bearer() -> bool:
+    return os.getenv("ALLOW_STATIC_FABRIC_BEARER", "false").strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+
+def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+    raw = str(token or "").strip()
+    if not raw:
+        return {}
+    parts = raw.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8", errors="ignore")
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _token_ttl_seconds(token: str) -> Optional[int]:
+    payload = _decode_jwt_payload(token)
+    exp = payload.get("exp")
+    try:
+        exp_ts = int(exp)
+    except Exception:
+        return None
+    return exp_ts - int(time.time())
+
+
+def _cluster_scope_for_endpoint(endpoint: str) -> str:
+    raw = (endpoint or "").strip()
+    if not raw:
+        return _FABRIC_DEFAULT_SCOPE
+    parsed = urllib.parse.urlparse(raw)
+    if not parsed.scheme or not parsed.hostname:
+        return _FABRIC_DEFAULT_SCOPE
+    host = str(parsed.hostname or "").lower()
+    if "kusto.fabric.microsoft.com" not in host:
+        return _FABRIC_DEFAULT_SCOPE
+    return f"{parsed.scheme}://{parsed.hostname}/.default"
+
+
+def _acquire_fabric_token_bundle(scope: str = _FABRIC_DEFAULT_SCOPE) -> Dict[str, Any]:
+    """Acquire Fabric token with auth metadata and freshness validation."""
+    min_ttl = _fabric_token_min_ttl_seconds()
+    allow_static = _allow_static_fabric_bearer()
+
+    # 0) DefaultAzureCredential (auto-refreshing, works with workload identity on AKS)
+    dac = _get_fabric_dac()
+    dac_status = "unavailable"  # default: azure.identity not installed or init failed
+    dac_error = None
+    if dac is not None:
+        try:
+            token_obj = dac.get_token(scope)
+            access_token = token_obj.token
+            ttl = int(token_obj.expires_on - time.time())
+            if ttl >= min_ttl:
+                with _fabric_token_lock:
+                    _fabric_token_cache[scope] = {"token": access_token, "expires_at": token_obj.expires_on}
+                logger.info("Fabric token via DefaultAzureCredential scope=%s ttl=%ds", scope, ttl)
+                return {
+                    "token": access_token,
+                    "auth_mode": "default_azure_credential",
+                    "reason": "dac",
+                    "token_ttl_seconds": ttl,
+                    "auth_ready": True,
+                    "dac_status": "active",
+                }
+            dac_status = "active"  # DAC works but token TTL too low
+            dac_error = f"token_ttl_below_min({ttl}s<{min_ttl}s)"
+        except Exception as dac_exc:
+            dac_status = "failed"
+            dac_error = str(dac_exc)
+            logger.info("DefaultAzureCredential failed for scope=%s: %s, falling back to SP", scope, dac_exc)
+    else:
+        dac_error = "azure.identity not available or DefaultAzureCredential init failed"
+
+    # 1) SP client credentials (refreshable) — fallback when DAC unavailable.
     client_id = os.getenv("FABRIC_CLIENT_ID", "").strip()
     client_secret = os.getenv("FABRIC_CLIENT_SECRET", "").strip()
     tenant_id = os.getenv("FABRIC_TENANT_ID", "").strip()
+    static_token = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+
+    logger.debug(
+        "Fabric token acquisition: sp_configured=%s static_configured=%s static_allowed=%s scope=%s",
+        bool(client_id and client_secret and tenant_id),
+        bool(static_token),
+        allow_static,
+        scope,
+    )
     if client_id and client_secret and tenant_id:
         with _fabric_token_lock:
             entry = _fabric_token_cache.get(scope, {})
             cached = entry.get("token")
             expires = entry.get("expires_at", 0)
-            if cached and time.time() < expires - 120:  # 2-min buffer
-                return cached
+            if cached and time.time() < expires - max(30, min_ttl):
+                ttl = int(expires - time.time())
+                return {
+                    "token": cached,
+                    "auth_mode": "sp_client_credentials",
+                    "reason": "cached",
+                    "token_ttl_seconds": ttl,
+                    "auth_ready": True,
+                    "dac_status": dac_status,
+                    **({"dac_error": dac_error} if dac_error else {}),
+                }
 
             token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
             body = urllib.parse.urlencode({
@@ -134,27 +287,146 @@ def _acquire_fabric_token(scope: str = _FABRIC_DEFAULT_SCOPE) -> str:
             req = urllib.request.Request(token_url, data=body, method="POST")
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read())
+                max_retries = 2
+                for attempt in range(1 + max_retries):
+                    try:
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            data = json.loads(resp.read())
+                        break
+                    except (urllib.error.URLError, urllib.error.HTTPError) as url_exc:
+                        is_server_error = isinstance(url_exc, urllib.error.HTTPError) and url_exc.code >= 500
+                        is_transient = not isinstance(url_exc, urllib.error.HTTPError) or is_server_error
+                        if not is_transient or attempt == max_retries:
+                            raise
+                        logger.warning(
+                            "Fabric SP token request transient failure (attempt %d/%d, scope=%s): %s",
+                            attempt + 1, 1 + max_retries, scope, url_exc,
+                        )
+                        time.sleep(0.5 * (attempt + 1))
+                        # Rebuild the request — urlopen consumes the body
+                        req = urllib.request.Request(token_url, data=body, method="POST")
+                        req.add_header("Content-Type", "application/x-www-form-urlencoded")
                 access_token = data["access_token"]
                 expires_in = int(data.get("expires_in", 3600))
+                ttl = _token_ttl_seconds(access_token)
+                if ttl is not None and ttl < min_ttl:
+                    return {
+                        "token": "",
+                        "auth_mode": "sp_client_credentials",
+                        "reason": "sp_token_near_expiry",
+                        "token_ttl_seconds": ttl,
+                        "auth_ready": False,
+                        "dac_status": dac_status,
+                        **({"dac_error": dac_error} if dac_error else {}),
+                    }
                 _fabric_token_cache[scope] = {
                     "token": access_token,
                     "expires_at": time.time() + expires_in,
                 }
                 logger.info("Acquired Fabric bearer token scope=%s (expires_in=%ds)", scope, expires_in)
-                return access_token
+                return {
+                    "token": access_token,
+                    "auth_mode": "sp_client_credentials",
+                    "reason": "refreshed",
+                    "token_ttl_seconds": int(ttl if ttl is not None else expires_in),
+                    "auth_ready": True,
+                    "dac_status": dac_status,
+                    **({"dac_error": dac_error} if dac_error else {}),
+                }
             except Exception as exc:
                 logger.warning("MSAL token acquisition failed (scope=%s): %s", scope, exc)
                 if cached:
-                    return cached
+                    ttl = _token_ttl_seconds(cached)
+                    return {
+                        "token": cached,
+                        "auth_mode": "sp_client_credentials",
+                        "reason": "cached_after_refresh_failure",
+                        "token_ttl_seconds": int(ttl if ttl is not None else max(0, int(expires - time.time()))),
+                        "auth_ready": (ttl is None) or (ttl >= min_ttl),
+                        "dac_status": dac_status,
+                        **({"dac_error": dac_error} if dac_error else {}),
+                    }
+                return {
+                    "token": "",
+                    "auth_mode": "sp_client_credentials",
+                    "reason": f"sp_token_acquisition_failed:{exc}",
+                    "token_ttl_seconds": None,
+                    "auth_ready": False,
+                    "dac_status": dac_status,
+                    **({"dac_error": dac_error} if dac_error else {}),
+                }
 
-    # 2. Fallback: static bearer token (local dev / manual override).
+    # 2) Optional static bearer fallback (explicit opt-in only).
     static = os.getenv("FABRIC_BEARER_TOKEN", "").strip()
-    if static:
-        return static
+    if static and not allow_static:
+        return {
+            "token": "",
+            "auth_mode": "none",
+            "reason": "static_bearer_disabled",
+            "token_ttl_seconds": _token_ttl_seconds(static),
+            "auth_ready": False,
+            "dac_status": dac_status,
+            **({"dac_error": dac_error} if dac_error else {}),
+        }
+    if static and allow_static:
+        ttl = _token_ttl_seconds(static)
+        if ttl is not None and ttl < min_ttl:
+            reason = "static_bearer_expired" if ttl <= 0 else "static_bearer_near_expiry"
+            return {
+                "token": "",
+                "auth_mode": "static_bearer",
+                "reason": reason,
+                "token_ttl_seconds": ttl,
+                "auth_ready": False,
+                "dac_status": dac_status,
+                **({"dac_error": dac_error} if dac_error else {}),
+            }
+        return {
+            "token": static,
+            "auth_mode": "static_bearer",
+            "reason": "static_bearer_allowed",
+            "token_ttl_seconds": ttl,
+            "auth_ready": True,
+            "dac_status": dac_status,
+            **({"dac_error": dac_error} if dac_error else {}),
+        }
 
-    return ""
+    missing_vars = [
+        v for v in ("FABRIC_CLIENT_ID", "FABRIC_CLIENT_SECRET", "FABRIC_TENANT_ID")
+        if not os.getenv(v, "").strip()
+    ]
+    logger.warning(
+        "Fabric auth not configured — no SP credentials and no static bearer. "
+        "Missing env vars: %s  scope=%s",
+        ", ".join(missing_vars) or "none",
+        scope,
+    )
+    return {
+        "token": "",
+        "auth_mode": "none",
+        "reason": "fabric_auth_not_configured",
+        "token_ttl_seconds": None,
+        "auth_ready": False,
+        "dac_status": dac_status,
+        **({"dac_error": dac_error} if dac_error else {}),
+    }
+
+
+def _acquire_fabric_token(scope: str = _FABRIC_DEFAULT_SCOPE) -> str:
+    bundle = _acquire_fabric_token_bundle(scope)
+    if not bundle.get("auth_ready"):
+        logger.warning(
+            "Fabric token not auth_ready (reason=%s, auth_mode=%s) — returning empty token",
+            bundle.get("reason"), bundle.get("auth_mode"),
+        )
+        return ""
+    return str(bundle.get("token") or "")
+
+
+def _invalidate_fabric_token_cache(scope: str = _FABRIC_DEFAULT_SCOPE) -> None:
+    """Remove cached token for *scope* so the next acquire triggers a fresh fetch."""
+    with _fabric_token_lock:
+        _fabric_token_cache.pop(scope, None)
 
 
 @dataclass
@@ -394,6 +666,12 @@ class UnifiedRetriever:
         self._graph_circuit_failures = 0
         self._graph_circuit_open_until = 0.0
 
+        # Fabric SQL capability cache (pyodbc + driver readiness for TDS path).
+        self._fabric_sql_tds_capability_cache: Optional[Dict[str, Any]] = None
+        self._source_capabilities: Dict[str, Dict[str, Any]] = {}
+        self._identity_guardrail_report: Dict[str, Any] = {}
+        self._refresh_source_capabilities(refresh_tds=True)
+
     @staticmethod
     def _filter_error_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Remove error/error_code rows from result lists before synthesis."""
@@ -428,6 +706,8 @@ class UnifiedRetriever:
 
     def get_embedding(self, text: str) -> List[float]:
         """Get embedding from Azure OpenAI with LRU cache."""
+        if not isinstance(text, str):
+            raise TypeError(f"embedding_input_must_be_string:{type(text).__name__}")
         normalized = text.strip()[:8000]
         with self._embedding_cache_lock:
             if normalized in self._embedding_cache:
@@ -493,8 +773,47 @@ class UnifiedRetriever:
         endpoint_l = (endpoint or "").lower()
         return "kusto.fabric.microsoft.com" in endpoint_l
 
+    def _effective_fabric_endpoint(self, source: str) -> str:
+        source_norm = (source or "").upper()
+        if source_norm == "KQL":
+            return (FABRIC_KQL_ENDPOINT or FABRIC_KUSTO_CLUSTER_URL or "").strip()
+        if source_norm == "GRAPH":
+            return (FABRIC_GRAPH_ENDPOINT or FABRIC_KUSTO_CLUSTER_URL or "").strip()
+        if source_norm == "NOSQL":
+            return (FABRIC_NOSQL_ENDPOINT or FABRIC_KUSTO_CLUSTER_URL or "").strip()
+        if source_norm == "FABRIC_SQL":
+            return (FABRIC_SQL_ENDPOINT or "").strip()
+        return ""
+
+    def _fabric_auth_bundle_for_endpoint(self, endpoint: str, force_scope: Optional[str] = None) -> Dict[str, Any]:
+        scope = force_scope or _cluster_scope_for_endpoint(endpoint)
+        bundle = _acquire_fabric_token_bundle(scope=scope)
+        return {
+            **bundle,
+            "scope": scope,
+        }
+
+    def _fabric_auth_reason_for_source(self, source: str) -> Tuple[bool, str, Dict[str, Any]]:
+        endpoint = self._effective_fabric_endpoint(source)
+        auth_bundle = self._fabric_auth_bundle_for_endpoint(endpoint)
+        auth_ready = bool(auth_bundle.get("auth_ready") and auth_bundle.get("token"))
+        reason = str(auth_bundle.get("reason") or "fabric_auth_not_ready")
+        if auth_ready:
+            return True, "ready", auth_bundle
+        return False, reason, auth_bundle
+
     def _query_tokens(self, query: str) -> List[str]:
-        tokens = [t.upper() for t in re.findall(r"[A-Za-z0-9]{3,8}", query or "")]
+        if isinstance(query, str):
+            text = query
+        elif isinstance(query, (dict, list)):
+            try:
+                text = json.dumps(query, ensure_ascii=False)
+            except Exception:
+                text = str(query)
+        else:
+            text = str(query or "")
+
+        tokens = [t.upper() for t in re.findall(r"[A-Za-z0-9]{3,8}", text)]
         deduped: List[str] = []
         for token in tokens:
             if token not in deduped:
@@ -504,7 +823,15 @@ class UnifiedRetriever:
         return deduped
 
     def _extract_airports_from_query(self, query: str) -> List[str]:
-        text = query or ""
+        if isinstance(query, str):
+            text = query
+        elif isinstance(query, (dict, list)):
+            try:
+                text = json.dumps(query, ensure_ascii=False)
+            except Exception:
+                text = str(query)
+        else:
+            text = str(query or "")
         upper = text.upper()
         lower = text.lower()
         out: List[str] = []
@@ -534,6 +861,65 @@ class UnifiedRetriever:
             return []
         return self._extract_airports_from_query(sql_query)
 
+    def _extract_explicit_flight_identifiers(self, query: str) -> List[str]:
+        if isinstance(query, str):
+            text = query
+        elif isinstance(query, (dict, list)):
+            try:
+                text = json.dumps(query, ensure_ascii=False)
+            except Exception:
+                text = str(query)
+        else:
+            text = str(query or "")
+
+        out: List[str] = []
+        upper = text.upper()
+
+        # Airline flight number style identifiers (e.g., TK123, THY6047).
+        for match in re.findall(r"\b[A-Z]{2,3}\s?\d{1,4}[A-Z]?\b", upper):
+            normalized = re.sub(r"\s+", "", match)
+            if normalized not in out:
+                out.append(normalized)
+
+        # Raw 24-bit ICAO transponder hex (icao24) identifiers.
+        for match in re.findall(r"\b[0-9A-F]{6}\b", upper):
+            if match not in out:
+                out.append(match)
+
+        return out[:12]
+
+    def _resolve_kusto_query_endpoint(self, endpoint: str) -> Tuple[str, bool, str]:
+        """Normalize Kusto endpoint to a valid query URI.
+
+        Supported inputs:
+        - Cluster root: https://<cluster>.kusto.fabric.microsoft.com
+        - Explicit query path: .../v1/rest/query or .../v2/rest/query
+        """
+        raw = (endpoint or "").strip()
+        if not raw:
+            return "", False, "kusto_endpoint_missing"
+
+        parsed = urllib.parse.urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw, False, "kusto_endpoint_invalid_url"
+
+        clean = parsed._replace(params="", query="", fragment="")
+        path = (clean.path or "").rstrip("/")
+        lower_path = path.lower()
+        rest_query_count = lower_path.count("/rest/query")
+
+        if rest_query_count > 1:
+            return urllib.parse.urlunparse(clean._replace(path=path)), False, "kusto_endpoint_path_duplicate_query_segments"
+
+        if lower_path.endswith("/v1/rest/query") or lower_path.endswith("/v2/rest/query"):
+            return urllib.parse.urlunparse(clean._replace(path=path)), True, "kusto_query_path_explicit"
+
+        if "/rest/query" in lower_path:
+            return urllib.parse.urlunparse(clean._replace(path=path)), False, "kusto_endpoint_path_invalid"
+
+        base = urllib.parse.urlunparse(clean._replace(path=path)).rstrip("/")
+        return f"{base}/v1/rest/query", True, "kusto_query_path_derived_v1"
+
     def _kusto_rows(
         self,
         endpoint: str,
@@ -545,12 +931,13 @@ class UnifiedRetriever:
         if not db_name:
             return [], "missing_fabric_kql_database"
 
-        # Derive cluster-specific token scope from endpoint URL.
-        parsed = urllib.parse.urlparse(endpoint)
-        kusto_scope = f"{parsed.scheme}://{parsed.hostname}/.default"
+        kql_endpoint, path_valid, path_reason = self._resolve_kusto_query_endpoint(endpoint)
+        if not path_valid:
+            return [], f"invalid_kusto_endpoint_path:{path_reason}"
 
-        # Kusto REST v1 endpoint: POST to {cluster}/v1/rest/query
-        kql_endpoint = endpoint.rstrip("/") + "/v1/rest/query"
+        # Derive cluster-specific token scope from endpoint URL.
+        parsed = urllib.parse.urlparse(kql_endpoint)
+        kusto_scope = f"{parsed.scheme}://{parsed.hostname}/.default"
 
         response = self._post_json(
             kql_endpoint,
@@ -559,7 +946,27 @@ class UnifiedRetriever:
             timeout_seconds=timeout_seconds if timeout_seconds is not None else 30.0,
         )
         if isinstance(response, dict) and response.get("error"):
-            return [], str(response.get("error"))
+            error_code = str(response.get("error"))
+            detail = str(response.get("detail") or "")[:500]
+            enriched = f"{error_code}:{detail}" if detail else error_code
+
+            # On 401: invalidate cached token, re-acquire, and retry once.
+            if error_code == "http_401":
+                logger.warning("KQL 401 — invalidating token cache and retrying (scope=%s)", kusto_scope)
+                _invalidate_fabric_token_cache(kusto_scope)
+                retry_response = self._post_json(
+                    kql_endpoint,
+                    {"db": db_name, "csl": csl},
+                    token_scope=kusto_scope,
+                    timeout_seconds=timeout_seconds if timeout_seconds is not None else 30.0,
+                )
+                if isinstance(retry_response, dict) and retry_response.get("error"):
+                    retry_detail = str(retry_response.get("detail") or "")[:500]
+                    retry_enriched = f"{retry_response['error']}:{retry_detail}" if retry_detail else str(retry_response["error"])
+                    return [], f"{retry_enriched} (retry_after_401)"
+                response = retry_response
+            else:
+                return [], enriched
 
         # v1 response: {"Tables": [{"TableName": ..., "Columns": [...], "Rows": [[...]]}]}
         if isinstance(response, dict) and "Tables" in response:
@@ -702,8 +1109,9 @@ class UnifiedRetriever:
         self._ensure_graph_runtime_state()
         max_attempts = 1 + max(0, self._graph_max_retries)
         attempts = 0
+        graph_endpoint = self._effective_fabric_endpoint("GRAPH")
 
-        if self._is_kusto_endpoint(FABRIC_GRAPH_ENDPOINT):
+        if self._is_kusto_endpoint(graph_endpoint):
             tokens = [] if probe else self._query_tokens(query)
             if probe:
                 csl = "ops_graph_edges | take 1"
@@ -721,7 +1129,7 @@ class UnifiedRetriever:
             for attempt in range(1, max_attempts + 1):
                 attempts = attempt
                 rows, error = self._kusto_rows(
-                    FABRIC_GRAPH_ENDPOINT,
+                    graph_endpoint,
                     csl,
                     database=db_name,
                     timeout_seconds=self._graph_timeout_seconds,
@@ -744,7 +1152,7 @@ class UnifiedRetriever:
         for attempt in range(1, max_attempts + 1):
             attempts = attempt
             response = self._post_json(
-                FABRIC_GRAPH_ENDPOINT,
+                graph_endpoint,
                 payload,
                 timeout_seconds=self._graph_timeout_seconds,
             )
@@ -763,7 +1171,8 @@ class UnifiedRetriever:
 
     def _probe_graph_query(self) -> Dict[str, Any]:
         self._ensure_graph_runtime_state()
-        if not FABRIC_GRAPH_ENDPOINT:
+        graph_endpoint = self._effective_fabric_endpoint("GRAPH")
+        if not graph_endpoint:
             return {
                 "status": "warn",
                 "detail": "graph_endpoint_not_configured",
@@ -827,34 +1236,598 @@ class UnifiedRetriever:
             detail=detail,
         )
 
+    @staticmethod
+    def _first_present_env(keys: Tuple[str, ...]) -> Tuple[str, str]:
+        for key in keys:
+            value = os.getenv(key, "").strip()
+            if value:
+                return key, value
+        return "", ""
+
+    def _identity_guardrail_checks(self) -> Dict[str, Any]:
+        strict_guardrail = os.getenv("ENFORCE_RUNTIME_GUARDRAILS", "false").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        expected_account = os.getenv("EXPECTED_RUNTIME_ACCOUNT_UPN", "").strip()
+        expected_tenant = os.getenv("EXPECTED_RUNTIME_TENANT_ID", "").strip()
+        expected_subscription = os.getenv("EXPECTED_RUNTIME_SUBSCRIPTION_ID", "").strip()
+        account_key, account_value = self._first_present_env(_RUNTIME_ACCOUNT_ENV_KEYS)
+        tenant_key, tenant_value = self._first_present_env(_RUNTIME_TENANT_ENV_KEYS)
+        subscription_key, subscription_value = self._first_present_env(_RUNTIME_SUBSCRIPTION_ENV_KEYS)
+
+        checks: List[Dict[str, Any]] = []
+
+        def _append_check(name: str, expected: str, fallback_expected: str, env_key: str, actual: str) -> None:
+            effective_expected = expected or (fallback_expected if strict_guardrail else "")
+            if not effective_expected:
+                status = "warn"
+                detail = "expected_runtime_value_not_set"
+            elif actual:
+                status = "pass" if actual.lower() == effective_expected.lower() else "fail"
+                detail = "matches_guardrail" if status == "pass" else f"mismatch:{actual}"
+            else:
+                status = "fail"
+                detail = "missing_runtime_identity_value"
+            checks.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "detail": detail,
+                    "expected": effective_expected,
+                    "env_key": env_key,
+                    "actual": actual,
+                }
+            )
+
+        _append_check("guardrail_account_upn", expected_account, GUARDRAIL_ACCOUNT_UPN, account_key, account_value)
+        _append_check("guardrail_tenant_id", expected_tenant, GUARDRAIL_TENANT_ID, tenant_key, tenant_value)
+        _append_check("guardrail_subscription_id", expected_subscription, GUARDRAIL_SUBSCRIPTION_ID, subscription_key, subscription_value)
+
+        if any(check["status"] == "fail" for check in checks):
+            overall_status = "fail"
+        elif any(check["status"] == "warn" for check in checks):
+            overall_status = "warn"
+        else:
+            overall_status = "pass"
+
+        return {
+            "timestamp": self._now_iso(),
+            "status": overall_status,
+            "checks": checks,
+        }
+
+    def _source_capability_payload(
+        self,
+        source: str,
+        status: str,
+        reason_code: str,
+        detail: str,
+        execution_mode: str,
+    ) -> Dict[str, Any]:
+        return {
+            "source": source,
+            "status": status,
+            "reason_code": reason_code,
+            "detail": detail,
+            "execution_mode": execution_mode,
+            "last_checked_at": self._now_iso(),
+        }
+
+    def _shared_fabric_endpoint_policy_allows(self) -> bool:
+        return os.getenv("ALLOW_SHARED_FABRIC_ENDPOINTS", "false").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+
+    def _refresh_source_capabilities(self, refresh_tds: bool = False) -> Dict[str, Dict[str, Any]]:
+        self._identity_guardrail_report = self._identity_guardrail_checks()
+        identity_mismatch = self._identity_guardrail_report.get("status") == "fail"
+        sql_available = bool(getattr(self, "sql_available", False))
+        sql_backend = str(getattr(self, "sql_backend", "unavailable") or "unavailable")
+        sql_unavailable_reason = str(getattr(self, "sql_unavailable_reason", "") or "")
+        cosmos_container = getattr(self, "_cosmos_container", None)
+        search_clients = getattr(self, "search_clients", {}) or {}
+        vector_source_to_index = getattr(self, "vector_source_to_index", {}) or {}
+        source_caps: Dict[str, Dict[str, Any]] = {}
+
+        if identity_mismatch:
+            for source in ("SQL", "KQL", "GRAPH", "NOSQL", "FABRIC_SQL", "VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):
+                source_caps[source] = self._source_capability_payload(
+                    source=source,
+                    status="unavailable",
+                    reason_code="tenant_guardrail_mismatch",
+                    detail="runtime identity does not match hardcoded guardrail",
+                    execution_mode="blocked",
+                )
+            self._source_capabilities = source_caps
+            return source_caps
+
+        # SQL
+        if sql_available:
+            source_caps["SQL"] = self._source_capability_payload(
+                source="SQL",
+                status="healthy",
+                reason_code="ready",
+                detail=f"backend={sql_backend}",
+                execution_mode="live",
+            )
+        else:
+            source_caps["SQL"] = self._source_capability_payload(
+                source="SQL",
+                status="unavailable",
+                reason_code="sql_backend_not_available",
+                detail=sql_unavailable_reason or "sql_backend_not_available",
+                execution_mode="blocked",
+            )
+
+        # KQL
+        kql_db = (FABRIC_KQL_DATABASE or os.getenv("FABRIC_KQL_DATABASE_NAME", "")).strip()
+        kql_endpoint = self._effective_fabric_endpoint("KQL")
+        if not kql_endpoint:
+            source_caps["KQL"] = self._source_capability_payload(
+                source="KQL",
+                status="unavailable",
+                reason_code="kql_endpoint_not_configured",
+                detail="FABRIC_KQL_ENDPOINT/FABRIC_KUSTO_CLUSTER_URL is empty",
+                execution_mode="blocked",
+            )
+        elif self._is_kusto_endpoint(kql_endpoint):
+            _normalized, path_valid, path_reason = self._resolve_kusto_query_endpoint(kql_endpoint)
+            if not path_valid:
+                source_caps["KQL"] = self._source_capability_payload(
+                    source="KQL",
+                    status="unavailable",
+                    reason_code="invalid_kusto_endpoint_path",
+                    detail=path_reason,
+                    execution_mode="blocked",
+                )
+            elif not kql_db:
+                source_caps["KQL"] = self._source_capability_payload(
+                    source="KQL",
+                    status="degraded",
+                    reason_code="missing_fabric_kql_database",
+                    detail="kusto endpoint requires FABRIC_KQL_DATABASE",
+                    execution_mode="live",
+                )
+            else:
+                auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("KQL")
+                if not auth_ready:
+                    no_token = not auth_bundle.get("token")
+                    source_caps["KQL"] = self._source_capability_payload(
+                        source="KQL",
+                        status="unavailable" if no_token else "degraded",
+                        reason_code="fabric_auth_unavailable",
+                        detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
+                        execution_mode="blocked" if no_token else "live",
+                    )
+                else:
+                    source_caps["KQL"] = self._source_capability_payload(
+                        source="KQL",
+                        status="healthy",
+                        reason_code="ready",
+                        detail=f"endpoint configured;auth_mode={auth_bundle.get('auth_mode', 'unknown')}",
+                        execution_mode="live",
+                    )
+        else:
+            auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("KQL")
+            if not auth_ready:
+                no_token = not auth_bundle.get("token")
+                source_caps["KQL"] = self._source_capability_payload(
+                    source="KQL",
+                    status="unavailable" if no_token else "degraded",
+                    reason_code="fabric_auth_unavailable",
+                    detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
+                    execution_mode="blocked" if no_token else "live",
+                )
+            else:
+                source_caps["KQL"] = self._source_capability_payload(
+                    source="KQL",
+                    status="healthy",
+                    reason_code="ready",
+                    detail=f"endpoint configured;auth_mode={auth_bundle.get('auth_mode', 'unknown')}",
+                    execution_mode="live",
+                )
+
+        # GRAPH
+        graph_db = self._graph_database()
+        graph_endpoint = self._effective_fabric_endpoint("GRAPH")
+        if not graph_endpoint:
+            if sql_available:
+                source_caps["GRAPH"] = self._source_capability_payload(
+                    source="GRAPH",
+                    status="degraded",
+                    reason_code="graph_endpoint_not_configured",
+                    detail="FABRIC_GRAPH_ENDPOINT/FABRIC_KUSTO_CLUSTER_URL is empty; using SQL fallback",
+                    execution_mode="fallback",
+                )
+            else:
+                source_caps["GRAPH"] = self._source_capability_payload(
+                    source="GRAPH",
+                    status="unavailable",
+                    reason_code="graph_endpoint_not_configured",
+                    detail=f"FABRIC_GRAPH_ENDPOINT/FABRIC_KUSTO_CLUSTER_URL is empty and SQL fallback is unavailable ({sql_unavailable_reason or 'sql_backend_not_available'})",
+                    execution_mode="blocked",
+                )
+        elif self._is_kusto_endpoint(graph_endpoint):
+            _normalized, path_valid, path_reason = self._resolve_kusto_query_endpoint(graph_endpoint)
+            if not path_valid:
+                source_caps["GRAPH"] = self._source_capability_payload(
+                    source="GRAPH",
+                    status="unavailable",
+                    reason_code="invalid_kusto_endpoint_path",
+                    detail=path_reason,
+                    execution_mode="blocked",
+                )
+            elif not graph_db:
+                if sql_available:
+                    source_caps["GRAPH"] = self._source_capability_payload(
+                        source="GRAPH",
+                        status="degraded",
+                        reason_code="missing_fabric_graph_database",
+                        detail="kusto graph endpoint requires FABRIC_GRAPH_DATABASE or FABRIC_KQL_DATABASE; using SQL fallback",
+                        execution_mode="fallback",
+                    )
+                else:
+                    source_caps["GRAPH"] = self._source_capability_payload(
+                        source="GRAPH",
+                        status="unavailable",
+                        reason_code="missing_fabric_graph_database",
+                        detail="kusto graph endpoint requires FABRIC_GRAPH_DATABASE or FABRIC_KQL_DATABASE",
+                        execution_mode="blocked",
+                    )
+            else:
+                auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("GRAPH")
+                if not auth_ready:
+                    source_caps["GRAPH"] = self._source_capability_payload(
+                        source="GRAPH",
+                        status="degraded",
+                        reason_code="fabric_auth_unavailable",
+                        detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
+                        execution_mode="fallback" if sql_available else "live",
+                    )
+                elif (
+                    graph_endpoint
+                    and kql_endpoint
+                    and graph_endpoint == kql_endpoint
+                    and not self._shared_fabric_endpoint_policy_allows()
+                ):
+                    source_caps["GRAPH"] = self._source_capability_payload(
+                        source="GRAPH",
+                        status="degraded",
+                        reason_code="graph_endpoint_shared_with_kql",
+                        detail="GRAPH and KQL share endpoint; set ALLOW_SHARED_FABRIC_ENDPOINTS=true to suppress",
+                        execution_mode="live",
+                    )
+                else:
+                    source_caps["GRAPH"] = self._source_capability_payload(
+                        source="GRAPH",
+                        status="healthy",
+                        reason_code="ready",
+                        detail=f"endpoint configured;auth_mode={auth_bundle.get('auth_mode', 'unknown')}",
+                        execution_mode="live",
+                    )
+        else:
+            auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("GRAPH")
+            if not auth_ready:
+                source_caps["GRAPH"] = self._source_capability_payload(
+                    source="GRAPH",
+                    status="degraded",
+                    reason_code="fabric_auth_unavailable",
+                    detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
+                    execution_mode="fallback" if sql_available else "live",
+                )
+            else:
+                source_caps["GRAPH"] = self._source_capability_payload(
+                    source="GRAPH",
+                    status="healthy",
+                    reason_code="ready",
+                    detail=f"endpoint configured;auth_mode={auth_bundle.get('auth_mode', 'unknown')}",
+                    execution_mode="live",
+                )
+
+        # NOSQL
+        if cosmos_container is not None:
+            source_caps["NOSQL"] = self._source_capability_payload(
+                source="NOSQL",
+                status="healthy",
+                reason_code="cosmos_ready",
+                detail="cosmos container connected",
+                execution_mode="live",
+            )
+        else:
+            nosql_endpoint = self._effective_fabric_endpoint("NOSQL")
+            if not nosql_endpoint:
+                source_caps["NOSQL"] = self._source_capability_payload(
+                    source="NOSQL",
+                    status="unavailable",
+                    reason_code="nosql_endpoint_not_configured",
+                    detail="no Cosmos client and FABRIC_NOSQL_ENDPOINT/FABRIC_KUSTO_CLUSTER_URL is empty",
+                    execution_mode="blocked",
+                )
+            elif self._is_kusto_endpoint(nosql_endpoint):
+                _normalized, path_valid, path_reason = self._resolve_kusto_query_endpoint(nosql_endpoint)
+                if not path_valid:
+                    source_caps["NOSQL"] = self._source_capability_payload(
+                        source="NOSQL",
+                        status="unavailable",
+                        reason_code="invalid_kusto_endpoint_path",
+                        detail=path_reason,
+                        execution_mode="blocked",
+                    )
+                elif not kql_db:
+                    source_caps["NOSQL"] = self._source_capability_payload(
+                        source="NOSQL",
+                        status="unavailable",
+                        reason_code="missing_fabric_kql_database",
+                        detail="kusto nosql endpoint requires FABRIC_KQL_DATABASE",
+                        execution_mode="blocked",
+                    )
+                else:
+                    auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("NOSQL")
+                    if not auth_ready:
+                        source_caps["NOSQL"] = self._source_capability_payload(
+                            source="NOSQL",
+                            status="degraded",
+                            reason_code="fabric_auth_unavailable",
+                            detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
+                            execution_mode="live",
+                        )
+                    else:
+                        source_caps["NOSQL"] = self._source_capability_payload(
+                            source="NOSQL",
+                            status="healthy",
+                            reason_code="ready",
+                            detail=f"endpoint configured;auth_mode={auth_bundle.get('auth_mode', 'unknown')}",
+                            execution_mode="live",
+                        )
+            else:
+                auth_ready, auth_reason, auth_bundle = self._fabric_auth_reason_for_source("NOSQL")
+                if not auth_ready:
+                    source_caps["NOSQL"] = self._source_capability_payload(
+                        source="NOSQL",
+                        status="degraded",
+                        reason_code="fabric_auth_unavailable",
+                        detail=f"{auth_reason};auth_mode={auth_bundle.get('auth_mode', 'none')}",
+                        execution_mode="live",
+                    )
+                else:
+                    source_caps["NOSQL"] = self._source_capability_payload(
+                        source="NOSQL",
+                        status="healthy",
+                        reason_code="ready",
+                        detail=f"endpoint configured;auth_mode={auth_bundle.get('auth_mode', 'unknown')}",
+                        execution_mode="live",
+                    )
+
+        # FABRIC_SQL
+        if refresh_tds:
+            self._fabric_sql_tds_capability(refresh=True)
+        fabric_sql_mode_detail = self._fabric_sql_effective_mode_detail()
+        fabric_sql_mode = str(fabric_sql_mode_detail.get("mode") or "blocked")
+        if fabric_sql_mode == "tds":
+            source_caps["FABRIC_SQL"] = self._source_capability_payload(
+                source="FABRIC_SQL",
+                status="healthy",
+                reason_code="tds_ready",
+                detail="pyodbc and ODBC driver are available",
+                execution_mode="live",
+            )
+        elif fabric_sql_mode == "rest":
+            auth_ready = bool(fabric_sql_mode_detail.get("auth_ready", True))
+            source_caps["FABRIC_SQL"] = self._source_capability_payload(
+                source="FABRIC_SQL",
+                status="healthy" if auth_ready else "degraded",
+                reason_code="rest_ready" if auth_ready else "fabric_auth_unavailable",
+                detail=str(fabric_sql_mode_detail.get("reason") or "rest_ready"),
+                execution_mode="live",
+            )
+        else:
+            source_caps["FABRIC_SQL"] = self._source_capability_payload(
+                source="FABRIC_SQL",
+                status="unavailable",
+                reason_code="fabric_sql_not_usable",
+                detail=str(fabric_sql_mode_detail.get("reason") or "fabric_sql_not_configured"),
+                execution_mode="blocked",
+            )
+
+        # Vector indexes
+        for source in ("VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"):
+            index_name = vector_source_to_index.get(source) or vector_source_to_index.get("VECTOR_OPS", "")
+            if index_name and search_clients.get(index_name):
+                source_caps[source] = self._source_capability_payload(
+                    source=source,
+                    status="healthy",
+                    reason_code="ready",
+                    detail=f"index={index_name}",
+                    execution_mode="live",
+                )
+            else:
+                source_caps[source] = self._source_capability_payload(
+                    source=source,
+                    status="unavailable",
+                    reason_code="search_index_unavailable",
+                    detail=f"index={index_name or 'unset'}",
+                    execution_mode="blocked",
+                )
+
+        self._source_capabilities = source_caps
+        return source_caps
+
+    def source_capability(self, source: str, refresh: bool = True) -> Dict[str, Any]:
+        source_norm = (source or "").upper()
+        if refresh or not getattr(self, "_source_capabilities", None):
+            self._refresh_source_capabilities()
+        capability = (self._source_capabilities or {}).get(source_norm)
+        if capability:
+            return capability
+        return {
+            "source": source_norm,
+            "status": "unknown",
+            "reason_code": "unknown_source",
+            "detail": "source is not recognized by capability registry",
+            "execution_mode": "unknown",
+            "last_checked_at": self._now_iso(),
+        }
+
+    def source_capabilities(self, refresh: bool = True) -> List[Dict[str, Any]]:
+        if refresh or not getattr(self, "_source_capabilities", None):
+            self._refresh_source_capabilities()
+        return [
+            dict(capability)
+            for _, capability in sorted((self._source_capabilities or {}).items(), key=lambda item: item[0])
+        ]
+
+    def _fabric_sql_tds_capability(self, refresh: bool = False) -> Dict[str, Any]:
+        """Return TDS readiness for Fabric SQL (`pyodbc` + driver + env)."""
+        server = os.getenv("FABRIC_SQL_SERVER", "").strip()
+        database = os.getenv("FABRIC_SQL_DATABASE", "").strip() or FABRIC_SQL_DATABASE
+        cache_key = f"{server}|{database}"
+        if not refresh:
+            cached = getattr(self, "_fabric_sql_tds_capability_cache", None)
+            if isinstance(cached, dict) and cached.get("cache_key") == cache_key:
+                return cached
+
+        if not server or not database:
+            result = {
+                "ok": False,
+                "detail": "fabric_sql_tds_missing_server_or_database",
+                "server_configured": bool(server),
+                "database_configured": bool(database),
+                "driver_present": False,
+                "cache_key": cache_key,
+            }
+            self._fabric_sql_tds_capability_cache = result
+            return result
+
+        try:
+            import pyodbc  # type: ignore[import-untyped]
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "detail": f"pyodbc_unavailable:{exc}",
+                "server_configured": True,
+                "database_configured": True,
+                "driver_present": False,
+                "cache_key": cache_key,
+            }
+            self._fabric_sql_tds_capability_cache = result
+            return result
+
+        driver_present = False
+        try:
+            drivers = {str(d).strip() for d in pyodbc.drivers()}
+            driver_present = "ODBC Driver 18 for SQL Server" in drivers
+        except Exception:
+            # Some environments do not expose driver listing; leave as unknown/present.
+            driver_present = True
+
+        result = {
+            "ok": bool(driver_present),
+            "detail": "ready" if driver_present else "odbc_driver_18_missing",
+            "server_configured": True,
+            "database_configured": True,
+            "driver_present": bool(driver_present),
+            "cache_key": cache_key,
+        }
+        self._fabric_sql_tds_capability_cache = result
+        return result
+
+    def _fabric_sql_effective_mode(self) -> str:
+        detail = self._fabric_sql_effective_mode_detail()
+        return str(detail.get("mode") or "blocked")
+
+    def _fabric_sql_effective_mode_detail(self) -> Dict[str, Any]:
+        """Compute effective FABRIC_SQL mode and block reason."""
+        configured_mode = (os.getenv("FABRIC_SQL_MODE", "auto").strip().lower() or "auto")
+        if configured_mode not in {"auto", "tds", "rest"}:
+            configured_mode = "auto"
+
+        rest_endpoint = self._effective_fabric_endpoint("FABRIC_SQL")
+        has_rest = bool(rest_endpoint)
+        has_tds_cfg = bool(os.getenv("FABRIC_SQL_SERVER", "").strip()) and bool(
+            os.getenv("FABRIC_SQL_DATABASE", "").strip() or FABRIC_SQL_DATABASE
+        )
+        tds_cap = self._fabric_sql_tds_capability() if has_tds_cfg else {
+            "ok": False,
+            "detail": "fabric_sql_tds_missing_server_or_database",
+        }
+        rest_auth_ready, rest_auth_reason, rest_auth_bundle = self._fabric_auth_reason_for_source("FABRIC_SQL")
+
+        def _rest_detail(reason: str) -> Dict[str, Any]:
+            return {
+                "mode": "rest",
+                "configured_mode": configured_mode,
+                "reason": reason,
+                "auth_mode": str(rest_auth_bundle.get("auth_mode") or "none"),
+                "auth_ready": bool(rest_auth_ready),
+            }
+
+        if configured_mode == "tds":
+            if has_tds_cfg and bool(tds_cap.get("ok")):
+                return {"mode": "tds", "configured_mode": configured_mode, "reason": "tds_ready"}
+            return {
+                "mode": "blocked",
+                "configured_mode": configured_mode,
+                "reason": f"TDS unavailable: {tds_cap.get('detail', 'fabric_sql_tds_unavailable')}",
+            }
+
+        if configured_mode == "rest":
+            if has_rest and rest_auth_ready:
+                return _rest_detail("rest_ready")
+            if has_rest:
+                return _rest_detail(f"rest_auth_not_ready:{rest_auth_reason}")
+            reason = "fabric_sql_rest_endpoint_missing"
+            return {
+                "mode": "blocked",
+                "configured_mode": configured_mode,
+                "reason": reason,
+                "auth_mode": str(rest_auth_bundle.get("auth_mode") or "none"),
+            }
+
+        # auto: REST-first policy when endpoint is configured.
+        if has_rest and rest_auth_ready:
+            reason = "rest_ready"
+            if has_tds_cfg and bool(tds_cap.get("ok")):
+                reason = "rest_preferred_over_tds"
+            elif has_tds_cfg and not bool(tds_cap.get("ok")):
+                reason = f"tds_unavailable_using_rest:{tds_cap.get('detail', 'fabric_sql_tds_unavailable')}"
+            return _rest_detail(reason)
+        if has_rest and not rest_auth_ready:
+            reason = f"rest_auth_not_ready:{rest_auth_reason}"
+            if has_tds_cfg and bool(tds_cap.get("ok")):
+                reason = f"{reason};tds_available_but_rest_preferred"
+            elif has_tds_cfg and not bool(tds_cap.get("ok")):
+                reason = f"{reason};tds_unavailable:{tds_cap.get('detail', 'fabric_sql_tds_unavailable')}"
+            return _rest_detail(reason)
+        if has_tds_cfg and bool(tds_cap.get("ok")):
+            return {"mode": "tds", "configured_mode": configured_mode, "reason": "tds_ready"}
+        if has_tds_cfg and not bool(tds_cap.get("ok")):
+            return {
+                "mode": "blocked",
+                "configured_mode": configured_mode,
+                "reason": f"TDS unavailable: {tds_cap.get('detail', 'fabric_sql_tds_unavailable')}",
+            }
+        return {
+            "mode": "blocked",
+            "configured_mode": configured_mode,
+            "reason": "fabric_sql_not_configured",
+        }
+
     def source_mode(self, source: str) -> str:
         source_norm = (source or "").upper()
-        if source_norm == "SQL":
-            return "live" if self.sql_available else "blocked"
-        if source_norm == "KQL":
-            return "live" if FABRIC_KQL_ENDPOINT else "blocked"
-        if source_norm == "GRAPH":
-            if FABRIC_GRAPH_ENDPOINT:
-                return "live"
-            return "fallback" if self.sql_available else "blocked"
-        if source_norm == "NOSQL":
-            if self._cosmos_container is not None:
-                return "live"
-            return "live" if FABRIC_NOSQL_ENDPOINT else "blocked"
-        if source_norm == "FABRIC_SQL":
-            if os.getenv("FABRIC_SQL_SERVER", "").strip():
-                return "live"
-            return "live" if FABRIC_SQL_ENDPOINT else "blocked"
-        if source_norm in {"VECTOR_OPS", "VECTOR_REG", "VECTOR_AIRPORT"}:
-            return "live" if self.search_clients else "blocked"
+        capability = self.source_capability(source_norm, refresh=True)
+        execution_mode = str(capability.get("execution_mode") or "").strip().lower()
+        if execution_mode in {"live", "fallback", "blocked"}:
+            return execution_mode
         return "unknown"
 
     def source_event_meta(self, source: str) -> Dict[str, Any]:
         source_norm = (source or "").upper()
+        cosmos_container = getattr(self, "_cosmos_container", None)
+        sql_backend = str(getattr(self, "sql_backend", "unavailable") or "unavailable")
         store_type_map = {
             "KQL": "fabric-eventhouse",
             "GRAPH": "fabric-graph",
-            "NOSQL": "cosmos-nosql" if self._cosmos_container is not None else "fabric-nosql",
+            "NOSQL": "cosmos-nosql" if cosmos_container is not None else "fabric-nosql",
             "SQL": "warehouse-sql",
             "FABRIC_SQL": "fabric-sql-warehouse",
             "VECTOR_OPS": "vector-ops",
@@ -875,42 +1848,115 @@ class UnifiedRetriever:
             "store_type": store_type_map.get(source_norm, "unknown"),
             "endpoint_label": self.source_mode(source_norm),
             "freshness": freshness_map.get(source_norm, "unknown"),
-            "sql_backend": self.sql_backend if source_norm == "SQL" else "",
+            "sql_backend": sql_backend if source_norm == "SQL" else "",
+            "capability_status": self.source_capability(source_norm, refresh=False).get("status", "unknown"),
+            "capability_reason": self.source_capability(source_norm, refresh=False).get("reason_code", "unknown"),
         }
 
     def _probe_endpoint(self, endpoint: str, timeout_seconds: int = 5) -> Dict[str, Any]:
         if not endpoint:
-            return {"status": "warn", "detail": "not_configured"}
+            return {
+                "status": "warn",
+                "detail": "not_configured",
+                "auth_mode": "none",
+                "auth_ready": False,
+                "token_ttl_seconds": None,
+            }
 
         req = urllib.request.Request(endpoint, method="GET")
-        token = _acquire_fabric_token()
+        token_bundle = self._fabric_auth_bundle_for_endpoint(endpoint)
+        token = str(token_bundle.get("token") or "")
         if token:
             req.add_header("Authorization", f"Bearer {token}")
+        def _probe_auth_fields() -> Dict[str, Any]:
+            fields: Dict[str, Any] = {
+                "auth_mode": str(token_bundle.get("auth_mode") or "none"),
+                "auth_ready": bool(token_bundle.get("auth_ready")),
+                "token_ttl_seconds": token_bundle.get("token_ttl_seconds"),
+                "dac_status": str(token_bundle.get("dac_status") or "unknown"),
+            }
+            dac_err = token_bundle.get("dac_error")
+            if dac_err:
+                fields["dac_error"] = dac_err
+            return fields
+
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 return {
                     "status": "pass",
                     "detail": f"reachable_http_{resp.status}",
+                    **_probe_auth_fields(),
                 }
         except urllib.error.HTTPError as exc:
             # Treat auth and method errors as reachable endpoint.
             if exc.code in (400, 401, 403, 404, 405):
-                return {"status": "warn", "detail": f"reachable_http_{exc.code}"}
-            return {"status": "fail", "detail": f"http_{exc.code}"}
+                return {
+                    "status": "warn",
+                    "detail": f"reachable_http_{exc.code}",
+                    **_probe_auth_fields(),
+                }
+            return {
+                "status": "fail",
+                "detail": f"http_{exc.code}",
+                **_probe_auth_fields(),
+            }
         except Exception as exc:
-            return {"status": "fail", "detail": str(exc)}
+            return {
+                "status": "fail",
+                "detail": str(exc),
+                **_probe_auth_fields(),
+            }
 
     def fabric_preflight(self) -> Dict[str, Any]:
+        self._refresh_source_capabilities(refresh_tds=True)
+        identity_report = dict(getattr(self, "_identity_guardrail_report", {}) or {})
+        source_capabilities = self.source_capabilities(refresh=False)
         checks: List[Dict[str, Any]] = []
 
-        fabric_token = _acquire_fabric_token()
-        token_status = "pass" if fabric_token else "warn"
+        for guardrail_check in identity_report.get("checks", []):
+            checks.append(
+                {
+                    "name": f"identity_{guardrail_check.get('name', 'guardrail')}",
+                    "status": guardrail_check.get("status", "warn"),
+                    "detail": guardrail_check.get("detail", ""),
+                    "mode": "policy",
+                    "expected": guardrail_check.get("expected", ""),
+                    "actual": guardrail_check.get("actual", ""),
+                    "env_key": guardrail_check.get("env_key", ""),
+                }
+            )
+
+        fabric_bundle = _acquire_fabric_token_bundle()
+        fabric_token = str(fabric_bundle.get("token") or "")
+        token_status = "pass" if fabric_bundle.get("auth_ready") else "fail"
+        dac_status_val = str(fabric_bundle.get("dac_status") or "unknown")
+        dac_error_val = fabric_bundle.get("dac_error")
         checks.append(
             {
                 "name": "fabric_bearer_token",
                 "status": token_status,
-                "detail": "present" if fabric_token else "missing_optional_or_not_configured",
+                "detail": str(fabric_bundle.get("reason") or ("present" if fabric_token else "missing_optional_or_not_configured")),
                 "mode": "n/a",
+                "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+                "dac_status": dac_status_val,
+                **({"dac_error": dac_error_val} if dac_error_val else {}),
+            }
+        )
+        auth_mode_effective = str(fabric_bundle.get("auth_mode") or "none")
+        auth_ready = bool(fabric_bundle.get("auth_ready") and fabric_token)
+        auth_mode_pass = auth_mode_effective in {"sp_client_credentials", "default_azure_credential"} and auth_ready
+        checks.append(
+            {
+                "name": "fabric_auth_mode",
+                "status": "pass" if auth_mode_pass else ("warn" if auth_mode_effective == "static_bearer" else "fail"),
+                "detail": auth_mode_effective,
+                "mode": "policy",
+                "auth_mode_effective": auth_mode_effective,
+                "auth_ready": auth_ready,
+                "allow_static_bearer": _allow_static_fabric_bearer(),
+                "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+                "dac_status": dac_status_val,
+                **({"dac_error": dac_error_val} if dac_error_val else {}),
             }
         )
         checks.append(
@@ -923,10 +1969,10 @@ class UnifiedRetriever:
         )
 
         endpoint_checks = [
-            ("fabric_kql_endpoint", FABRIC_KQL_ENDPOINT or "", "KQL"),
-            ("fabric_graph_endpoint", FABRIC_GRAPH_ENDPOINT or "", "GRAPH"),
-            ("fabric_nosql_endpoint", FABRIC_NOSQL_ENDPOINT or "", "NOSQL"),
-            ("fabric_sql_endpoint", FABRIC_SQL_ENDPOINT or "", "FABRIC_SQL"),
+            ("fabric_kql_endpoint", self._effective_fabric_endpoint("KQL"), "KQL"),
+            ("fabric_graph_endpoint", self._effective_fabric_endpoint("GRAPH"), "GRAPH"),
+            ("fabric_nosql_endpoint", self._effective_fabric_endpoint("NOSQL"), "NOSQL"),
+            ("fabric_sql_endpoint", self._effective_fabric_endpoint("FABRIC_SQL"), "FABRIC_SQL"),
         ]
 
         live_configured = False
@@ -934,16 +1980,86 @@ class UnifiedRetriever:
             mode = self.source_mode(source)
             if endpoint:
                 live_configured = True
-            probe = self._probe_endpoint(endpoint)
+            path_valid = True
+            path_detail = "n/a"
+            normalized_endpoint = endpoint or ""
+            probe_endpoint = endpoint or ""
+            if endpoint and self._is_kusto_endpoint(endpoint):
+                normalized_endpoint, path_valid, path_detail = self._resolve_kusto_query_endpoint(endpoint)
+                if path_valid and normalized_endpoint:
+                    # Probe the same normalized query URI used by runtime execution.
+                    probe_endpoint = normalized_endpoint
+            probe = self._probe_endpoint(probe_endpoint)
+            auth_required = source in {"KQL", "GRAPH", "FABRIC_SQL"} or (
+                source == "NOSQL" and endpoint and self._is_kusto_endpoint(endpoint)
+            )
+            auth_ready_for_source = bool(probe.get("auth_ready")) if auth_required else True
+            probe_detail = str(probe.get("detail", ""))
+            query_ready = bool(endpoint) and path_valid and auth_ready_for_source and probe.get("status") != "fail"
+            if probe_detail in {"reachable_http_401", "reachable_http_403", "reachable_http_404"}:
+                query_ready = False
+            check_status = probe["status"]
+            if endpoint and not path_valid:
+                check_status = "fail"
+            elif endpoint and auth_required and not auth_ready_for_source:
+                check_status = "fail"
+            elif endpoint and not query_ready:
+                check_status = "fail"
             checks.append(
                 {
                     "name": check_name,
-                    "status": probe["status"],
+                    "status": check_status,
                     "detail": probe["detail"],
                     "mode": mode,
                     "endpoint": endpoint if endpoint else "",
+                    "probe_endpoint": probe_endpoint,
+                    "normalized_endpoint": normalized_endpoint,
+                    "path_valid_for_runtime": path_valid,
+                    "path_detail": path_detail,
+                    "auth_required": auth_required,
+                    "auth_ready": auth_ready_for_source,
+                    "auth_mode": probe.get("auth_mode", "none"),
+                    "token_ttl_seconds": probe.get("token_ttl_seconds"),
+                    "query_ready": query_ready,
                 }
             )
+
+        fabric_sql_tds = self._fabric_sql_tds_capability()
+        fabric_sql_rest_capable = bool(FABRIC_SQL_ENDPOINT)
+        fabric_sql_mode_detail = self._fabric_sql_effective_mode_detail()
+        fabric_sql_effective_mode = str(fabric_sql_mode_detail.get("mode") or "blocked")
+        if fabric_sql_effective_mode in {"tds", "rest"}:
+            live_configured = True
+        checks.append(
+            {
+                "name": "fabric_sql_tds_capability",
+                "status": "pass" if fabric_sql_tds.get("ok") else "warn",
+                "detail": str(fabric_sql_tds.get("detail", "unknown")),
+                "mode": "tds",
+                "server_configured": bool(fabric_sql_tds.get("server_configured")),
+                "database_configured": bool(fabric_sql_tds.get("database_configured")),
+                "driver_present": bool(fabric_sql_tds.get("driver_present")),
+            }
+        )
+        checks.append(
+            {
+                "name": "fabric_sql_rest_capability",
+                "status": "pass" if fabric_sql_rest_capable else "warn",
+                "detail": "configured" if fabric_sql_rest_capable else "not_configured",
+                "mode": "rest",
+                "endpoint": FABRIC_SQL_ENDPOINT or "",
+            }
+        )
+        checks.append(
+            {
+                "name": "fabric_sql_effective_mode",
+                "status": "pass" if fabric_sql_effective_mode in {"tds", "rest"} else "fail",
+                "detail": str(fabric_sql_mode_detail.get("reason") or fabric_sql_effective_mode),
+                "mode": self.source_mode("FABRIC_SQL"),
+                "configured_mode": str(fabric_sql_mode_detail.get("configured_mode") or os.getenv("FABRIC_SQL_MODE", "auto")),
+                "effective_mode": fabric_sql_effective_mode,
+            }
+        )
 
         graph_query_probe = self._probe_graph_query()
         checks.append(
@@ -1011,6 +2127,32 @@ class UnifiedRetriever:
             }
         )
 
+        for capability in source_capabilities:
+            status_map = {"healthy": "pass", "degraded": "warn", "unavailable": "fail"}
+            checks.append(
+                {
+                    "name": f"source_capability_{capability.get('source', '').lower()}",
+                    "status": status_map.get(str(capability.get("status", "unknown")).lower(), "warn"),
+                    "detail": str(capability.get("reason_code", "unknown")),
+                    "mode": str(capability.get("execution_mode", "unknown")),
+                }
+            )
+
+        baseline_sources = ("SQL", "NOSQL")
+        baseline_unavailable = [
+            source
+            for source in baseline_sources
+            if str(self.source_capability(source, refresh=False).get("status", "")) == "unavailable"
+        ]
+        checks.append(
+            {
+                "name": "baseline_sources",
+                "status": "pass" if not baseline_unavailable else "fail",
+                "detail": "ready" if not baseline_unavailable else f"unavailable:{','.join(baseline_unavailable)}",
+                "mode": "policy",
+            }
+        )
+
         if any(c["status"] == "fail" for c in checks):
             overall = "fail"
         elif any(c["status"] == "warn" for c in checks):
@@ -1022,6 +2164,16 @@ class UnifiedRetriever:
             "timestamp": self._now_iso(),
             "overall_status": overall,
             "live_path_available": live_configured,
+            "fabric_sql_tds_capable": bool(fabric_sql_tds.get("ok")),
+            "fabric_sql_rest_capable": fabric_sql_rest_capable,
+            "fabric_sql_effective_mode": fabric_sql_effective_mode,
+            "auth_mode_effective": auth_mode_effective,
+            "auth_ready": auth_ready,
+            "fabric_token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+            "identity_guardrail": identity_report,
+            "source_capabilities": source_capabilities,
+            "baseline_sources": list(baseline_sources),
+            "baseline_unavailable_sources": baseline_unavailable,
             "checks": checks,
         }
 
@@ -1166,6 +2318,137 @@ class UnifiedRetriever:
                 cleaned.append(table_ref)
         return cleaned
 
+    def _sql_table_columns(self, schema: Dict[str, Any]) -> Dict[str, set[str]]:
+        table_columns: Dict[str, set[str]] = {}
+        for table_entry in schema.get("tables", []):
+            if not isinstance(table_entry, dict):
+                continue
+            table_name = str(table_entry.get("table", "")).lower().strip()
+            schema_name = str(table_entry.get("schema", "")).lower().strip()
+            cols = {
+                str(col.get("name", "")).lower().strip()
+                for col in (table_entry.get("columns") or [])
+                if isinstance(col, dict) and str(col.get("name", "")).strip()
+            }
+            if not table_name:
+                continue
+            table_columns[table_name] = cols
+            if schema_name:
+                table_columns[f"{schema_name}.{table_name}"] = cols
+        return table_columns
+
+    def _sql_alias_map(self, sql_query: str, referenced_tables: List[str]) -> Dict[str, str]:
+        alias_map: Dict[str, str] = {}
+        known_refs = {t.lower() for t in referenced_tables}
+        alias_pattern = re.compile(
+            r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.\"`]*)"
+            r"(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
+            flags=re.IGNORECASE,
+        )
+        for table_token, alias in alias_pattern.findall(sql_query):
+            table_clean = table_token.strip().strip('"').strip("`")
+            if not table_clean:
+                continue
+            parts = [p for p in table_clean.split(".") if p]
+            if not parts:
+                continue
+            if len(parts) >= 2:
+                table_ref = f"{parts[-2].lower()}.{parts[-1].lower()}"
+            else:
+                table_ref = parts[-1].lower()
+            if table_ref not in known_refs:
+                continue
+            alias_norm = (alias or "").strip().lower()
+            if alias_norm and alias_norm not in _SQL_RESERVED_WORDS:
+                alias_map[alias_norm] = table_ref
+            alias_map[parts[-1].lower()] = table_ref
+        return alias_map
+
+    def _split_sql_select_items(self, select_expr: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        for ch in select_expr:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            if ch == "," and depth == 0:
+                item = "".join(buf).strip()
+                if item:
+                    items.append(item)
+                buf = []
+                continue
+            buf.append(ch)
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _validate_sql_columns(
+        self,
+        sql_query: str,
+        schema: Dict[str, Any],
+        referenced_tables: List[str],
+    ) -> Optional[str]:
+        if not referenced_tables:
+            return None
+
+        table_columns = self._sql_table_columns(schema)
+        alias_map = self._sql_alias_map(sql_query, referenced_tables)
+        missing: set[str] = set()
+
+        def _columns_for_table(table_ref: str) -> set[str]:
+            table_ref = table_ref.lower()
+            if table_ref in table_columns:
+                return table_columns[table_ref]
+            parts = [p for p in table_ref.split(".") if p]
+            bare = parts[-1] if parts else table_ref
+            return table_columns.get(bare, set())
+
+        # Validate qualified references: alias.column
+        for alias, column in re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", sql_query
+        ):
+            alias_norm = alias.lower().strip()
+            column_norm = column.lower().strip()
+            table_ref = alias_map.get(alias_norm)
+            if not table_ref:
+                continue
+            valid_cols = _columns_for_table(table_ref)
+            if valid_cols and column_norm not in valid_cols:
+                missing.add(f"{alias_norm}.{column_norm}")
+
+        # Validate simple unqualified SELECT columns.
+        select_match = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql_query, flags=re.IGNORECASE | re.DOTALL)
+        if select_match:
+            select_items = self._split_sql_select_items(select_match.group(1))
+            all_cols: set[str] = set()
+            for table_ref in referenced_tables:
+                all_cols.update(_columns_for_table(table_ref))
+            for item in select_items:
+                expr = item.strip()
+                if not expr:
+                    continue
+                expr = re.sub(r"^\s*DISTINCT\s+", "", expr, flags=re.IGNORECASE)
+                expr = re.sub(r"\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*$", "", expr, flags=re.IGNORECASE)
+                expr = re.sub(r"\s+[A-Za-z_][A-Za-z0-9_]*\s*$", "", expr)
+                if expr == "*" or expr.endswith(".*"):
+                    continue
+                if "." in expr:
+                    continue
+                if "(" in expr or ")" in expr:
+                    continue
+                if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", expr):
+                    continue
+                col = expr.lower()
+                if all_cols and col not in all_cols:
+                    missing.add(col)
+
+        if missing:
+            return f"missing columns in current schema: {', '.join(sorted(missing))}"
+        return None
+
     def _validate_sql_query(self, sql_query: str) -> Optional[Dict[str, Any]]:
         sql = (sql_query or "").strip()
         if not sql:
@@ -1209,6 +2492,12 @@ class UnifiedRetriever:
             return {
                 "code": "sql_schema_missing",
                 "detail": f"missing tables in current schema: {', '.join(missing_tables)}",
+            }
+        missing_columns = self._validate_sql_columns(sql, schema, referenced_tables)
+        if missing_columns:
+            return {
+                "code": "sql_schema_missing",
+                "detail": missing_columns,
             }
         return None
 
@@ -1274,20 +2563,107 @@ class UnifiedRetriever:
     def _heuristic_sql_fallback(self, query: str, need_schema_detail: str) -> Optional[str]:
         """Best-effort SQL fallback when writer returns NEED_SCHEMA."""
         schema = self.cached_sql_schema()
-        tables = {
-            str(t.get("table", "")).lower(): {
-                str(col.get("name", "")).lower()
-                for col in (t.get("columns") or [])
+        tables: Dict[str, set[str]] = {}
+        for table_entry in schema.get("tables", []):
+            if not isinstance(table_entry, dict):
+                continue
+            table = str(table_entry.get("table", "")).lower().strip()
+            schema_name = str(table_entry.get("schema", "")).lower().strip()
+            if not table:
+                continue
+            cols = {
+                str(col.get("name", "")).lower().strip()
+                for col in (table_entry.get("columns") or [])
                 if isinstance(col, dict)
             }
-            for t in schema.get("tables", [])
-            if isinstance(t, dict)
-        }
+            tables[table] = cols
+            if schema_name:
+                tables[f"{schema_name}.{table}"] = cols
         asrs_cols = tables.get("asrs_reports", set())
+        q = (query or "").lower()
+        need_detail = str(need_schema_detail or "").lower()
+
+        # Runway/airport fallback for queries that fail with generated columns that are
+        # not present in OurAirports schema (e.g., a.iata, runway_id, airport, active).
+        runway_terms = {"runway", "airport", "airports", "flight risk", "disruption", "compare"}
+        runway_missing_markers = {"runway_id", "a.iata", " airport", " active", "ourairports"}
+        if (
+            any(term in q for term in runway_terms)
+            and any(marker in need_detail for marker in runway_missing_markers)
+        ):
+            required_airport_cols = {"id", "ident", "iata_code"}
+            required_runway_cols = {"id", "airport_ref", "surface", "length_ft", "width_ft", "closed"}
+
+            def _safe_ident(ident: str) -> Optional[str]:
+                value = str(ident or "").strip()
+                if re.fullmatch(r"[a-z_][a-z0-9_]*", value):
+                    return value
+                return None
+
+            airport_table_ref: Optional[str] = None
+            runway_table_ref: Optional[str] = None
+
+            for table_entry in schema.get("tables", []):
+                if not isinstance(table_entry, dict):
+                    continue
+                table_name = str(table_entry.get("table", "")).lower().strip()
+                schema_name = str(table_entry.get("schema", "")).lower().strip()
+                table_ident = _safe_ident(table_name)
+                schema_ident = _safe_ident(schema_name) if schema_name else None
+                if not table_ident:
+                    continue
+                cols = {
+                    str(col.get("name", "")).lower().strip()
+                    for col in (table_entry.get("columns") or [])
+                    if isinstance(col, dict)
+                }
+                qualified = f"{schema_ident}.{table_ident}" if schema_ident else table_ident
+                if table_name == "ourairports_airports" and cols.issuperset(required_airport_cols):
+                    airport_table_ref = qualified
+                if table_name == "ourairports_runways" and cols.issuperset(required_runway_cols):
+                    runway_table_ref = qualified
+
+            if airport_table_ref and runway_table_ref:
+                iata_tokens = [
+                    token
+                    for token in re.findall(r"\b[A-Z]{3}\b", (query or "").upper())
+                    if token
+                    and token not in {
+                        "THE", "AND", "FOR", "WITH", "FROM", "NEXT", "MIN",
+                        "RISK", "ACROSS", "FLIGHT", "COMPARE", "OVER", "UNDER",
+                    }
+                ]
+                icao_tokens = self._extract_airports_from_query(query)
+                where_clause = ""
+                if iata_tokens or icao_tokens:
+                    filters: List[str] = []
+                    if iata_tokens:
+                        filters.append(
+                            "a.iata_code IN (" + ", ".join(f"'{token}'" for token in sorted(set(iata_tokens))) + ")"
+                        )
+                    if icao_tokens:
+                        filters.append(
+                            "a.ident IN (" + ", ".join(f"'{token}'" for token in sorted(set(icao_tokens))) + ")"
+                        )
+                    where_clause = "WHERE (" + " OR ".join(filters) + ") "
+                return (
+                    "SELECT "
+                    "COALESCE(NULLIF(a.iata_code, ''), a.ident) AS airport, "
+                    "r.id AS runway_id, "
+                    "r.surface, "
+                    "r.length_ft, "
+                    "r.width_ft, "
+                    "r.closed "
+                    f"FROM {runway_table_ref} r "
+                    f"JOIN {airport_table_ref} a ON r.airport_ref = a.id "
+                    f"{where_clause}"
+                    "ORDER BY airport ASC, r.length_ft DESC NULLS LAST "
+                    "LIMIT 200"
+                )
+
         if not asrs_cols:
             return None
 
-        q = (query or "").lower()
         ask_top = any(token in q for token in ("top", "highest", "rank"))
         ask_count = "count" in q or "how many" in q or "number of" in q
         ask_facility = any(token in q for token in ("facility", "facilities", "airport", "airports", "location", "station"))
@@ -1333,8 +2709,10 @@ class UnifiedRetriever:
     def query_sql(self, query: str, sql_hint: str = None) -> Tuple[List[Dict], str, List[Citation]]:
         """Execute SQL query against the aviation database."""
         _t0_sql = time.perf_counter()
-        if not self.sql_available:
-            row = self._source_unavailable_row("SQL", self.sql_unavailable_reason or "sql_backend_not_available")
+        sql_capability = self.source_capability("SQL", refresh=True)
+        if sql_capability.get("status") == "unavailable":
+            detail = str(sql_capability.get("detail") or sql_capability.get("reason_code") or "sql_backend_not_available")
+            row = self._source_unavailable_row("SQL", detail)
             return [row], "", []
 
         if sql_hint:
@@ -1376,10 +2754,8 @@ class UnifiedRetriever:
             if fallback_sql:
                 results, citations = self.execute_sql_query(fallback_sql)
                 if results and not results[0].get("error_code"):
-                    for row in results:
-                        if isinstance(row, dict):
-                            row["partial_schema"] = sql
-                            row["fallback_sql"] = fallback_sql
+                    logger.info("NEED_SCHEMA fallback succeeded: original=%s fallback=%s rows=%d",
+                                sql[:120], fallback_sql[:120], len(results))
                 return results, fallback_sql, citations
             return [self._source_error_row("SQL", "sql_schema_missing", sql, {"sql": sql})], sql, []
 
@@ -1397,6 +2773,10 @@ class UnifiedRetriever:
     ) -> Tuple[List[Dict], List[Citation]]:
         """Search a specific semantic index using hybrid/vector retrieval."""
         _t0_sem = time.perf_counter()
+        source_capability = self.source_capability(source, refresh=True)
+        if source_capability.get("status") == "unavailable":
+            return [self._source_unavailable_row(source, str(source_capability.get("reason_code") or "search_index_unavailable"))], []
+
         index_name = self.vector_source_to_index.get(source) or self.vector_source_to_index.get("VECTOR_OPS", "idx_ops_narratives")
         client = self.search_clients.get(index_name)
         if client is None:
@@ -1563,7 +2943,153 @@ class UnifiedRetriever:
         lowered = candidate.lower()
         return lowered.startswith("let ") or lowered.startswith(".show")
 
-    def _validate_kql_query(self, csl: str) -> Optional[str]:
+    def _kql_table_columns(self, kql_schema: Optional[Dict[str, Any]]) -> Dict[str, set[str]]:
+        if not isinstance(kql_schema, dict):
+            return {}
+        out: Dict[str, set[str]] = {}
+        for table_entry in kql_schema.get("tables", []):
+            if not isinstance(table_entry, dict):
+                continue
+            table = str(table_entry.get("table", "")).strip().lower()
+            if not table:
+                continue
+            cols: set[str] = set()
+            for col in (table_entry.get("columns") or []):
+                if isinstance(col, dict):
+                    name = str(col.get("name", "")).strip()
+                else:
+                    name = str(col).strip()
+                if name:
+                    cols.add(name.lower())
+            out[table] = cols
+        return out
+
+    def _infer_kql_table(self, csl: str) -> str:
+        stripped = re.sub(r'"[^"]*"', "", csl or "")
+        stripped = re.sub(r"'[^']*'", "", stripped)
+        stripped, _bindings = self._split_kql_let_bindings(stripped)
+        match = re.search(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\b", stripped)
+        if not match:
+            return ""
+        table = match.group(1).strip().lower()
+        if table in _KQL_RESERVED_WORDS:
+            return ""
+        return table
+
+    def _split_kql_let_bindings(self, csl: str) -> Tuple[str, Dict[str, str]]:
+        """Return (main_query, let_bindings) for leading let declarations."""
+        remaining = (csl or "").strip()
+        bindings: Dict[str, str] = {}
+        while True:
+            match = re.match(
+                r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?);\s*",
+                remaining,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                break
+            alias = match.group(1).strip().lower()
+            expr = match.group(2).strip()
+            if alias and expr:
+                bindings[alias] = expr
+            remaining = remaining[match.end():]
+        return remaining.strip(), bindings
+
+    def _resolve_kql_table_alias(self, table: str, bindings: Dict[str, str]) -> str:
+        """Resolve let-bound alias to a concrete table when possible."""
+        current = (table or "").strip().lower()
+        if not current:
+            return ""
+        visited: set[str] = set()
+        for _ in range(8):
+            if current in visited:
+                break
+            visited.add(current)
+            expr = bindings.get(current)
+            if not expr:
+                return current
+            resolved = self._infer_kql_table(expr)
+            if not resolved:
+                return current
+            current = resolved
+        return current
+
+    def _extract_kql_column_refs(self, csl: str) -> set[str]:
+        refs: set[str] = set()
+        stripped = re.sub(r'"[^"]*"', "", csl or "")
+        stripped = re.sub(r"'[^']*'", "", stripped)
+        for segment in [seg.strip() for seg in stripped.split("|") if seg.strip()]:
+            seg_low = segment.lower()
+            if seg_low.startswith("where "):
+                for col in re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(==|=~|!=|!~|has_any|has|contains|in~|in|between|>|<|>=|<=)",
+                    segment,
+                    flags=re.IGNORECASE,
+                ):
+                    refs.add(str(col[0]).lower())
+                continue
+            if seg_low.startswith("project "):
+                project_expr = segment[len("project "):]
+                for item in [x.strip() for x in project_expr.split(",") if x.strip()]:
+                    expr = item.split("=", 1)[1].strip() if "=" in item else item
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", expr):
+                        refs.add(expr.lower())
+                        continue
+                    function_tokens = {
+                        fn.strip().lower()
+                        for fn in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expr)
+                    }
+                    for token in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", expr):
+                        token_l = token.lower()
+                        if token_l in function_tokens:
+                            continue
+                        refs.add(token_l)
+                continue
+            if seg_low.startswith("sort by ") or seg_low.startswith("order by "):
+                by_expr = re.split(r"\bby\b", segment, maxsplit=1, flags=re.IGNORECASE)[-1]
+                for item in [x.strip() for x in by_expr.split(",") if x.strip()]:
+                    token = item.split()[0].strip()
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", token):
+                        refs.add(token.lower())
+                continue
+            if seg_low.startswith("top ") and re.search(r"\bby\b", seg_low):
+                by_expr = re.split(r"\bby\b", segment, maxsplit=1, flags=re.IGNORECASE)[-1]
+                for item in [x.strip() for x in by_expr.split(",") if x.strip()]:
+                    token = item.split()[0].strip()
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", token):
+                        refs.add(token.lower())
+                continue
+            if seg_low.startswith("summarize ") and re.search(r"\bby\b", seg_low):
+                by_expr = re.split(r"\bby\b", segment, maxsplit=1, flags=re.IGNORECASE)[-1]
+                for item in [x.strip() for x in by_expr.split(",") if x.strip()]:
+                    token = item.split("=")[-1].split()[0].strip()
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", token):
+                        refs.add(token.lower())
+        return refs
+
+    def _sanitize_kql_query(self, csl: str) -> Tuple[str, bool, str]:
+        text = (csl or "").strip()
+        if not text:
+            return text, False, ""
+        reasons: List[str] = []
+        updated = re.sub(r";\s*\|", " |", text)
+        if updated != text:
+            text = updated
+            reasons.append("semicolon_before_pipe_removed")
+        if text.rstrip().endswith(";"):
+            text = text.rstrip().rstrip(";").rstrip()
+            reasons.append("trailing_semicolon_removed")
+        return text, bool(reasons), ",".join(reasons)
+
+    def prepare_kql_query(self, csl: str, window_minutes: int = 60) -> Tuple[str, Dict[str, Any]]:
+        prepared = self._ensure_kql_window(csl, window_minutes)
+        sanitized, changed, reason = self._sanitize_kql_query(prepared)
+        return sanitized, {
+            "query_rewritten": bool(changed),
+            "rewrite_reason": reason if changed else "",
+        }
+
+    def _validate_kql_query(self, csl: str, kql_schema: Optional[Dict[str, Any]] = None) -> Optional[str]:
         text = (csl or "").strip()
         if not text:
             return "empty_kql_query"
@@ -1585,10 +3111,31 @@ class UnifiedRetriever:
         stripped = re.sub(r'\blet\s+\w+\s*=\s*[^;]*;', '', stripped)
         if ";" in stripped:
             return "kql_multiple_statements_not_allowed"
+        if re.search(r"\btime_now\s*\(", stripped, flags=re.IGNORECASE):
+            return "kql_unsupported_function:time_now"
         # After stripping let bindings, block Kusto management commands (dot-commands)
         # that could leak info or mutate state (e.g. `.show commands`, `.set-or-replace`).
         if re.search(r'\.\s*(show|set|append|move|rename|replace|enable|disable)\b', stripped, flags=re.IGNORECASE):
             return "kql_contains_blocked_management_command"
+        table_columns = self._kql_table_columns(kql_schema)
+        if table_columns:
+            main_query, let_bindings = self._split_kql_let_bindings(text)
+            table = self._infer_kql_table(main_query)
+            table_is_alias = bool(table and table in let_bindings)
+            resolved_table = self._resolve_kql_table_alias(table, let_bindings) if table else ""
+            if table and resolved_table not in table_columns:
+                return f"kql_unknown_table:{table}"
+            if resolved_table and resolved_table in table_columns and not table_is_alias:
+                allowed = table_columns.get(resolved_table, set())
+                refs = self._extract_kql_column_refs(text)
+                unknown = sorted(
+                    ref for ref in refs
+                    if ref not in allowed
+                    and ref not in _KQL_RESERVED_WORDS
+                    and ref not in _KQL_ALLOWED_FUNCTIONS
+                )
+                if unknown:
+                    return f"kql_unknown_columns:{','.join(unknown[:8])}"
         return None
 
     # Time columns used by known Kusto tables.
@@ -1612,32 +3159,119 @@ class UnifiedRetriever:
                 return f"{text}\n| where {col} > ago({max(1, int(window_minutes))}m)"
         return text
 
-    def query_kql(self, query: str, window_minutes: int = 60) -> Tuple[List[Dict], List[Citation]]:
+    def query_kql(
+        self,
+        query: str,
+        window_minutes: int = 60,
+        kql_schema: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve event-window signals from Eventhouse (live only)."""
-        if not FABRIC_KQL_ENDPOINT:
-            return [self._source_unavailable_row("KQL", "FABRIC_KQL_ENDPOINT not configured")], []
+        effective_kql_schema = kql_schema
+        if not isinstance(effective_kql_schema, dict) or "tables" not in effective_kql_schema:
+            effective_kql_schema = {
+                "tables": [
+                    {
+                        "table": "opensky_states",
+                        "columns": ["callsign", "icao24", "time_position", "timestamp"],
+                    },
+                    {
+                        "table": "hazards_airsigmets",
+                        "columns": ["raw_text", "valid_time_from", "valid_time_to", "points"],
+                    },
+                    {
+                        "table": "hazards_gairmets",
+                        "columns": ["valid_time", "points", "hazard"],
+                    },
+                ]
+            }
+        table_columns = self._kql_table_columns(effective_kql_schema)
+        kql_endpoint = self._effective_fabric_endpoint("KQL")
+        kql_capability = self.source_capability("KQL", refresh=True)
+        if kql_capability.get("status") == "unavailable":
+            reason_code = str(kql_capability.get("reason_code") or "")
+            soft_block_reasons = {"fabric_auth_unavailable", "missing_fabric_kql_database"}
+            if kql_endpoint and reason_code in soft_block_reasons:
+                pass
+            else:
+                detail = str(kql_capability.get("detail") or reason_code or "kql_endpoint_not_configured")
+                return [self._source_unavailable_row("KQL", detail)], []
 
-        if self._is_kusto_endpoint(FABRIC_KQL_ENDPOINT):
+        if self._is_kusto_endpoint(kql_endpoint):
             if self._looks_like_kql_text(query):
-                csl = self._ensure_kql_window(query, window_minutes)
+                csl, _meta = self.prepare_kql_query(query, window_minutes)
             else:
                 airports = self._extract_airports_from_query(query)
                 query_lower = (query or "").lower()
                 is_weather_query = any(w in query_lower for w in ("weather", "hazard", "sigmet", "airmet", "turbulence", "icing", "storm"))
-                if airports and is_weather_query:
-                    # Query hazards_airsigmets for weather-related airport queries.
-                    # Note: hazards_airsigmets has points (lat/lon polygon) not station IDs,
-                    # so we search raw_text for the airport identifiers.
-                    values = ",".join(f"'{a}'" for a in airports)
-                    csl = (
-                        "hazards_airsigmets "
-                        f"| where raw_text has_any ({values}) "
-                        f"| where valid_time_to > ago({max(1, int(window_minutes))}m) "
-                        "| top 40 by valid_time_from desc"
+                is_airport_risk_query = any(
+                    token in query_lower
+                    for token in (
+                        "risk",
+                        "departure",
+                        "disruption",
+                        "compare",
+                        "next-90",
+                        "next 90",
                     )
+                )
+                if airports and (is_weather_query or is_airport_risk_query):
+                    iata_tokens = sorted(set(re.findall(r"\b[A-Z]{3}\b", (query or "").upper())))
+                    terms = sorted(set([*airports, *iata_tokens]))
+                    values = ",".join(f"'{term}'" for term in terms)
+
+                    has_airsigmets = "hazards_airsigmets" in table_columns
+                    has_gairmets = "hazards_gairmets" in table_columns
+                    airsig_cols = table_columns.get("hazards_airsigmets", set())
+                    gair_cols = table_columns.get("hazards_gairmets", set())
+                    window = max(1, int(window_minutes))
+
+                    if has_airsigmets and {"raw_text", "valid_time_from", "valid_time_to"}.issubset(airsig_cols):
+                        csl = (
+                            "let horizon_start = now(); "
+                            f"let horizon_end = now() + {window}m; "
+                            "hazards_airsigmets "
+                            "| where valid_time_to >= horizon_start and valid_time_from <= horizon_end "
+                            f"| where raw_text has_any ({values}) "
+                            "| top 40 by valid_time_from desc"
+                        )
+                    elif has_gairmets and {"valid_time", "points"}.issubset(gair_cols):
+                        csl = (
+                            "let horizon_start = now(); "
+                            f"let horizon_end = now() + {window}m; "
+                            "hazards_gairmets "
+                            "| where valid_time between (horizon_start .. horizon_end) "
+                            f"| where tostring(points) has_any ({values}) or tostring(hazard) has_any ({values}) "
+                            "| top 40 by valid_time desc"
+                        )
+                    else:
+                        explicit_ids = self._extract_explicit_flight_identifiers(query)
+                        if not explicit_ids:
+                            return [
+                                self._source_error_row(
+                                    source="KQL",
+                                    code="kql_unmappable_airport_filter",
+                                    detail="airport identifiers cannot be mapped to available KQL tables",
+                                    extra={"airports": airports},
+                                )
+                            ], []
+                        values = ",".join(f"'{value}'" for value in explicit_ids)
+                        csl = (
+                            "opensky_states "
+                            f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
+                            "| take 50"
+                        )
                 elif airports:
-                    # Query opensky_states for flight tracking near airports.
-                    values = ",".join(f"'{a}'" for a in airports)
+                    explicit_ids = self._extract_explicit_flight_identifiers(query)
+                    if not explicit_ids:
+                        return [
+                            self._source_error_row(
+                                source="KQL",
+                                code="kql_unmappable_airport_filter",
+                                detail="airport identifiers cannot be mapped to opensky_states without explicit callsign or icao24 values",
+                                extra={"airports": airports},
+                            )
+                        ], []
+                    values = ",".join(f"'{value}'" for value in explicit_ids)
                     csl = (
                         "opensky_states "
                         f"| where callsign has_any ({values}) or icao24 in~ ({values}) "
@@ -1654,8 +3288,9 @@ class UnifiedRetriever:
                         )
                     else:
                         csl = "opensky_states | take 50"
+                csl, _changed, _reason = self._sanitize_kql_query(csl)
 
-            validation_error = self._validate_kql_query(csl)
+            validation_error = self._validate_kql_query(csl, kql_schema=effective_kql_schema)
             if validation_error:
                 return [
                     self._source_error_row(
@@ -1666,7 +3301,11 @@ class UnifiedRetriever:
                     )
                 ], []
 
-            rows, error = self._kusto_rows(FABRIC_KQL_ENDPOINT, csl)
+            rows, error = self._kusto_rows(
+                kql_endpoint,
+                csl,
+                timeout_seconds=_source_call_timeout_seconds(),
+            )
             if rows:
                 citation = Citation(
                     source_type="KQL",
@@ -1677,17 +3316,28 @@ class UnifiedRetriever:
                     dataset="fabric-eventhouse",
                 )
                 return rows, [citation]
+            error_extra: Dict[str, Any] = {"csl": csl}
+            if error and "http_401" in error:
+                error_extra["auth_hint"] = (
+                    "KQL auth failed (HTTP 401). Check: (1) DefaultAzureCredential / "
+                    "workload identity binding, (2) FABRIC_CLIENT_ID/SECRET/TENANT_ID "
+                    "credentials, (3) SP permissions on the Kusto database."
+                )
             return [
                 self._source_error_row(
                     source="KQL",
                     code="kql_runtime_error",
                     detail=error or "kql_query_returned_no_rows",
-                    extra={"csl": csl},
+                    extra=error_extra,
                 )
             ], []
         else:
             payload = {"query": query, "window_minutes": window_minutes}
-            response = self._post_json(FABRIC_KQL_ENDPOINT, payload)
+            response = self._post_json(
+                kql_endpoint,
+                payload,
+                timeout_seconds=_source_call_timeout_seconds(),
+            )
             if isinstance(response, dict) and "error" not in response:
                 rows = response.get("rows", [])
                 if rows:
@@ -1798,13 +3448,42 @@ class UnifiedRetriever:
 
     def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve graph relationships from Fabric graph endpoint, with PostgreSQL fallback."""
-        if not FABRIC_GRAPH_ENDPOINT:
+        graph_capability = self.source_capability("GRAPH", refresh=True)
+        if graph_capability.get("status") == "unavailable":
+            detail = str(graph_capability.get("detail") or graph_capability.get("reason_code") or "graph_endpoint_not_configured")
+            return [self._source_unavailable_row("GRAPH", detail)], []
+        graph_execution_mode = str(graph_capability.get("execution_mode") or "").strip().lower()
+        if graph_execution_mode == "fallback":
+            reason = str(graph_capability.get("detail") or graph_capability.get("reason_code") or "graph_fallback_mode")
             rows, citations = self._query_graph_pg_fallback(
                 query,
                 hops=hops,
-                unavailable_detail="FABRIC_GRAPH_ENDPOINT not configured; using PostgreSQL fallback",
+                unavailable_detail=f"Graph live path skipped by capability mode fallback ({reason})",
             )
-            return self._annotate_graph_rows(rows, "pg_fallback_no_endpoint", True, 0), citations
+            snapshot = self._graph_circuit_snapshot()
+            return self._annotate_graph_rows(
+                rows,
+                "pg_fallback_capability_mode",
+                True,
+                0,
+                extra={"graph_live_error": "capability_forced_fallback", **snapshot},
+            ), citations
+
+        graph_endpoint = self._effective_fabric_endpoint("GRAPH")
+        if not graph_endpoint:
+            rows, citations = self._query_graph_pg_fallback(
+                query,
+                hops=hops,
+                unavailable_detail="FABRIC_GRAPH_ENDPOINT not configured; attempting SQL fallback",
+            )
+            snapshot = self._graph_circuit_snapshot()
+            return self._annotate_graph_rows(
+                rows,
+                "pg_fallback_no_endpoint",
+                True,
+                0,
+                extra=snapshot,
+            ), citations
 
         if self._graph_circuit_is_open():
             snapshot = self._graph_circuit_snapshot()
@@ -1936,16 +3615,26 @@ class UnifiedRetriever:
 
     def query_nosql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve NoSQL-style records — Cosmos DB first, then Fabric REST fallback."""
+        nosql_capability = self.source_capability("NOSQL", refresh=True)
+        if nosql_capability.get("status") == "unavailable":
+            detail = str(nosql_capability.get("detail") or nosql_capability.get("reason_code") or "nosql_endpoint_not_configured")
+            return [self._source_unavailable_row("NOSQL", detail)], []
+
         # Path 1: Cosmos DB native SDK
         if self._cosmos_container is not None:
             return self._query_cosmos_notams(query)
 
         # Path 2: Fabric REST / Kusto endpoint (backward compat)
-        if not FABRIC_NOSQL_ENDPOINT:
+        nosql_endpoint = self._effective_fabric_endpoint("NOSQL")
+        if not nosql_endpoint:
             return [self._source_unavailable_row("NOSQL", "NOSQL source not configured (no Cosmos DB or FABRIC_NOSQL_ENDPOINT)")], []
 
-        if self._is_kusto_endpoint(FABRIC_NOSQL_ENDPOINT):
-            docs, _error = self._kusto_rows(FABRIC_NOSQL_ENDPOINT, "hazards_airsigmets | take 30")
+        if self._is_kusto_endpoint(nosql_endpoint):
+            docs, _error = self._kusto_rows(
+                nosql_endpoint,
+                "hazards_airsigmets | take 30",
+                timeout_seconds=_source_call_timeout_seconds(),
+            )
             if docs:
                 citation = Citation(
                     source_type="NOSQL",
@@ -1959,7 +3648,11 @@ class UnifiedRetriever:
             return [self._source_error_row("NOSQL", "nosql_runtime_error", _error or "nosql_query_returned_no_rows")], []
 
         payload = {"query": query}
-        response = self._post_json(FABRIC_NOSQL_ENDPOINT, payload)
+        response = self._post_json(
+            nosql_endpoint,
+            payload,
+            timeout_seconds=_source_call_timeout_seconds(),
+        )
         if isinstance(response, dict) and "error" not in response:
             docs = response.get("docs", [])
             if docs:
@@ -2031,32 +3724,76 @@ Notes:
 
         logger.info("FABRIC_SQL TDS query: %s", sql[:200])
 
-        try:
-            import pyodbc
-            import struct
-            from azure.identity import DefaultAzureCredential
+        sql_token_scope = "https://database.windows.net/.default"
+        token_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
+        token = str(token_bundle.get("token") or "")
+        if not token or not bool(token_bundle.get("auth_ready")):
+            # Retry once: invalidate cache and re-acquire (mirrors KQL 401 pattern)
+            logger.warning("FABRIC_SQL auth not ready — invalidating cache and retrying (scope=%s)", sql_token_scope)
+            _invalidate_fabric_token_cache(sql_token_scope)
+            token_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
+            token = str(token_bundle.get("token") or "")
+            if not token or not bool(token_bundle.get("auth_ready")):
+                detail = str(token_bundle.get("reason") or "fabric_sql_tds_auth_not_ready")
+                return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
+                    "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+                })], []
+        token_aud = str(_decode_jwt_payload(token).get("aud") or "")
+        if token_aud and "database.windows.net" not in token_aud:
+            detail = f"fabric_sql_tds_invalid_token_audience:{token_aud}"
+            return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
+                "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+            })], []
 
-            credential = DefaultAzureCredential()
-            token = credential.get_token("https://database.windows.net/.default").token
-            encoded = token.encode("UTF-16-LE")
+        connect_timeout = _env_int("FABRIC_SQL_TDS_CONNECT_TIMEOUT_SECONDS", 10, minimum=1)
+        query_timeout = _env_int("FABRIC_SQL_TDS_QUERY_TIMEOUT_SECONDS", 15, minimum=1)
+
+        import pyodbc
+        import struct
+
+        def _tds_connect_and_query(tok: str) -> tuple:
+            encoded = tok.encode("UTF-16-LE")
             token_bytes = struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
-
             conn_str = (
                 f"Driver={{ODBC Driver 18 for SQL Server}};"
                 f"Server={server},1433;"
                 f"Database={database};"
                 f"Encrypt=yes;"
                 f"TrustServerCertificate=no;"
-                f"Connection Timeout=30;"
+                f"Connection Timeout={connect_timeout};"
             )
-            conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=30)
-            cursor = conn.cursor()
-            cursor.execute(sql)
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=connect_timeout)
+            cur = conn.cursor()
+            cur.timeout = query_timeout
+            cur.execute(sql)
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            result = [dict(zip(cols, r)) for r in cur.fetchall()]
             conn.close()
+            return result
+
+        try:
+            rows = _tds_connect_and_query(token)
         except Exception as exc:
-            return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", str(exc), {"sql": sql})], []
+            detail = str(exc)
+            if "18456" in detail:
+                # Stale token — invalidate cache, re-acquire, retry once (mirrors KQL 401 pattern)
+                logger.warning("FABRIC_SQL 18456 — invalidating token cache and retrying (scope=%s)", sql_token_scope)
+                _invalidate_fabric_token_cache(sql_token_scope)
+                retry_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
+                retry_token = str(retry_bundle.get("token") or "")
+                if not retry_token or not bool(retry_bundle.get("auth_ready")):
+                    return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
+                        "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+                    })], []
+                try:
+                    rows = _tds_connect_and_query(retry_token)
+                except Exception as retry_exc:
+                    retry_detail = str(retry_exc)
+                    return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", f"{retry_detail} (retry_after_18456)", {
+                        "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
+                    })], []
+            else:
+                return [self._source_error_row("FABRIC_SQL", "fabric_sql_tds_error", detail, {"sql": sql})], []
 
         if not rows:
             return [self._source_error_row("FABRIC_SQL", "fabric_sql_no_rows", "query returned no rows", {"sql": sql})], []
@@ -2075,22 +3812,14 @@ Notes:
             ))
         return rows, citations
 
-    def query_fabric_sql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
-        """Retrieve data from Fabric SQL warehouse (TDS preferred, REST fallback)."""
-        # Prefer TDS (pyodbc) path when FABRIC_SQL_SERVER is configured.
-        fabric_sql_server = os.getenv("FABRIC_SQL_SERVER", "").strip()
-        fabric_sql_database = os.getenv("FABRIC_SQL_DATABASE", "").strip() or FABRIC_SQL_DATABASE
+    def _query_fabric_sql_rest(self, query: str) -> Tuple[List[Dict], List[Citation]]:
+        """Query Fabric SQL via REST endpoint."""
+        fabric_sql_endpoint = self._effective_fabric_endpoint("FABRIC_SQL")
+        if not fabric_sql_endpoint:
+            return [self._source_unavailable_row("FABRIC_SQL", "FABRIC_SQL_ENDPOINT not configured")], []
 
-        if fabric_sql_server and fabric_sql_database:
-            return self._query_fabric_sql_tds(query, fabric_sql_server, fabric_sql_database)
-
-        # REST fallback (legacy path).
-        if not FABRIC_SQL_ENDPOINT:
-            return [self._source_unavailable_row("FABRIC_SQL", "FABRIC_SQL not configured (set FABRIC_SQL_SERVER or FABRIC_SQL_ENDPOINT)")], []
-
-        # Generate SQL from user query using sql_writer.
         try:
-            schema = self.cached_sql_schema()
+            schema = self._get_fabric_sql_schema()
             sql = self.sql_writer.generate(
                 user_query=query,
                 evidence_type="generic",
@@ -2109,7 +3838,11 @@ Notes:
         if FABRIC_SQL_DATABASE:
             payload["database"] = FABRIC_SQL_DATABASE
 
-        response = self._post_json(FABRIC_SQL_ENDPOINT, payload)
+        response = self._post_json(
+            fabric_sql_endpoint,
+            payload,
+            timeout_seconds=_source_call_timeout_seconds(),
+        )
         if isinstance(response, dict) and response.get("error"):
             return [self._source_error_row("FABRIC_SQL", "fabric_sql_runtime_error", str(response.get("error")), {"sql": sql})], []
 
@@ -2135,6 +3868,34 @@ Notes:
                 dataset="fabric-sql-warehouse",
             ))
         return rows, citations
+
+    def query_fabric_sql(self, query: str) -> Tuple[List[Dict], List[Citation]]:
+        """Retrieve data from Fabric SQL warehouse."""
+        fabric_sql_capability = self.source_capability("FABRIC_SQL", refresh=True)
+        if fabric_sql_capability.get("status") == "unavailable":
+            detail = str(
+                fabric_sql_capability.get("detail")
+                or fabric_sql_capability.get("reason_code")
+                or "fabric_sql_not_configured"
+            )
+            return [self._source_unavailable_row("FABRIC_SQL", detail)], []
+
+        mode_detail = self._fabric_sql_effective_mode_detail()
+        mode = str(mode_detail.get("mode") or "blocked")
+        if mode == "rest":
+            if not bool(mode_detail.get("auth_ready")):
+                detail = str(mode_detail.get("reason") or "fabric_sql_rest_auth_not_ready")
+                return [self._source_unavailable_row("FABRIC_SQL", detail)], []
+            return self._query_fabric_sql_rest(query)
+        if mode == "tds":
+            tds_capability = self._fabric_sql_tds_capability(refresh=False)
+            if not bool(tds_capability.get("ok")):
+                detail = str(tds_capability.get("detail") or "fabric_sql_tds_unavailable")
+                return [self._source_unavailable_row("FABRIC_SQL", detail)], []
+            fabric_sql_server = os.getenv("FABRIC_SQL_SERVER", "").strip()
+            fabric_sql_database = os.getenv("FABRIC_SQL_DATABASE", "").strip() or FABRIC_SQL_DATABASE
+            return self._query_fabric_sql_tds(query, fabric_sql_server, fabric_sql_database)
+        return [self._source_unavailable_row("FABRIC_SQL", str(mode_detail.get("reason") or "fabric_sql_not_usable"))], []
 
     # =========================================================================
     # Route Execution Methods
@@ -2231,9 +3992,13 @@ Notes:
     ) -> Tuple[List[Dict[str, Any]], List[Citation], Optional[str]]:
         """Execute retrieval against one logical source."""
         cfg = params or {}
+        capability = self.source_capability(source, refresh=True)
         source_mode = self.source_mode(source)
-        if source_mode == "blocked":
-            row = self._source_unavailable_row(source, f"{source} is blocked by current source policy/configuration")
+        if source_mode == "blocked" or capability.get("status") == "unavailable":
+            row = self._source_unavailable_row(
+                source,
+                str(capability.get("reason_code") or f"{source} is blocked by current source policy/configuration"),
+            )
             return [row], [], None
         with _ur_tracer.start_as_current_span(f"source.{source.lower()}", attributes={"query.length": len(query)}) as span:
             if source == "SQL":
@@ -2415,9 +4180,22 @@ Retrieved Data:
                 messages=messages,
                 stream=True,
             )
+            emitted_chars = 0
+            refusal_message = ""
             for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    yield {"type": "agent_update", "content": chunk.choices[0].delta.content}
+                text_chunk, refusal_chunk = self._extract_chat_chunk_text(chunk)
+                if text_chunk:
+                    emitted_chars += len(text_chunk)
+                    yield {"type": "agent_update", "content": text_chunk}
+                if refusal_chunk and not refusal_message:
+                    refusal_message = refusal_chunk
+            if emitted_chars == 0 and refusal_message:
+                yield {
+                    "type": "agent_error",
+                    "error_code": "llm_refusal",
+                    "terminal_reason": "llm_refusal",
+                    "message": refusal_message,
+                }
             _synth_ms = (time.perf_counter() - _t0_synth) * 1000
             _synth_span.set_attribute("latency_ms", _synth_ms)
             _synth_span.end()
@@ -2428,6 +4206,53 @@ Retrieved Data:
             logger.error("LLM streaming synthesis failed: %s — falling back to non-streaming", exc)
             answer = self._synthesize_answer(query, context, route, conversation_history=conversation_history)
             yield {"type": "agent_update", "content": answer}
+
+    @classmethod
+    def _normalize_text_delta(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(cls._normalize_text_delta(item) for item in value)
+        if isinstance(value, dict):
+            return "".join(
+                cls._normalize_text_delta(value.get(key))
+                for key in ("text", "content", "value", "output_text")
+            )
+        return "".join(
+            cls._normalize_text_delta(getattr(value, attr, None))
+            for attr in ("text", "content", "value", "output_text")
+        )
+
+    @classmethod
+    def _extract_chat_chunk_text(cls, chunk: Any) -> Tuple[str, str]:
+        choices = getattr(chunk, "choices", None) or []
+        choice = choices[0] if choices else None
+        delta = getattr(choice, "delta", None) if choice is not None else None
+
+        content = ""
+        if delta is not None:
+            content = cls._normalize_text_delta(getattr(delta, "content", None))
+            if not content:
+                content = cls._normalize_text_delta(getattr(delta, "text", None))
+        if not content and choice is not None:
+            content = cls._normalize_text_delta(getattr(choice, "text", None))
+        if not content and choice is not None:
+            content = cls._normalize_text_delta(getattr(choice, "content", None))
+        if not content:
+            content = cls._normalize_text_delta(getattr(chunk, "output_text", None))
+        if not content:
+            content = cls._normalize_text_delta(getattr(chunk, "text", None))
+
+        refusal = ""
+        if delta is not None:
+            refusal = cls._normalize_text_delta(getattr(delta, "refusal", None))
+        if not refusal and choice is not None:
+            refusal = cls._normalize_text_delta(getattr(choice, "refusal", None))
+        if not refusal:
+            refusal = cls._normalize_text_delta(getattr(chunk, "refusal", None))
+        return content, refusal
 
 
 # =============================================================================

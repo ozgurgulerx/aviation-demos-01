@@ -99,6 +99,7 @@ def run_one(
 
     payload = {
         "message": "connectivity probe",
+        "messages": [{"role": "user", "content": "connectivity probe"}],
         "required_sources": required,
         "source_policy": source_policy,
         "failure_policy": policy,

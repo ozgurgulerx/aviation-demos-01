@@ -6,6 +6,7 @@ Contracts for agentic routing/execution plans.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any, Dict, List, Optional
 
 
@@ -80,13 +81,29 @@ class ToolCall:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], idx: int) -> "ToolCall":
+        raw_query = data.get("query")
+        params = dict(data.get("params") or {})
+        query: Optional[str]
+        if isinstance(raw_query, str):
+            query = raw_query
+        elif raw_query is None:
+            query = None
+        else:
+            query = None
+            params.setdefault("__raw_query_type", type(raw_query).__name__)
+            try:
+                preview = json.dumps(raw_query, ensure_ascii=True)
+            except Exception:
+                preview = repr(raw_query)
+            params.setdefault("__raw_query_preview", preview[:400])
+
         return cls(
             id=str(data.get("id") or f"call_{idx}"),
             tool=str(data.get("tool", "")).strip(),
             operation=str(data.get("operation", "lookup")).strip(),
             depends_on=[str(v) for v in (data.get("depends_on") or [])],
-            query=data.get("query"),
-            params=dict(data.get("params") or {}),
+            query=query,
+            params=params,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -184,4 +201,3 @@ class AgenticPlan:
             "schema_requests": self.schema_requests,
             "warnings": self.warnings,
         }
-

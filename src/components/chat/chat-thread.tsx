@@ -3,8 +3,6 @@
 import { useRef, useEffect, useState } from "react";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import {
-  Loader2,
-  Sparkles,
   Radar,
   ShieldAlert,
   Workflow,
@@ -15,6 +13,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Message } from "./message";
+import { AnswerFrame } from "./answer-frame";
 import { QUERY_CATEGORIES, type QueryType } from "@/data/seed";
 import type { Message as MessageType } from "@/types";
 import { motionTokens } from "@/lib/motion";
@@ -23,6 +22,7 @@ interface ChatThreadProps {
   messages: MessageType[];
   isLoading: boolean;
   streamingContent?: string;
+  loadingElapsedMs?: number;
   onCitationClick?: (id: number) => void;
   activeCitationId?: number | null;
   onSpeakMessage?: (messageId: string, content: string) => void;
@@ -51,6 +51,7 @@ export function ChatThread({
   messages,
   isLoading,
   streamingContent,
+  loadingElapsedMs = 0,
   onCitationClick,
   activeCitationId,
   onSpeakMessage,
@@ -137,70 +138,40 @@ export function ChatThread({
           </div>
         ) : (
           <AnimatePresence mode="popLayout">
-            {messages.map((message) => (
-              <Message
-                key={message.id}
-                message={message}
-                onCitationClick={onCitationClick}
-                activeCitationId={activeCitationId}
-                onSpeakMessage={onSpeakMessage}
-                isSpeaking={speakingMessageId === message.id}
-                voiceEnabled={voiceEnabled}
-                voiceStatus={voiceStatuses[message.id] || "idle"}
-              />
-            ))}
-
-            {isLoading && streamingContent && (
-              <motion.div
-                initial={reducedMotion ? false : { opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
-                className="flex gap-3 py-4"
-              >
-                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10">
-                  <Sparkles className="h-4 w-4 text-primary animate-pulse" />
-                </div>
-                <div className="max-w-[88%] flex-1 rounded-xl border border-border bg-card px-4 py-3">
-                  <div className="markdown-content text-sm">
-                    {streamingContent}
-                    <span className="ml-0.5 inline-block h-4 w-2 animate-pulse bg-primary/40" />
-                  </div>
-                </div>
-              </motion.div>
-            )}
-
-            {isLoading && !streamingContent && (
-              <motion.div
-                initial={reducedMotion ? false : { opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
-                className="flex gap-3 py-4"
-              >
-                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10">
-                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                </div>
-                <div className="max-w-[88%] flex-1 rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
-                  <AnimatePresence mode="wait">
-                    <motion.span
-                      key={currentReasoningDetail || "default"}
-                      initial={reducedMotion ? false : { opacity: 0, y: 4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
-                      transition={{ duration: reducedMotion ? 0 : 0.15 }}
-                    >
-                      {currentReasoningDetail || "Analyzing intent, retrieval path, and evidence..."}
-                    </motion.span>
-                  </AnimatePresence>
-                </div>
-              </motion.div>
-            )}
+            {messages.map((message) => {
+              if (message.role === "assistant") {
+                const isActiveStreaming = isLoading &&
+                  (message.status === "streaming" || message.status === "loading");
+                return (
+                  <AnswerFrame
+                    key={message.id}
+                    message={message}
+                    streamingContent={isActiveStreaming ? streamingContent : undefined}
+                    currentReasoningDetail={isActiveStreaming ? currentReasoningDetail : undefined}
+                    loadingElapsedMs={isActiveStreaming ? loadingElapsedMs : 0}
+                    onCitationClick={onCitationClick}
+                    activeCitationId={activeCitationId}
+                    onSpeakMessage={onSpeakMessage}
+                    isSpeaking={speakingMessageId === message.id}
+                    voiceEnabled={voiceEnabled}
+                    voiceStatus={voiceStatuses[message.id] || "idle"}
+                  />
+                );
+              }
+              return (
+                <Message
+                  key={message.id}
+                  message={message}
+                />
+              );
+            })}
           </AnimatePresence>
         )}
 
+        <div ref={bottomRef} className="h-1" />
         {messages.length > 0 && (
           <div className="min-h-[40vh]" aria-hidden="true" />
         )}
-        <div ref={bottomRef} className="h-1" />
       </div>
     </ScrollArea>
   );

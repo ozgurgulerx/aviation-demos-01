@@ -400,6 +400,8 @@ class AgenticOrchestrator:
 
     def _infer_intent(self, query: str) -> str:
         q = query.lower()
+        if self._is_short_horizon_departure_risk_query(query):
+            return "PilotBrief.Departure"
         if any(t in q for t in ("policy", "sop", "compliance", "clause", "airworthiness", "directive", "easa", "bulletin", "regulatory")):
             return "Policy.Check"
         if any(t in q for t in ("arrival", "approach", "landing")):
@@ -425,6 +427,21 @@ class AgenticOrchestrator:
         if any(t in q for t in ("delay", "performance")):
             return "Analytics.Compare"
         return "PilotBrief.Departure"
+
+    @staticmethod
+    def _is_short_horizon_departure_risk_query(query: str) -> bool:
+        text = str(query or "")
+        lower = text.lower()
+        has_compare = any(token in lower for token in ("compare", "across", "versus", "vs"))
+        has_departure_risk = ("departure" in lower and "risk" in lower) or ("flight risk" in lower)
+        has_short_horizon = bool(
+            re.search(
+                r"\bnext[-\s]?\d{1,3}\s*(?:[-\s]?minute(?:s)?|[-\s]?min|m)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        return has_compare and has_departure_risk and has_short_horizon
 
     def _enrich_plan_with_heuristics(
         self, plan: AgenticPlan, user_query: str, allowed_tools: List[str],

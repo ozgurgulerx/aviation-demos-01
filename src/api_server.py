@@ -54,14 +54,69 @@ def get_runtime() -> AgentFrameworkRuntime:
         if runtime is None:
             logger.info("Initializing Agent Framework runtime...")
             runtime = AgentFrameworkRuntime()
+            try:
+                capabilities = runtime.retriever.source_capabilities(refresh=True)
+                unavailable = [
+                    c.get("source")
+                    for c in capabilities
+                    if str(c.get("status", "")).lower() == "unavailable"
+                ]
+                degraded = [
+                    c.get("source")
+                    for c in capabilities
+                    if str(c.get("status", "")).lower() == "degraded"
+                ]
+                guardrail_status = (
+                    (runtime.retriever._identity_guardrail_report or {}).get("status", "unknown")
+                )
+                logger.info(
+                    "Runtime source capabilities initialized (guardrail=%s unavailable=%s degraded=%s)",
+                    guardrail_status,
+                    ",".join(str(s) for s in unavailable if s) or "none",
+                    ",".join(str(s) for s in degraded if s) or "none",
+                )
+            except Exception:
+                logger.exception("Failed to initialize source capability snapshot")
             logger.info("Runtime ready (af_enabled=%s)", runtime.af_enabled)
     return runtime
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint."""
-    return jsonify({"status": "ok", "service": "aviation-rag-api"})
+    """Health check endpoint.
+
+    Query parameters:
+        detail=auth — include Fabric token status for both API and TDS scopes.
+    """
+    payload: dict = {"status": "ok", "service": "aviation-rag-api"}
+    detail = request.args.get("detail", "").lower()
+
+    if detail == "auth" and runtime is not None:
+        try:
+            from unified_retriever import _acquire_fabric_token_bundle
+
+            fabric_bundle = _acquire_fabric_token_bundle()
+            tds_bundle = _acquire_fabric_token_bundle(
+                scope="https://database.windows.net/.default",
+            )
+            payload["fabric_auth"] = {
+                "auth_mode": fabric_bundle.get("auth_mode"),
+                "auth_ready": fabric_bundle.get("auth_ready"),
+                "reason": fabric_bundle.get("reason"),
+                "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
+            }
+            payload["fabric_sql_tds_auth"] = {
+                "auth_mode": tds_bundle.get("auth_mode"),
+                "auth_ready": tds_bundle.get("auth_ready"),
+                "reason": tds_bundle.get("reason"),
+                "token_ttl_seconds": tds_bundle.get("token_ttl_seconds"),
+            }
+        except Exception:
+            logger.exception("Failed to gather auth diagnostics")
+            payload["fabric_auth"] = {"error": "diagnostics_unavailable"}
+            payload["fabric_sql_tds_auth"] = {"error": "diagnostics_unavailable"}
+
+    return jsonify(payload)
 
 
 @app.route('/api/chat', methods=['POST'])
