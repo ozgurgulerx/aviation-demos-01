@@ -1063,6 +1063,7 @@ class AviationRagContextProvider:
         return "\n\n".join(all_sections)
 
     def _format_rows(self, rows: List[Dict[str, Any]], source: str, max_rows: int = 8) -> str:
+        _hidden = {"content_vector", "partial_schema", "fallback_sql"}
         lines: List[str] = []
         for idx, row in enumerate(rows[:max_rows], start=1):
             # Build metadata prefix from fusion/evidence annotations.
@@ -1081,10 +1082,10 @@ class AviationRagContextProvider:
                 snippet = str(row.get("content", ""))[:220].replace("\n", " ")
                 lines.append(f"{idx}. {meta_prefix}{title} ({doc_id})\n   {snippet}")
                 continue
-            # Filter out __-prefixed internal keys from compact output.
+            # Filter out __-prefixed internal keys and debug columns from compact output.
             compact = ", ".join(
                 f"{k}={v}" for k, v in list(row.items())[:10]
-                if not str(k).startswith("__")
+                if not str(k).startswith("__") and k not in _hidden
             )
             lines.append(f"{idx}. {meta_prefix}{compact}")
         return "\n".join(lines) if lines else "No rows returned."
