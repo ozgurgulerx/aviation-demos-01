@@ -345,6 +345,48 @@ if bool_true "$CREATE_COSMOS"; then
     echo "[7/11] Created Cosmos container: ${COSMOS_CONTAINER_NAME}"
   fi
 
+  # Ensure public network access is enabled so AKS pods can reach Cosmos DB.
+  # The account uses disableLocalAuth=true (AAD-only), so the AKS kubelet
+  # identity must also have Cosmos RBAC roles assigned (see below).
+  COSMOS_PUBLIC_ACCESS="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query publicNetworkAccess -o tsv)"
+  if [ "$COSMOS_PUBLIC_ACCESS" != "Enabled" ]; then
+    echo "[7/11] Enabling Cosmos DB public network access (was: ${COSMOS_PUBLIC_ACCESS})..."
+    az cosmosdb update -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --public-network-access ENABLED -o none
+  fi
+
+  # Whitelist AKS outbound IP in Cosmos DB firewall (idempotent).
+  AKS_OUTBOUND_IP_IDS="$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query 'networkProfile.loadBalancerProfile.effectiveOutboundIPs[].id' -o tsv 2>/dev/null || true)"
+  if [ -n "$AKS_OUTBOUND_IP_IDS" ]; then
+    AKS_OUTBOUND_IP=""
+    for ip_id in $AKS_OUTBOUND_IP_IDS; do
+      AKS_OUTBOUND_IP="$(az network public-ip show --ids "$ip_id" --query ipAddress -o tsv 2>/dev/null || true)"
+      [ -n "$AKS_OUTBOUND_IP" ] && break
+    done
+    if [ -n "$AKS_OUTBOUND_IP" ]; then
+      EXISTING_IPS="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query 'ipRules[].ipAddressOrRange' -o tsv 2>/dev/null || true)"
+      if ! echo "$EXISTING_IPS" | grep -qF "$AKS_OUTBOUND_IP"; then
+        echo "[7/11] Adding AKS outbound IP ${AKS_OUTBOUND_IP} to Cosmos DB firewall..."
+        az cosmosdb update -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" \
+          --ip-range-filter "${AKS_OUTBOUND_IP},0.0.0.0" -o none
+      fi
+    fi
+  fi
+
+  # Grant AKS kubelet identity Cosmos DB RBAC (Data Contributor) so
+  # DefaultAzureCredential works from pods (idempotent — errors on duplicate are suppressed).
+  AKS_KUBELET_OBJECT_ID="$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query identityProfile.kubeletidentity.objectId -o tsv 2>/dev/null || true)"
+  COSMOS_ACCOUNT_ID="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query id -o tsv)"
+  if [ -n "$AKS_KUBELET_OBJECT_ID" ] && [ -n "$COSMOS_ACCOUNT_ID" ]; then
+    az cosmosdb sql role assignment create \
+      --account-name "$COSMOS_ACCOUNT_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --principal-id "$AKS_KUBELET_OBJECT_ID" \
+      --role-definition-id "00000000-0000-0000-0000-000000000002" \
+      --scope "$COSMOS_ACCOUNT_ID" \
+      -o none 2>/dev/null || true
+    echo "[7/11] Cosmos DB RBAC: AKS kubelet identity has Data Contributor role"
+  fi
+
   COSMOS_PRIMARY_KEY="$(az cosmosdb keys list -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query primaryMasterKey -o tsv)"
   COSMOS_ENDPOINT="$(az cosmosdb show -g "$RESOURCE_GROUP" -n "$COSMOS_ACCOUNT_NAME" --query documentEndpoint -o tsv)"
   export AZURE_COSMOS_ENDPOINT="$COSMOS_ENDPOINT"

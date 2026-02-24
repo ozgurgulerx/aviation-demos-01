@@ -196,7 +196,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` — PostgreSQL connection
 - `PII_ENDPOINT` / `PII_CONTAINER_ENDPOINT` — PII service URL
 - `AZURE_COSMOS_ENDPOINT` — Cosmos DB for NoSQL endpoint (NOTAM storage)
-- `AZURE_COSMOS_KEY` — Cosmos DB primary key
+- `AZURE_COSMOS_KEY` — Cosmos DB primary key (unused: account has `disableLocalAuth=true`, auth is AAD-only via AKS kubelet identity)
 - `AZURE_COSMOS_DATABASE` — Cosmos DB database name (default: `aviationrag`)
 - `AZURE_COSMOS_CONTAINER` — Cosmos DB container name (default: `notams`)
 
@@ -219,3 +219,4 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - **Forget CSP `connect-src`** in `next.config.mjs` when changing backend domain
 - **Assume startup is free** — cold runtime initialization can be slow; keep first SSE byte fast
 - **Use `AZURE_OPENAI_API_KEY` in production** — prefer `DefaultAzureCredential` (managed identity)
+- **Disable `publicNetworkAccess` on Cosmos DB** — AKS pods connect via public IP (`135.116.249.200`); disabling it silently breaks NOSQL (NOTAM) queries with no clear error (pods fall back to Fabric REST which also fails). The `provision-azure.sh` script enforces this, but manual Azure Portal changes can override it.
