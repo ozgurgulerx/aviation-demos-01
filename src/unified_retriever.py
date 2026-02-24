@@ -67,6 +67,7 @@ FABRIC_KUSTO_CLUSTER_URL = os.getenv("FABRIC_KUSTO_CLUSTER_URL", "").strip()
 FABRIC_KQL_DATABASE = os.getenv("FABRIC_KQL_DATABASE", "").strip()
 FABRIC_GRAPH_DATABASE = os.getenv("FABRIC_GRAPH_DATABASE", "").strip()
 FABRIC_SQL_DATABASE = os.getenv("FABRIC_SQL_DATABASE", "").strip()
+FABRIC_MANAGED_IDENTITY_CLIENT_ID = os.getenv("FABRIC_MANAGED_IDENTITY_CLIENT_ID", "").strip()
 
 GUARDRAIL_ACCOUNT_UPN = "admin@MngEnvMCAP705508.onmicrosoft.com"
 GUARDRAIL_TENANT_ID = "52095a81-130f-4b06-83f1-9859b2c73de6"
@@ -148,7 +149,12 @@ _FABRIC_SQL_AUTH_HINT = (
 
 
 def _get_fabric_dac():
-    """Thread-safe lazy singleton for DefaultAzureCredential.
+    """Thread-safe lazy singleton for Azure credential.
+
+    When ``FABRIC_MANAGED_IDENTITY_CLIENT_ID`` is set, pins to
+    ``ManagedIdentityCredential(client_id=...)`` instead of cycling through
+    the full ``DefaultAzureCredential`` chain.  This eliminates
+    non-deterministic credential resolution on AKS.
 
     Uses a sentinel so that a failed init (``None``) is cached and the lock
     is never re-acquired after the first attempt.
@@ -160,11 +166,19 @@ def _get_fabric_dac():
         if _fabric_dac is not _FABRIC_DAC_UNSET:
             return _fabric_dac
         try:
-            from azure.identity import DefaultAzureCredential
-            _fabric_dac = DefaultAzureCredential()
-            logger.info("DefaultAzureCredential instance created (singleton)")
+            if FABRIC_MANAGED_IDENTITY_CLIENT_ID:
+                from azure.identity import ManagedIdentityCredential
+                _fabric_dac = ManagedIdentityCredential(client_id=FABRIC_MANAGED_IDENTITY_CLIENT_ID)
+                logger.info(
+                    "ManagedIdentityCredential(client_id=%s...) created (singleton)",
+                    FABRIC_MANAGED_IDENTITY_CLIENT_ID[:8],
+                )
+            else:
+                from azure.identity import DefaultAzureCredential
+                _fabric_dac = DefaultAzureCredential()
+                logger.info("DefaultAzureCredential instance created (singleton)")
         except Exception as exc:
-            logger.info("DefaultAzureCredential import/init failed: %s", exc)
+            logger.info("Fabric credential import/init failed: %s", exc)
             _fabric_dac = None
     return _fabric_dac
 
@@ -961,10 +975,13 @@ class UnifiedRetriever:
             detail = str(response.get("detail") or "")[:500]
             enriched = f"{error_code}:{detail}" if detail else error_code
 
-            # On 401/403: invalidate cached token, re-acquire, and retry once.
+            # On 401/403: invalidate cached token, back off, re-acquire, and retry once.
             if error_code in ("http_401", "http_403"):
+                backoff = _env_float("FABRIC_AUTH_RETRY_BACKOFF_SECONDS", 1.5, minimum=0.0)
                 logger.warning("KQL %s — invalidating token cache and retrying (scope=%s)", error_code, kusto_scope)
                 _invalidate_fabric_token_cache(kusto_scope)
+                logger.debug("KQL %s — waiting %.1fs before retry", error_code, backoff)
+                time.sleep(backoff)
                 retry_response = self._post_json(
                     kql_endpoint,
                     {"db": db_name, "csl": csl},
@@ -974,7 +991,9 @@ class UnifiedRetriever:
                 if isinstance(retry_response, dict) and retry_response.get("error"):
                     retry_detail = str(retry_response.get("detail") or "")[:500]
                     retry_enriched = f"{retry_response['error']}:{retry_detail}" if retry_detail else str(retry_response["error"])
+                    logger.error("KQL %s retry FAILED (persistent) scope=%s error=%s", error_code, kusto_scope, retry_enriched)
                     return [], f"{retry_enriched} (retry_after_{error_code})"
+                logger.info("KQL %s retry SUCCEEDED (self-healed) scope=%s", error_code, kusto_scope)
                 response = retry_response
             else:
                 return [], enriched
@@ -1956,6 +1975,7 @@ class UnifiedRetriever:
         auth_mode_effective = str(fabric_bundle.get("auth_mode") or "none")
         auth_ready = bool(fabric_bundle.get("auth_ready") and fabric_token)
         auth_mode_pass = auth_mode_effective in {"sp_client_credentials", "default_azure_credential"} and auth_ready
+        credential_type = "managed_identity_pinned" if FABRIC_MANAGED_IDENTITY_CLIENT_ID else "default_azure_credential"
         checks.append(
             {
                 "name": "fabric_auth_mode",
@@ -1967,6 +1987,8 @@ class UnifiedRetriever:
                 "allow_static_bearer": _allow_static_fabric_bearer(),
                 "token_ttl_seconds": fabric_bundle.get("token_ttl_seconds"),
                 "dac_status": dac_status_val,
+                "credential_type": credential_type,
+                **({"managed_identity_client_id": FABRIC_MANAGED_IDENTITY_CLIENT_ID[:8] + "..."} if FABRIC_MANAGED_IDENTITY_CLIENT_ID else {}),
                 **({"dac_error": dac_error_val} if dac_error_val else {}),
             }
         )
@@ -3785,19 +3807,25 @@ Notes:
         except Exception as exc:
             detail = str(exc)
             if "18456" in detail:
-                # Stale token — invalidate cache, re-acquire, retry once (mirrors KQL 401 pattern)
+                # Stale token — invalidate cache, back off, re-acquire, retry once (mirrors KQL 401 pattern)
+                backoff = _env_float("FABRIC_AUTH_RETRY_BACKOFF_SECONDS", 1.5, minimum=0.0)
                 logger.warning("FABRIC_SQL 18456 — invalidating token cache and retrying (scope=%s)", sql_token_scope)
                 _invalidate_fabric_token_cache(sql_token_scope)
+                logger.debug("FABRIC_SQL 18456 — waiting %.1fs before retry", backoff)
+                time.sleep(backoff)
                 retry_bundle = _acquire_fabric_token_bundle(scope=sql_token_scope)
                 retry_token = str(retry_bundle.get("token") or "")
                 if not retry_token or not bool(retry_bundle.get("auth_ready")):
+                    logger.error("FABRIC_SQL 18456 retry FAILED (persistent) scope=%s error=no_token_after_reacquire", sql_token_scope)
                     return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", detail, {
                         "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
                     })], []
                 try:
                     rows = _tds_connect_and_query(retry_token)
+                    logger.info("FABRIC_SQL 18456 retry SUCCEEDED (self-healed) scope=%s", sql_token_scope)
                 except Exception as retry_exc:
                     retry_detail = str(retry_exc)
+                    logger.error("FABRIC_SQL 18456 retry FAILED (persistent) scope=%s error=%s", sql_token_scope, retry_detail[:200])
                     return [self._source_error_row("FABRIC_SQL", "fabric_sql_auth_unavailable", f"{retry_detail} (retry_after_18456)", {
                         "sql": sql, "auth_hint": _FABRIC_SQL_AUTH_HINT,
                     })], []

@@ -130,9 +130,7 @@ export function AnswerFrame({
                   exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
                   transition={{ duration: reducedMotion ? 0 : 0.15 }}
                 >
-                  {loadingElapsedMs >= 15000
-                    ? "Retrieval is taking longer than usual. Generating a provisional brief from available evidence..."
-                    : (currentReasoningDetail || "Analyzing intent, retrieval path, and evidence...")}
+                  {currentReasoningDetail || "Analyzing intent, retrieval path, and evidence..."}
                 </motion.span>
               </AnimatePresence>
             </div>
