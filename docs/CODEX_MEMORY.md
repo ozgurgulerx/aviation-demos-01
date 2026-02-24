@@ -151,6 +151,11 @@ Current tracked status:
 
 ## Decision log (non-secret)
 
+- 2026-02-24: Deployed backend commit `f130301` to AKS with amd64 image lock verification.
+  - Decision: Built/pushed backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-f130301-manual-20260224190036` from `HEAD` using `docker buildx --platform linux/amd64`, verified ACR manifest metadata (`os=linux`, `architecture=amd64`), rolled `aviation-rag-backend` deployment, and validated `/health`, `/api/fabric/preflight`, and predictive endpoint behavior (`status=disabled` while dark-launch flag remains off).
+  - Why: Apply post-review retrieval/predictive stability fixes without changing dark-launch runtime policy.
+  - Sources: `./scripts/aks/use-deploy-target-context.sh`, `./scripts/validate-tenant-lock.sh`, `git archive --format=tar HEAD | docker buildx build --platform linux/amd64 ... --push -`, `az acr repository show-manifests --name avrag705508acr --repository aviation-rag-backend --detail --orderby time_desc -o json`, `kubectl -n aviation-rag set image deployment/aviation-rag-backend ...`, `kubectl -n aviation-rag rollout status deployment/aviation-rag-backend --timeout=900s`, `curl http://127.0.0.1:18081/health`, `curl http://127.0.0.1:18081/api/fabric/preflight`, `curl http://127.0.0.1:18081/api/predictive/delays?...`.
+  - Changed-from: Backend image `avrag705508acr.azurecr.io/aviation-rag-backend:backend-498c8bf-manual-20260224164020`.
 - 2026-02-24: Patched predictive API stability gaps and Fabric MI env compatibility.
   - Decision: Fixed predictive delays to use a forward-looking window (`NOW()` to `NOW()+window`), preserved explicit `0.0` KPI deltas in predictive metrics, made predictive Postgres SSL/GSS behavior environment-driven (`PGSSLMODE`/`PGGSSENCMODE`), and added compatibility bridging so backend runtime can resolve MI client ID from either `FABRIC_MANAGED_IDENTITY_CLIENT_ID` or legacy `FABRIC_WORKLOAD_IDENTITY_CLIENT_ID`; aligned deploy workflow/configmap/render exports to pass both paths.
   - Why: Prevent incorrect predictive panel data selection, avoid KPI misreporting, reduce local mirror false degradation, and keep managed-identity pinning deterministic after rollout.
