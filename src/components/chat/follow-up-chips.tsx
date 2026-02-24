@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import {
   Radar,
@@ -81,6 +82,9 @@ function inferQueryType(text: string): QueryType {
 }
 
 export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChipsProps) {
+  const [isHydrated, setIsHydrated] = useState(false);
+  useEffect(() => setIsHydrated(true), []);
+
   if (!isVisible || suggestions.length === 0) return null;
 
   const normalizedSuggestions: FollowUpSuggestion[] = suggestions.map((suggestion) => {
@@ -94,23 +98,25 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
     return suggestion;
   });
 
+  const Container = isHydrated ? motion.div : "div";
+  const containerProps = isHydrated
+    ? { initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 }, exit: { opacity: 0, y: 10 } }
+    : {};
+
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 10 }}
-      className="px-4 pb-3"
-    >
+    <Container {...containerProps} className="px-4 pb-3">
       <div className="mx-auto max-w-5xl flex flex-wrap gap-2">
         {normalizedSuggestions.map((suggestion, index) => {
           const Icon = iconMap[suggestion.type];
           const palette = colorMap[suggestion.type];
+          const Chip = isHydrated ? motion.div : "div";
+          const chipProps = isHydrated
+            ? { initial: { opacity: 0, scale: 0.94 }, animate: { opacity: 1, scale: 1 }, transition: { delay: index * 0.04 } }
+            : {};
           return (
-            <motion.div
+            <Chip
               key={suggestion.text}
-              initial={{ opacity: 0, scale: 0.94 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: index * 0.04 }}
+              {...chipProps}
             >
               <Button
                 variant="outline"
@@ -121,10 +127,10 @@ export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChip
                 <Icon className={`h-3.5 w-3.5 ${palette.text}`} />
                 <span className="text-left">{suggestion.text}</span>
               </Button>
-            </motion.div>
+            </Chip>
           );
         })}
       </div>
-    </motion.div>
+    </Container>
   );
 }

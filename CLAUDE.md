@@ -159,7 +159,7 @@ User -> MessageComposer (PII pre-check) -> POST /api/pii -> Azure PII Container
 - Next.js 15 App Router with `output: "standalone"` for container deployment
 - shadcn/ui (new-york style) + Tailwind + Framer Motion for animations
 - Dark theme default ("Obsidian Ledger"), gold accent color
-- `isHydrated` pattern in Message component for Framer Motion SSR safety
+- `isHydrated` pattern **required** in every component that uses Framer Motion `motion.*` elements — render as plain `div`/`span` before hydration, swap to `motion.div` after. Without this, `initial={{ opacity: 0 }}` sticks permanently on page-load mount. Applied in: Message, AnswerFrame, MessageComposer, FollowUpChips.
 - Citation chips `[N]` parsed from markdown with regex, rendered as clickable buttons
 - PII scan UI: idle -> checking (amber) -> passed (emerald) -> blocked (red + shake)
 
