@@ -2447,6 +2447,10 @@ class UnifiedRetriever:
             column_norm = column.lower().strip()
             table_ref = alias_map.get(alias_norm)
             if not table_ref:
+                # Allow known schema/catalog prefixes — flag anything else as unknown alias
+                if alias_norm in {"demo", "public", "information_schema", "pg_catalog", "dbo"}:
+                    continue
+                missing.add(f"{alias_norm}.{column_norm} (unknown table/alias '{alias_norm}')")
                 continue
             valid_cols = _columns_for_table(table_ref)
             if valid_cols and column_norm not in valid_cols:
@@ -2705,6 +2709,7 @@ class UnifiedRetriever:
         flight_leg_cols = tables.get("ops_flight_legs", set()) | tables.get("demo.ops_flight_legs", set())
         milestone_cols = tables.get("ops_turnaround_milestones", set()) | tables.get("demo.ops_turnaround_milestones", set())
         crew_cols = tables.get("ops_crew_rosters", set()) | tables.get("demo.ops_crew_rosters", set())
+        mel_cols = tables.get("ops_mel_techlog_events", set()) | tables.get("demo.ops_mel_techlog_events", set())
         bag_cols = tables.get("ops_baggage_events", set()) | tables.get("demo.ops_baggage_events", set())
 
         def _qual(table_base: str) -> str:
@@ -2804,6 +2809,38 @@ class UnifiedRetriever:
                     f"GROUP BY event_type "
                     f"ORDER BY events DESC"
                 )
+
+        # --- Dependency chain / trace / multi-table queries ---
+        chain_terms = {"dependency", "chain", "trace", "depend", "linked", "connection", "multi-table", "cross-table"}
+        if any(term in q for term in chain_terms) and flight_leg_cols:
+            legs_tbl = _qual("ops_flight_legs")
+            select_parts = ["l.leg_id", "l.carrier_code", "l.flight_no", "l.tailnum",
+                            "l.origin_iata", "l.dest_iata"]
+            join_parts: list[str] = []
+            if crew_cols:
+                crew_tbl = _qual("ops_crew_rosters")
+                join_parts.append(f"LEFT JOIN {crew_tbl} c ON c.leg_id = l.leg_id")
+                select_parts.extend(["c.crew_id", "c.role"])
+            if milestone_cols:
+                mile_tbl = _qual("ops_turnaround_milestones")
+                join_parts.append(f"LEFT JOIN {mile_tbl} m ON m.leg_id = l.leg_id")
+                select_parts.extend(["m.milestone", "m.delay_cause_code"])
+            if mel_cols:
+                mel_tbl = _qual("ops_mel_techlog_events")
+                join_parts.append(f"LEFT JOIN {mel_tbl} t ON t.leg_id = l.leg_id")
+                select_parts.extend(["t.jasc_code", "t.mel_category", "t.severity"])
+            # Extract possible tailnum filter from query (e.g., "N12345")
+            tail_match = re.search(r"\b(N\d{3,5}[A-Z]{0,2})\b", query or "", re.IGNORECASE)
+            where_clause = f"WHERE l.tailnum = '{tail_match.group(1).upper()}' " if tail_match else ""
+            joins_str = " ".join(join_parts)
+            return (
+                f"SELECT {', '.join(select_parts)} "
+                f"FROM {legs_tbl} l "
+                f"{joins_str} "
+                f"{where_clause}"
+                f"ORDER BY l.scheduled_dep_utc DESC NULLS LAST "
+                f"LIMIT 50"
+            )
 
         if not asrs_cols:
             return None
@@ -3843,6 +3880,155 @@ Notes:
 - Use TOP N instead of LIMIT N (T-SQL dialect)
 """
 
+    # -- Fabric SQL heuristic fallback (BTS tables, T-SQL dialect) -----------
+
+    _FABRIC_SQL_AIRPORT_BLOCKLIST = frozenset({
+        "THE", "AND", "FOR", "WITH", "FROM", "NEXT", "MIN", "MAX", "AVG",
+        "RISK", "ACROSS", "FLIGHT", "COMPARE", "OVER", "UNDER", "ALL",
+        "TOP", "HOW", "WHAT", "WHY", "ARE", "NOT", "BUT", "HAS", "CAN",
+        "GET", "SET", "PER", "VIA", "PRE", "POST", "ANY", "LOW", "MID",
+        "HIGH", "RAW", "SQL", "BTS", "FAA", "USA", "NAS",
+    })
+
+    def _heuristic_fabric_sql_fallback(self, query: str, need_schema_detail: str) -> Optional[str]:
+        """Best-effort T-SQL fallback when Fabric SQL writer returns NEED_SCHEMA.
+
+        Targets the two BTS tables available in the Fabric SQL warehouse:
+        - airline_delay_causes (airport-level monthly delay aggregates)
+        - bts_ontime_reporting (flight-level on-time data)
+
+        Returns a T-SQL query string or None if no heuristic matches.
+        """
+        q = (query or "").lower()
+
+        # Extract IATA airport codes from the query
+        iata_tokens = sorted({
+            token
+            for token in re.findall(r"\b[A-Z]{3}\b", (query or "").upper())
+            if token not in self._FABRIC_SQL_AIRPORT_BLOCKLIST
+        })
+
+        def _airport_in_clause(col: str, tokens: List[str]) -> str:
+            if not tokens:
+                return ""
+            return f"{col} IN (" + ", ".join(f"'{t}'" for t in tokens) + ")"
+
+        delay_terms = {"delay", "late", "on-time", "on time", "punctuality", "otp",
+                       "risk", "departure risk", "arrival risk"}
+        cause_terms = {"cause", "reason", "breakdown", "weather", "carrier delay",
+                       "nas delay", "security delay", "late aircraft"}
+        cancel_terms = {"cancel", "cancelled", "canceled", "divert", "diverted", "diversion"}
+        compare_terms = {"compare", "comparison", "across", "vs", "versus", "between"}
+
+        has_delay = any(term in q for term in delay_terms)
+        has_cause = any(term in q for term in cause_terms)
+        has_cancel = any(term in q for term in cancel_terms)
+        has_compare = any(term in q for term in compare_terms)
+
+        # -----------------------------------------------------------------
+        # Branch 1: Delay comparison across airports
+        # -----------------------------------------------------------------
+        if has_delay and iata_tokens and (has_compare or len(iata_tokens) >= 2):
+            where = "WHERE " + _airport_in_clause("airport", iata_tokens) + " " if iata_tokens else ""
+            return (
+                "SELECT TOP 50 "
+                "airport, airport_name, "
+                "SUM(arr_flights) AS total_flights, "
+                "SUM(arr_del15) AS delayed_flights, "
+                "ROUND(CASE WHEN SUM(arr_flights) > 0 "
+                "THEN 100.0 * SUM(arr_del15) / SUM(arr_flights) ELSE 0 END, 1) AS delay_pct, "
+                "ROUND(SUM(arr_delay) / NULLIF(SUM(arr_flights), 0), 1) AS avg_delay_min "
+                "FROM airline_delay_causes "
+                f"{where}"
+                "GROUP BY airport, airport_name "
+                "ORDER BY delay_pct DESC"
+            )
+
+        # -----------------------------------------------------------------
+        # Branch 2: Delay cause breakdown
+        # -----------------------------------------------------------------
+        if has_delay and has_cause:
+            where = "WHERE " + _airport_in_clause("airport", iata_tokens) + " " if iata_tokens else ""
+            return (
+                "SELECT TOP 20 "
+                "airport, airport_name, "
+                "SUM(carrier_ct) AS carrier_delays, "
+                "SUM(weather_ct) AS weather_delays, "
+                "SUM(nas_ct) AS nas_delays, "
+                "SUM(security_ct) AS security_delays, "
+                "SUM(late_aircraft_ct) AS late_aircraft_delays, "
+                "SUM(arr_del15) AS total_delayed "
+                "FROM airline_delay_causes "
+                f"{where}"
+                "GROUP BY airport, airport_name "
+                "ORDER BY total_delayed DESC"
+            )
+
+        # -----------------------------------------------------------------
+        # Branch 3: General delay stats (no specific airports)
+        # -----------------------------------------------------------------
+        if has_delay and not iata_tokens:
+            return (
+                "SELECT TOP 20 "
+                "airport, airport_name, "
+                "SUM(arr_flights) AS total_flights, "
+                "SUM(arr_del15) AS delayed_flights, "
+                "ROUND(CASE WHEN SUM(arr_flights) > 0 "
+                "THEN 100.0 * SUM(arr_del15) / SUM(arr_flights) ELSE 0 END, 1) AS delay_pct, "
+                "ROUND(SUM(arr_delay) / NULLIF(SUM(arr_flights), 0), 1) AS avg_delay_min "
+                "FROM airline_delay_causes "
+                "GROUP BY airport, airport_name "
+                "HAVING SUM(arr_flights) > 100 "
+                "ORDER BY delay_pct DESC"
+            )
+
+        # -----------------------------------------------------------------
+        # Branch 4: Cancellation / diversion queries (flight-level)
+        # -----------------------------------------------------------------
+        if has_cancel:
+            where_parts: List[str] = []
+            if iata_tokens:
+                origin_clause = _airport_in_clause("Origin", iata_tokens)
+                dest_clause = _airport_in_clause("Dest", iata_tokens)
+                where_parts.append(f"({origin_clause} OR {dest_clause})")
+            if "cancel" in q:
+                where_parts.append("Cancelled = 1.0")
+            elif "divert" in q:
+                where_parts.append("Diverted = 1.0")
+            where = "WHERE " + " AND ".join(where_parts) + " " if where_parts else ""
+            return (
+                "SELECT TOP 50 "
+                "Origin, Dest, "
+                "IATA_Code_Marketing_Airline AS carrier, "
+                "FlightDate, "
+                "Cancelled, CancellationCode, Diverted, "
+                "DepDelay, ArrDelay "
+                "FROM bts_ontime_reporting "
+                f"{where}"
+                "ORDER BY FlightDate DESC"
+            )
+
+        # -----------------------------------------------------------------
+        # Branch 5: Delay queries with specific airports but no compare keyword
+        # -----------------------------------------------------------------
+        if iata_tokens and not has_cancel:
+            where = "WHERE " + _airport_in_clause("airport", iata_tokens) + " "
+            return (
+                "SELECT TOP 50 "
+                "airport, airport_name, "
+                "SUM(arr_flights) AS total_flights, "
+                "SUM(arr_del15) AS delayed_flights, "
+                "ROUND(CASE WHEN SUM(arr_flights) > 0 "
+                "THEN 100.0 * SUM(arr_del15) / SUM(arr_flights) ELSE 0 END, 1) AS delay_pct, "
+                "ROUND(SUM(arr_delay) / NULLIF(SUM(arr_flights), 0), 1) AS avg_delay_min "
+                "FROM airline_delay_causes "
+                f"{where}"
+                "GROUP BY airport, airport_name "
+                "ORDER BY delay_pct DESC"
+            )
+
+        return None
+
     def _query_fabric_sql_tds(self, query: str, server: str, database: str) -> Tuple[List[Dict], List[Citation]]:
         """Query Fabric SQL Warehouse via TDS (pyodbc) with AAD token auth."""
         # Generate SQL using warehouse-specific schema.
@@ -3860,7 +4046,16 @@ Notes:
             return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
-            return [self._source_error_row("FABRIC_SQL", "sql_schema_missing", sql, {"sql": sql})], []
+            fallback_sql = self._heuristic_fabric_sql_fallback(query, sql)
+            if fallback_sql:
+                logger.info("FABRIC_SQL TDS: heuristic fallback triggered for NEED_SCHEMA")
+                sql = fallback_sql
+            else:
+                return [self._source_error_row(
+                    "FABRIC_SQL", "fabric_sql_no_matching_data",
+                    "Fabric SQL warehouse tables (US domestic BTS data) do not contain data matching this query",
+                    {"sql": sql},
+                )], []
 
         logger.info("FABRIC_SQL TDS query: %s", sql[:200])
 
@@ -3904,8 +4099,8 @@ Notes:
             )
             conn = pyodbc.connect(conn_str, attrs_before={1256: token_bytes}, timeout=connect_timeout)
             try:
+                conn.timeout = query_timeout  # pyodbc.Connection.timeout (SQL_ATTR_QUERY_TIMEOUT); cursor has no .timeout
                 cur = conn.cursor()
-                cur.timeout = query_timeout
                 cur.execute(sql)
                 cols = [desc[0] for desc in cur.description] if cur.description else []
                 result = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -3980,7 +4175,16 @@ Notes:
             return [self._source_error_row("FABRIC_SQL", "sql_generation_failed", str(exc))], []
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
-            return [self._source_error_row("FABRIC_SQL", "sql_schema_missing", sql, {"sql": sql})], []
+            fallback_sql = self._heuristic_fabric_sql_fallback(query, sql)
+            if fallback_sql:
+                logger.info("FABRIC_SQL REST: heuristic fallback triggered for NEED_SCHEMA")
+                sql = fallback_sql
+            else:
+                return [self._source_error_row(
+                    "FABRIC_SQL", "fabric_sql_no_matching_data",
+                    "Fabric SQL warehouse tables (US domestic BTS data) do not contain data matching this query",
+                    {"sql": sql},
+                )], []
 
         payload: Dict[str, Any] = {"query": sql}
         if FABRIC_SQL_DATABASE:
