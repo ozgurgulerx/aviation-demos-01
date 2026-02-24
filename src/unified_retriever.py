@@ -961,9 +961,9 @@ class UnifiedRetriever:
             detail = str(response.get("detail") or "")[:500]
             enriched = f"{error_code}:{detail}" if detail else error_code
 
-            # On 401: invalidate cached token, re-acquire, and retry once.
-            if error_code == "http_401":
-                logger.warning("KQL 401 — invalidating token cache and retrying (scope=%s)", kusto_scope)
+            # On 401/403: invalidate cached token, re-acquire, and retry once.
+            if error_code in ("http_401", "http_403"):
+                logger.warning("KQL %s — invalidating token cache and retrying (scope=%s)", error_code, kusto_scope)
                 _invalidate_fabric_token_cache(kusto_scope)
                 retry_response = self._post_json(
                     kql_endpoint,
@@ -974,7 +974,7 @@ class UnifiedRetriever:
                 if isinstance(retry_response, dict) and retry_response.get("error"):
                     retry_detail = str(retry_response.get("detail") or "")[:500]
                     retry_enriched = f"{retry_response['error']}:{retry_detail}" if retry_detail else str(retry_response["error"])
-                    return [], f"{retry_enriched} (retry_after_401)"
+                    return [], f"{retry_enriched} (retry_after_{error_code})"
                 response = retry_response
             else:
                 return [], enriched
