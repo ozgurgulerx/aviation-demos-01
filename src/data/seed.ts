@@ -271,6 +271,20 @@ export const PIPELINE_CONFIGS: PipelineConfig[] = [
       "Cosmos DB (NOTAMs)",
     ],
     accentColor: "blue",
+    badge: "Default",
+    philosophy:
+      "You control what runs. An LLM router picks the optimal retrieval strategy per query, with full source-level transparency.",
+    bestFor:
+      "Precise SQL queries, KPI audits, cross-source correlation, NOTAM lookups",
+    tradeoff:
+      "Requires pipeline tuning; each data source is independently managed",
+    features: [
+      { label: "Query Routing", value: "Agentic LLM router (SQL / Semantic / Hybrid)", icon: "Route" },
+      { label: "Data Sources", value: "4 independent stores, queried in parallel", icon: "Database" },
+      { label: "Retrieval Style", value: "Deterministic SQL + vector search + KQL", icon: "Layers" },
+      { label: "Transparency", value: "Full tool-call trace with per-source citations", icon: "Eye" },
+    ],
+    sourceCount: 4,
   },
   {
     id: "foundry-iq",
@@ -284,6 +298,20 @@ export const PIPELINE_CONFIGS: PipelineConfig[] = [
       "Fabric Semantic Model",
     ],
     accentColor: "teal",
+    badge: "Preview",
+    philosophy:
+      "The platform decides. Fabric handles grounding, ranking, and retrieval — you ask questions, it finds answers.",
+    bestFor:
+      "Exploratory analysis, semantic search, Lakehouse-native datasets",
+    tradeoff:
+      "Less control over retrieval path; dependent on Fabric Data Agent availability",
+    features: [
+      { label: "Query Routing", value: "Fabric Data Agent (automatic grounding)", icon: "Route" },
+      { label: "Data Sources", value: "3 managed Lakehouse + OneLake assets", icon: "Database" },
+      { label: "Retrieval Style", value: "Semantic ranking with managed retrieval", icon: "Layers" },
+      { label: "Transparency", value: "Platform-level grounding signals", icon: "Eye" },
+    ],
+    sourceCount: 3,
   },
 ];
 

@@ -18,6 +18,12 @@ export interface PiiCheckResult {
 // Pipeline Types
 export type RetrievalMode = "code-rag" | "foundry-iq";
 
+export interface PipelineFeature {
+  label: string;
+  value: string;
+  icon: "Route" | "Database" | "Layers" | "Eye";
+}
+
 export interface PipelineConfig {
   id: RetrievalMode;
   name: string;
@@ -25,6 +31,12 @@ export interface PipelineConfig {
   description: string;
   dataSources: string[];
   accentColor: "blue" | "teal";
+  badge: "Default" | "Preview";
+  philosophy: string;
+  bestFor: string;
+  tradeoff: string;
+  features: PipelineFeature[];
+  sourceCount: number;
 }
 
 // Chat Types
