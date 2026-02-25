@@ -219,6 +219,7 @@ FABRIC_SQL_DELAY_TRIGGERS: frozenset = frozenset({
 # ---------------------------------------------------------------------------
 
 ENGLISH_4LETTER_BLOCKLIST: set[str] = {
+    # Common English words
     "WHAT", "WITH", "FROM", "YOUR", "SHOW", "THIS", "THAT", "WHEN",
     "WILL", "HAVE", "DOES", "BEEN", "WERE", "THEY", "THEM", "THEN",
     "THAN", "EACH", "MADE", "FIND", "HERE", "MANY", "SOME", "LIKE",
@@ -230,6 +231,15 @@ ENGLISH_4LETTER_BLOCKLIST: set[str] = {
     "HIGH", "RISK", "EVER", "NEXT", "TYPE", "LIST", "DATA", "USED",
     "BEST", "DONE", "FULL", "MUST", "KNOW", "TIME", "WENT", "GATE",
     "TAXI", "LAND", "HOLD", "TAKE", "CALL", "NOTE",
+    # Aviation-domain false positives
+    "TAIL", "LEGS", "WING", "CREW", "FUEL", "NOSE", "RAMP", "GEAR",
+    "LOAD", "PLAN", "PART", "LOSS", "MILE", "PATH", "RATE", "BASE",
+    "CODE", "ZONE", "WIND", "LATE", "FLOW", "STOP", "WAIT", "DOWN",
+    "SIZE", "TECH", "BIRD", "DECK", "DROP", "FAIL", "FLAG", "FORM",
+    "LOCK", "LOOP", "PACK", "PORT", "PUSH", "SLOT", "SPAN", "STEP",
+    "TANK", "TEST", "TIRE", "TRIM", "WASH", "DAYS", "FAST", "HALF",
+    "KIND", "LESS", "MORE", "NAME", "ONCE", "PAST", "SAID", "SIDE",
+    "TOLD", "WORD", "ZERO",
 }
 
 CITY_AIRPORT_MAP: Dict[str, List[str]] = {

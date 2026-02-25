@@ -138,6 +138,37 @@ def _contains_tsql_parameter_placeholders(sql: str) -> bool:
     return bool(_TSQL_PARAMETER_PLACEHOLDER_RE.search(str(sql or "")))
 
 
+# Regex to extract string literals from IN (...) clauses in generated SQL.
+_IN_CLAUSE_LITERALS_RE = re.compile(
+    r"\bIN\s*\(\s*("
+    r"(?:'[^']*'(?:\s*,\s*'[^']*')*)"
+    r")\s*\)",
+    re.IGNORECASE,
+)
+_SINGLE_QUOTED_RE = re.compile(r"'([^']*)'")
+
+
+def _contains_hallucinated_airport_codes(sql: str, provided_airports: List[str]) -> bool:
+    """Detect if generated SQL contains airport-like codes not in the provided entities.
+
+    Checks IN (...) clauses for 3-4 letter alphabetic strings that look like
+    airport codes but were not in the caller-provided entities.airports list.
+    Only triggers when entities.airports was empty (i.e. no airports were
+    legitimately extracted from the query).
+    """
+    if provided_airports:
+        return False  # Caller provided airports; trust the LLM's usage of them
+    sql_upper = (sql or "").upper()
+    for in_match in _IN_CLAUSE_LITERALS_RE.finditer(sql_upper):
+        literals_str = in_match.group(1)
+        for lit_match in _SINGLE_QUOTED_RE.finditer(literals_str):
+            literal = lit_match.group(1).strip()
+            if re.fullmatch(r"[A-Z]{3,4}", literal):
+                # Found a 3-4 letter airport-like code with no entities to justify it
+                return True
+    return False
+
+
 _fabric_token_lock = threading.Lock()
 _fabric_token_cache: Dict[str, Dict[str, Any]] = {}  # scope -> {token, expires_at}
 
@@ -839,6 +870,30 @@ class UnifiedRetriever:
             return True, "ready", auth_bundle
         return False, reason, auth_bundle
 
+    # Common English words (3-8 chars) that should never be used as GRAPH BFS seeds.
+    _GRAPH_TOKEN_BLOCKLIST: frozenset = frozenset(_ENGLISH_4LETTER_BLOCKLIST) | frozenset({
+        # 3-letter
+        "THE", "AND", "FOR", "NOT", "ARE", "BUT", "HAS", "CAN", "GET",
+        "SET", "ALL", "HOW", "WHO", "WHY", "ITS", "HAD", "HIS", "HER",
+        "OUR", "OUT", "USE", "DID", "ONE", "TWO", "TEN", "NEW", "OLD",
+        "DAY", "WAY", "RUN", "ADD", "END", "LET", "MAY", "OWN", "SAY",
+        "TRY", "WAS", "YET", "OFF", "TOP", "LEG", "LOG", "AIR", "FLY",
+        "JET", "KEY", "FIT", "FAR", "FEW", "RED", "BIG", "BAD", "DUE",
+        "ODD", "RAW", "WET", "HOT", "LOW", "MID", "ANY", "PER", "VIA",
+        # 5-8 letter
+        "TRACE", "CHAIN", "DELAY", "ABOUT", "AFTER", "BEING", "BELOW",
+        "COULD", "EVERY", "FIRST", "GIVEN", "LARGE", "LATER", "NEVER",
+        "OTHER", "QUITE", "RIGHT", "SHALL", "SINCE", "STILL", "THEIR",
+        "THERE", "THESE", "THOSE", "THREE", "UNDER", "UNTIL", "WHERE",
+        "WHICH", "WHILE", "WHOLE", "WOULD", "ABOVE", "ALONG", "AMONG",
+        "BEGAN", "EARLY", "EXACT", "FOUND", "GREAT", "KNOWN", "LEAST",
+        "MIGHT", "OFTEN", "ORDER", "PLACE", "POINT", "RAISE", "SMALL",
+        "STATE", "TAKEN", "THINK", "USING", "WORLD", "WORSE", "WRITE",
+        "DELAYED", "INBOUND", "FLIGHTS", "COMPARE", "BETWEEN",
+        "SHOWING", "AVERAGE", "BECAUSE", "THROUGH", "WITHOUT",
+        "DEPENDENCY", "DOWNSTREAM",
+    })
+
     def _query_tokens(self, query: str) -> List[str]:
         if isinstance(query, str):
             text = query
@@ -853,6 +908,8 @@ class UnifiedRetriever:
         tokens = [t.upper() for t in re.findall(r"[A-Za-z0-9]{3,8}", text)]
         deduped: List[str] = []
         for token in tokens:
+            if token in self._GRAPH_TOKEN_BLOCKLIST:
+                continue
             if token not in deduped:
                 deduped.append(token)
             if len(deduped) >= 8:
@@ -3994,6 +4051,15 @@ class UnifiedRetriever:
         "TOP", "HOW", "WHAT", "WHY", "ARE", "NOT", "BUT", "HAS", "CAN",
         "GET", "SET", "PER", "VIA", "PRE", "POST", "ANY", "LOW", "MID",
         "HIGH", "RAW", "SQL", "BTS", "FAA", "USA", "NAS",
+        # Common 3-letter English words that survive uppercasing
+        "LEG", "LOG", "RUN", "USE", "ADD", "OLD", "NEW", "DAY", "WAY",
+        "OUR", "TWO", "TEN", "AGE", "AID", "AIM", "AIR", "BAD", "BAG",
+        "BIG", "BIT", "CUT", "DID", "DUE", "END", "FAN", "FAR", "FEW",
+        "FIT", "FLY", "GAP", "GAS", "GOT", "HAD", "HIT", "HOT", "ITS",
+        "JET", "JOB", "KEY", "LET", "LOT", "MAP", "MAY", "MET", "MIX",
+        "NET", "ODD", "OFF", "OIL", "ONE", "OUT", "OWN", "PAY", "PIN",
+        "PUT", "RAN", "RED", "ROW", "SAT", "SAW", "SAY", "SIX", "TIP",
+        "TOO", "TRY", "WAS", "WET", "WHO", "WIN", "WON", "YET",
     })
 
     def _heuristic_fabric_sql_fallback(self, query: str, need_schema_detail: str) -> Optional[str]:
@@ -4162,6 +4228,11 @@ class UnifiedRetriever:
             logger.warning("FABRIC_SQL TDS: generated SQL contains @parameters, falling to heuristic")
             sql = "-- NEED_SCHEMA (parameterized)"
 
+        # Post-generation guard: reject hallucinated airport codes in IN clauses
+        if _contains_hallucinated_airport_codes(sql, airports):
+            logger.warning("FABRIC_SQL TDS: generated SQL contains hallucinated airport codes, falling to heuristic")
+            sql = "-- NEED_SCHEMA (hallucinated_entities)"
+
         if sql.strip().startswith("-- NEED_SCHEMA"):
             fallback_sql = self._heuristic_fabric_sql_fallback(query, sql)
             if fallback_sql:
@@ -4297,6 +4368,11 @@ class UnifiedRetriever:
         if _contains_tsql_parameter_placeholders(sql):
             logger.warning("FABRIC_SQL REST: generated SQL contains @parameters, falling to heuristic")
             sql = "-- NEED_SCHEMA (parameterized)"
+
+        # Post-generation guard: reject hallucinated airport codes in IN clauses
+        if _contains_hallucinated_airport_codes(sql, airports):
+            logger.warning("FABRIC_SQL REST: generated SQL contains hallucinated airport codes, falling to heuristic")
+            sql = "-- NEED_SCHEMA (hallucinated_entities)"
 
         if sql.strip().startswith("-- NEED_SCHEMA"):
             fallback_sql = self._heuristic_fabric_sql_fallback(query, sql)

@@ -53,6 +53,9 @@ Rules:
 - If needed columns are missing, output exactly:
 -- NEED_SCHEMA: <what is missing>
 - Never generate INSERT/UPDATE/DELETE/DDL.
+- IMPORTANT: Airport codes, flight IDs, and other identifiers MUST come ONLY from the entities object provided in the payload. NEVER extract or infer identifiers from the user_query text itself. If a word in the query looks like an airport code but is not listed in entities.airports, do NOT use it.
+- If entities.airports AND entities.flight_ids are both empty, write a general aggregate query (e.g. GROUP BY with ORDER BY and LIMIT) or output exactly:
+-- NEED_SCHEMA: no specific entities provided
 - IMPORTANT: Many tables (especially demo.* and ops_*) store ALL columns as TEXT. When sql_schema shows columns as type "text" that are semantically numeric or timestamps:
   * Cast timestamp columns (ending in _utc) via column::timestamptz before date/time comparisons or NOW().
   * Cast numeric columns (dep_delay_min, arr_delay_min, cumulative_duty_hours, legality_risk_flag, bag_count, distance_nm, passengers, deferred_flag) via column::numeric or column::integer before arithmetic, aggregation (SUM, AVG, MIN, MAX), or comparison.
@@ -121,6 +124,9 @@ Rules:
 - If needed columns are missing, output exactly:
 // NEED_SCHEMA: <what is missing>
 - Never invent table names.
+- IMPORTANT: Airport codes, flight IDs, and other identifiers MUST come ONLY from the entities object provided in the payload. NEVER extract or infer identifiers from the user_query text itself.
+- If entities.airports AND entities.flight_ids are both empty, write a general aggregate query or output exactly:
+// NEED_SCHEMA: no specific entities provided
 """
         payload = {
             "user_query": user_query,
