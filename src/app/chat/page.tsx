@@ -60,7 +60,10 @@ const ENABLE_PREDICTIVE_ACTIONS_TAB =
   String(process.env.NEXT_PUBLIC_ENABLE_PREDICTIVE_ACTIONS_TAB || "false").toLowerCase() ===
   "true";
 
-function createInitialSourceHealth(): SourceHealthStatus[] {
+function createInitialSourceHealth(mode: RetrievalMode = "code-rag"): SourceHealthStatus[] {
+  if (mode === "foundry-iq") {
+    return [{ source: "FOUNDRY_IQ", status: "idle", rowCount: 0, mode: "unknown" }];
+  }
   return DATA_SOURCE_BLUEPRINT.map((source) => ({
     source: source.id,
     status: "idle",
@@ -433,6 +436,8 @@ export default function ChatPage() {
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [voiceStatuses, setVoiceStatuses] = useState<Record<string, VoiceClipStatus>>({});
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const modeChangeCountRef = useRef(0);
   const speechRequestRef = useRef(0);
   const voicePreparationSeqRef = useRef(0);
   const voicePreparationByMessageRef = useRef<Record<string, number>>({});
@@ -443,6 +448,50 @@ export default function ChatPage() {
   });
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+
+  // Abort in-flight request and reset all transient state when retrieval mode changes
+  // Skip the initial mount — only act on actual user-initiated mode switches
+  useEffect(() => {
+    if (modeChangeCountRef.current === 0) {
+      modeChangeCountRef.current = 1;
+      return;
+    }
+
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+
+    setIsLoading(false);
+    setLoadingStartedAtMs(null);
+    setStreamingContent("");
+    setTimelineEvents([]);
+    setReasoningEvents([]);
+    setSourceSnapshots({});
+    setSourceHealth(createInitialSourceHealth(retrievalMode));
+    setRouteLabel("Pending");
+    setConfidenceLabel("Awaiting run");
+    setGroundingInfo(null);
+    setOperationalAlert(null);
+    // Always restore follow-ups after a mode switch — the !isLoading guard
+    // in the visibility condition already hides them during active requests.
+    setShowFollowUps(true);
+    retrievalProgressRef.current = { sources: new Set<string>(), callCount: 0 };
+
+    // Finalize any in-progress assistant message so it doesn't show a stuck spinner
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.role === "assistant" && (m.status === "loading" || m.status === "streaming")
+          ? { ...m, content: m.content || "Request cancelled — pipeline mode changed.", status: "error" as const, errorMessage: "Pipeline mode changed" }
+          : m
+      )
+    );
+  }, [retrievalMode]);
+
+  // Abort in-flight request on unmount to prevent state updates on unmounted component
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (!isLoading) {
@@ -495,6 +544,8 @@ export default function ChatPage() {
   );
 
   const handleNewChat = useCallback(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     setActiveConversationId(null);
     setMessages([]);
     setCitations([]);
@@ -504,7 +555,7 @@ export default function ChatPage() {
     setTimelineEvents([]);
     setReasoningEvents([]);
     setSourceSnapshots({});
-    setSourceHealth(createInitialSourceHealth());
+    setSourceHealth(createInitialSourceHealth(retrievalMode));
     setRouteLabel("Pending");
     setConfidenceLabel("Awaiting run");
     setGroundingInfo(null);
@@ -513,7 +564,7 @@ export default function ChatPage() {
     voiceClipByMessageRef.current = {};
     voicePreparationByMessageRef.current = {};
     retrievalProgressRef.current = { sources: new Set<string>(), callCount: 0 };
-  }, []);
+  }, [retrievalMode]);
 
   const handleSelectConversation = useCallback((id: string) => {
     const conversation = SAMPLE_CONVERSATIONS.find((item) => item.id === id);
@@ -774,6 +825,11 @@ export default function ChatPage() {
 
   const handleSendMessage = useCallback(
     async (content: string) => {
+      // Abort any previous in-flight request
+      abortControllerRef.current?.abort();
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
       const conversationId = activeConversationId ?? generateId();
       if (!activeConversationId) {
         setActiveConversationId(conversationId);
@@ -804,7 +860,7 @@ export default function ChatPage() {
       setReasoningEvents([]);
       setShowFollowUps(false);
       setSourceSnapshots({});
-      setSourceHealth(createInitialSourceHealth());
+      setSourceHealth(createInitialSourceHealth(retrievalMode));
       setRouteLabel("Running");
       setConfidenceLabel("Calculating");
       setGroundingInfo(null);
@@ -837,6 +893,7 @@ export default function ChatPage() {
             failurePolicy: "graceful",
             demoScenario: demoScenario === "none" ? undefined : demoScenario,
           }),
+          signal: controller.signal,
         });
 
         if (!response.ok) {
@@ -1114,6 +1171,11 @@ export default function ChatPage() {
 
         setShowFollowUps(true);
       } catch (error) {
+        // Request was intentionally cancelled (mode switch or new request) — clean exit
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+
         console.error("Chat error:", error);
         emitReasoningEvent("evidence_check_complete", {
           verification: "Partial",
@@ -1148,6 +1210,12 @@ export default function ChatPage() {
           timestamp: new Date().toISOString(),
         });
       } finally {
+        // Only clean up loading state if this request is still the active one.
+        // If the controller was aborted (mode switch or new request took over),
+        // the aborting code already handled the state reset.
+        if (controller.signal.aborted) {
+          return;
+        }
         setIsLoading(false);
         setLoadingStartedAtMs(null);
         setStreamingContent("");
@@ -1229,6 +1297,7 @@ export default function ChatPage() {
         onRunPreset={handleRunPreset}
         showPredictiveOps={ENABLE_PREDICTIVE_PANEL}
         onOpenPredictive={() => setPredictivePanelOpen(true)}
+        retrievalMode={retrievalMode}
       />
 
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
@@ -1327,12 +1396,18 @@ export default function ChatPage() {
                       </DialogTrigger>
                       <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
                         <DialogHeader>
-                          <DialogTitle>Context-to-Evidence Architecture</DialogTitle>
+                          <DialogTitle>
+                            {retrievalMode === "foundry-iq"
+                              ? "Foundry IQ Agent Topology"
+                              : "Context-to-Evidence Architecture"}
+                          </DialogTitle>
                           <DialogDescription>
-                            Live source status and retrieval rationale for each datastore used by the flight brief assistant.
+                            {retrievalMode === "foundry-iq"
+                              ? "The Foundry IQ agent orchestrates retrieval internally across knowledge bases, connected tools, and (future) MCP servers."
+                              : "Live source status and retrieval rationale for each datastore used by the flight brief assistant."}
                           </DialogDescription>
                         </DialogHeader>
-                        <ArchitectureMap sourceHealth={sourceHealth} />
+                        <ArchitectureMap sourceHealth={sourceHealth} retrievalMode={retrievalMode} />
                       </DialogContent>
                     </Dialog>
 
@@ -1413,6 +1488,7 @@ export default function ChatPage() {
             isLoading={isLoading}
             onRetryLast={handleRetryLast}
             docked
+            retrievalMode={retrievalMode}
           />
         )}
       </div>
@@ -1427,6 +1503,7 @@ export default function ChatPage() {
         route={routeLabel}
         confidenceLabel={confidenceLabel}
         groundingInfo={groundingInfo}
+        retrievalMode={retrievalMode}
       />
       {ENABLE_PREDICTIVE_PANEL && (
         <PredictivePanel
