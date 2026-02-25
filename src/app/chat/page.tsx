@@ -9,6 +9,7 @@ import { ChatThread } from "@/components/chat/chat-thread";
 import { TimelinePanel } from "@/components/chat/timeline-panel";
 import { MessageComposer } from "@/components/chat/message-composer";
 import { FollowUpChips } from "@/components/chat/follow-up-chips";
+import { PipelineSelector } from "@/components/chat/pipeline-selector";
 import { PredictivePanel } from "@/components/predictive/predictive-panel";
 import { ToggleGroup } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
@@ -42,6 +43,7 @@ import type {
   ReasoningEventPayload,
   ReasoningSseEvent,
   ReasoningStage,
+  RetrievalMode,
   SourceResultSnapshot,
 } from "@/types";
 import type { StreamEvent } from "@/lib/chat";
@@ -385,6 +387,7 @@ export default function ChatPage() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sourcesPanelCollapsed, setSourcesPanelCollapsed] = useState(false);
 
+  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>("code-rag");
   const [queryProfile, setQueryProfile] = useState<QueryProfile>("pilot-brief");
   const [explainRetrieval, setExplainRetrieval] = useState(true);
   const [freshnessSlaMinutes, setFreshnessSlaMinutes] = useState<number>(60);
@@ -406,6 +409,7 @@ export default function ChatPage() {
   const [activeCitationId, setActiveCitationId] = useState<number | null>(null);
 
   const [isLoading, setIsLoading] = useState(false);
+  const pipelineExpanded = messages.length === 0 && !isLoading;
   const [loadingStartedAtMs, setLoadingStartedAtMs] = useState<number | null>(null);
   const [, setLoadingTick] = useState(0);
   const [streamingContent, setStreamingContent] = useState("");
@@ -780,6 +784,7 @@ export default function ChatPage() {
         role: "user",
         content,
         createdAt: new Date(),
+        pipeline: retrievalMode,
       };
       const assistantMessageId = generateId();
       const placeholderAssistant: Message = {
@@ -788,6 +793,7 @@ export default function ChatPage() {
         content: "",
         createdAt: new Date(),
         status: "loading",
+        pipeline: retrievalMode,
       };
 
       setMessages((previous) => [...previous, userMessage, placeholderAssistant]);
@@ -823,7 +829,7 @@ export default function ChatPage() {
               role: message.role,
               content: message.content,
             })),
-            retrievalMode: "code-rag",
+            retrievalMode,
             conversationId,
             queryProfile,
             freshnessSlaMinutes,
@@ -1159,6 +1165,7 @@ export default function ChatPage() {
     [
       activeConversationId,
       messages,
+      retrievalMode,
       queryProfile,
       freshnessSlaMinutes,
       explainRetrieval,
@@ -1345,6 +1352,12 @@ export default function ChatPage() {
             )}
           </AnimatePresence>
         </div>
+
+        <PipelineSelector
+          value={retrievalMode}
+          onChange={setRetrievalMode}
+          expanded={pipelineExpanded}
+        />
 
         <OperationalAlertBanner
           alert={operationalAlert}

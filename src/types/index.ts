@@ -15,6 +15,18 @@ export interface PiiCheckResult {
   redactedText?: string;
 }
 
+// Pipeline Types
+export type RetrievalMode = "code-rag" | "foundry-iq";
+
+export interface PipelineConfig {
+  id: RetrievalMode;
+  name: string;
+  tagline: string;
+  description: string;
+  dataSources: string[];
+  accentColor: "blue" | "teal";
+}
+
 // Chat Types
 export type MessageStatus = "loading" | "streaming" | "complete" | "error";
 
@@ -28,6 +40,7 @@ export interface Message {
   toolCalls?: ToolCall[];
   status?: MessageStatus;      // undefined = "complete" (backward compat)
   errorMessage?: string;       // populated when status is "error"
+  pipeline?: RetrievalMode;
 }
 
 export interface Citation {

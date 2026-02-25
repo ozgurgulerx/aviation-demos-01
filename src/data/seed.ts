@@ -1,4 +1,4 @@
-import type { Conversation, Message, Citation, WatchlistItem } from "@/types";
+import type { Conversation, Message, Citation, WatchlistItem, PipelineConfig } from "@/types";
 
 export const SAMPLE_CITATIONS: Citation[] = [
   {
@@ -256,6 +256,36 @@ export const ALL_QUERY_EXAMPLES = QUERY_CATEGORIES.flatMap((category) =>
     tone: category.tone,
   }))
 );
+
+export const PIPELINE_CONFIGS: PipelineConfig[] = [
+  {
+    id: "code-rag",
+    name: "Custom Agentic Retrieval",
+    tagline: "Multi-Source Evidence Orchestration",
+    description:
+      "Purpose-built RAG pipeline with deterministic SQL, vector search, and live telemetry — orchestrated by an agentic query router.",
+    dataSources: [
+      "PostgreSQL (SQL)",
+      "AI Search (Vector)",
+      "Eventhouse (KQL)",
+      "Cosmos DB (NOTAMs)",
+    ],
+    accentColor: "blue",
+  },
+  {
+    id: "foundry-iq",
+    name: "Foundry IQ",
+    tagline: "Semantic Intelligence",
+    description:
+      "Microsoft Fabric Data Agent with built-in grounding, semantic ranking, and managed retrieval across Lakehouse and OneLake assets.",
+    dataSources: [
+      "Fabric Data Agent",
+      "OneLake Lakehouse",
+      "Fabric Semantic Model",
+    ],
+    accentColor: "teal",
+  },
+];
 
 export const DATA_PROVIDERS = [
   { name: "Fabric Eventhouse (KQL)", type: "Telemetry" },

@@ -111,6 +111,21 @@ export function AnswerFrame({
 
       {/* Content */}
       <div className="flex-1 space-y-2 max-w-[85%]">
+        {/* Pipeline badge */}
+        {message.pipeline && (
+          <Badge
+            variant="outline"
+            className={cn(
+              "text-[10px] uppercase tracking-[0.08em]",
+              message.pipeline === "code-rag"
+                ? "border-primary/30 text-primary"
+                : "border-teal-500/30 text-teal-400",
+            )}
+          >
+            {message.pipeline === "code-rag" ? "Agentic RAG" : "Foundry IQ"}
+          </Badge>
+        )}
+
         {/* Message bubble */}
         <div
           className={cn(
