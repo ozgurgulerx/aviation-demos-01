@@ -17,7 +17,8 @@ import { Separator } from "@/components/ui/separator";
 import { cn, formatDateTime } from "@/lib/utils";
 import { getDatastoreVisual } from "@/lib/datastore";
 import { motionTokens } from "@/lib/motion";
-import type { Citation, GroundingInfo, SourceHealthStatus } from "@/types";
+import { FoundryIqTopology } from "@/components/architecture/foundry-iq-topology";
+import type { Citation, GroundingInfo, RetrievalMode, SourceHealthStatus } from "@/types";
 
 interface SourcesPanelProps {
   isCollapsed: boolean;
@@ -29,6 +30,7 @@ interface SourcesPanelProps {
   route?: string;
   confidenceLabel: string;
   groundingInfo?: GroundingInfo | null;
+  retrievalMode?: RetrievalMode;
 }
 
 export function SourcesPanel({
@@ -41,8 +43,10 @@ export function SourcesPanel({
   route,
   confidenceLabel,
   groundingInfo,
+  retrievalMode = "code-rag",
 }: SourcesPanelProps) {
   const reducedMotion = useReducedMotion();
+  const isFoundryIq = retrievalMode === "foundry-iq";
 
   return (
     <motion.aside
@@ -72,7 +76,12 @@ export function SourcesPanel({
               transition={{ duration: reducedMotion ? 0 : motionTokens.state }}
             >
               <div className="mb-3 flex items-center justify-between gap-2">
-                <h2 className="font-display text-sm font-semibold">Evidence Ledger</h2>
+                <h2 className={cn(
+                  "font-display text-sm font-semibold",
+                  isFoundryIq && "text-teal-400",
+                )}>
+                  {isFoundryIq ? "Agent Intelligence Ledger" : "Evidence Ledger"}
+                </h2>
                 <Badge variant="gold">{citations.length} refs</Badge>
               </div>
 
@@ -116,7 +125,8 @@ export function SourcesPanel({
         </AnimatePresence>
       </div>
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="relative flex-1">
+        <div className="pointer-events-none absolute inset-0 flight-grid opacity-20" />
         <AnimatePresence>
           {!isCollapsed && (
             <motion.div
@@ -124,136 +134,154 @@ export function SourcesPanel({
               animate={{ opacity: 1 }}
               exit={reducedMotion ? { opacity: 1 } : { opacity: 0 }}
               transition={{ duration: reducedMotion ? 0 : motionTokens.state }}
-              className="space-y-4 p-4"
+              className="relative z-[1] space-y-4 p-4"
             >
-              <section className="space-y-2">
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                  Data Stores Queried
-                </p>
-                {sourceHealth.length === 0 ? (
-                  <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
-                    Source status appears after query execution starts.
-                  </div>
-                ) : (
-                  <AnimatePresence initial={false}>
-                    {sourceHealth.map((source) => {
-                      const visual = getDatastoreVisual(source.source);
-                      const tone = getSourceTone(source.source);
+              {isFoundryIq ? (
+                <section className="space-y-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-teal-400/80">
+                    Agent Topology
+                  </p>
+                  <FoundryIqTopology variant="compact" sourceHealth={sourceHealth} />
+                </section>
+              ) : (
+                <section className="space-y-2">
+                  <p className="text-[0.7rem] font-semibold uppercase tracking-widest text-primary/70">
+                    Data Stores Queried
+                  </p>
+                  {sourceHealth.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
+                      Source status appears after query execution starts.
+                    </div>
+                  ) : (
+                    <AnimatePresence initial={false}>
+                      {sourceHealth.map((source) => {
+                        const visual = getDatastoreVisual(source.source);
+                        const tone = getSourceTone(source.source);
 
-                      return (
-                        <motion.div
-                          key={source.source}
-                          layout
-                          animate={{ opacity: 1, y: 0 }}
-                          initial={
-                            reducedMotion
-                              ? false
-                              : {
-                                  opacity: 0,
-                                  y: 6,
-                                }
-                          }
-                          transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
-                          className={cn(
-                            "relative overflow-hidden rounded-lg border bg-card px-3 py-2 text-xs",
-                            source.status === "querying" && tone.queryCard,
-                            source.status === "ready" && tone.readyCard,
-                            source.status === "error" && "border-destructive/45 bg-destructive/[0.05]"
-                          )}
-                        >
-                          <span
+                        return (
+                          <motion.div
+                            key={source.source}
+                            layout
+                            animate={{ opacity: 1, y: 0 }}
+                            initial={
+                              reducedMotion
+                                ? false
+                                : {
+                                    opacity: 0,
+                                    y: 6,
+                                  }
+                            }
+                            transition={{ duration: reducedMotion ? 0 : motionTokens.state, ease: motionTokens.easeOut }}
                             className={cn(
-                              "pointer-events-none absolute inset-y-0 left-0 w-1 rounded-l-lg opacity-0 transition-opacity duration-300",
-                              tone.accentBar,
-                              source.status !== "idle" && "opacity-100"
+                              "relative overflow-hidden rounded-lg border bg-card px-3 py-2 text-xs",
+                              source.status === "querying" && tone.queryCard,
+                              source.status === "ready" && tone.readyCard,
+                              source.status === "error" && "border-destructive/45 bg-destructive/[0.05]"
                             )}
-                          />
-                          {source.status === "querying" && !reducedMotion && (
-                            <motion.span
-                              className={cn("pointer-events-none absolute inset-0 rounded-lg border", tone.queryBorder)}
-                              animate={{ opacity: [0.65, 0.25, 0.65] }}
-                              transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
+                          >
+                            <span
+                              className={cn(
+                                "pointer-events-none absolute inset-y-0 left-0 w-1 rounded-l-lg opacity-0 transition-opacity duration-300",
+                                tone.accentBar,
+                                source.status !== "idle" && "opacity-100"
+                              )}
                             />
-                          )}
-                          <div className="relative z-[1] mb-1 flex items-center justify-between gap-2">
-                            <div className="flex min-w-0 items-center gap-2">
-                              <motion.div
-                                animate={
-                                  source.status === "querying" && !reducedMotion
-                                    ? { scale: [1, 1.04, 1] }
-                                    : { scale: 1 }
-                                }
-                                transition={{ duration: 1.2, repeat: source.status === "querying" ? Infinity : 0 }}
-                                className="h-7 w-7 shrink-0 overflow-hidden rounded-md border border-border bg-white/80 p-0.5"
-                              >
-                                <Image
-                                  src={visual.iconSrc}
-                                  alt={visual.shortLabel}
-                                  width={28}
-                                  height={28}
-                                  className="h-full w-full object-contain"
-                                />
-                              </motion.div>
-                              <div className="min-w-0">
-                                <span className="block truncate font-medium text-foreground">{visual.longLabel}</span>
-                                {visual.description && (
-                                  <span className="block truncate text-[10px] text-muted-foreground">
-                                    {visual.description}
-                                  </span>
-                                )}
-                                {visual.isFabric && (
-                                  <span className="text-[10px] font-semibold uppercase tracking-[0.09em] text-primary">
-                                    Fabric datastore
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                            <Badge
-                              variant={
-                                source.status === "ready"
-                                  ? "success"
-                                  : source.status === "querying"
-                                    ? "warning"
-                                    : source.status === "error"
-                                      ? "destructive"
-                                      : "outline"
-                              }
-                            >
-                              {source.status}
-                            </Badge>
-                          </div>
-                          <div className="relative z-[1] flex items-center justify-between text-muted-foreground">
-                            <AnimatePresence mode="popLayout" initial={false}>
+                            {source.status === "querying" && !reducedMotion && (
                               <motion.span
-                                key={`${source.source}-${source.rowCount}`}
-                                initial={reducedMotion ? false : { opacity: 0, y: 6 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
-                                transition={{ duration: reducedMotion ? 0 : motionTokens.micro }}
+                                className={cn("pointer-events-none absolute inset-0 rounded-lg border", tone.queryBorder)}
+                                animate={{ opacity: [0.65, 0.25, 0.65] }}
+                                transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
+                              />
+                            )}
+                            <div className="relative z-[1] mb-1 flex items-center justify-between gap-2">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <motion.div
+                                  animate={
+                                    source.status === "querying" && !reducedMotion
+                                      ? { scale: [1, 1.04, 1] }
+                                      : { scale: 1 }
+                                  }
+                                  transition={{ duration: 1.2, repeat: source.status === "querying" ? Infinity : 0 }}
+                                  className="h-7 w-7 shrink-0 overflow-hidden rounded-md border border-border bg-white/80 p-0.5"
+                                >
+                                  <Image
+                                    src={visual.iconSrc}
+                                    alt={visual.shortLabel}
+                                    width={28}
+                                    height={28}
+                                    className="h-full w-full object-contain"
+                                  />
+                                </motion.div>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="block truncate font-medium text-foreground">{visual.longLabel}</span>
+                                    <span className={cn(
+                                      "inline-flex shrink-0 items-center rounded border px-1 py-px font-mono text-[9px] font-semibold leading-tight",
+                                      tone.badgeText,
+                                      tone.badgeBg,
+                                    )}>
+                                      {source.source.toUpperCase().replace("_", " ")}
+                                    </span>
+                                  </div>
+                                  {visual.description && (
+                                    <span className="block truncate text-[10px] text-muted-foreground">
+                                      {visual.description}
+                                    </span>
+                                  )}
+                                  {visual.isFabric && (
+                                    <span className="text-[10px] font-semibold uppercase tracking-[0.09em] text-primary">
+                                      Fabric datastore
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              <Badge
+                                variant={
+                                  source.status === "ready"
+                                    ? "success"
+                                    : source.status === "querying"
+                                      ? "warning"
+                                      : source.status === "error"
+                                        ? "destructive"
+                                        : "outline"
+                                }
                               >
-                                {source.rowCount} rows
-                              </motion.span>
-                            </AnimatePresence>
-                            <span className="font-mono text-[10px]">
-                              {source.updatedAt ? formatDateTime(source.updatedAt) : "-"}
-                            </span>
-                          </div>
-                          {source.mode && (
-                            <div className="relative z-[1] mt-1 text-[10px] text-muted-foreground">
-                              Retrieval mode: <span className="font-semibold text-foreground">{source.mode}</span>
+                                {source.status}
+                              </Badge>
                             </div>
-                          )}
-                        </motion.div>
-                      );
-                    })}
-                  </AnimatePresence>
-                )}
-              </section>
+                            <div className="relative z-[1] flex items-center justify-between text-muted-foreground">
+                              <AnimatePresence mode="popLayout" initial={false}>
+                                <motion.span
+                                  key={`${source.source}-${source.rowCount}`}
+                                  initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={reducedMotion ? { opacity: 1 } : { opacity: 0, y: -4 }}
+                                  transition={{ duration: reducedMotion ? 0 : motionTokens.micro }}
+                                >
+                                  {source.rowCount} rows
+                                </motion.span>
+                              </AnimatePresence>
+                              <span className="font-mono text-[10px]">
+                                {source.updatedAt ? formatDateTime(source.updatedAt) : "-"}
+                              </span>
+                            </div>
+                            {source.mode && (
+                              <div className="relative z-[1] mt-1 text-[10px] text-muted-foreground">
+                                Retrieval mode: <span className="font-semibold text-foreground">{source.mode}</span>
+                              </div>
+                            )}
+                          </motion.div>
+                        );
+                      })}
+                    </AnimatePresence>
+                  )}
+                </section>
+              )}
 
               <Separator />
 
               <section className="space-y-2">
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                <p className="text-[0.7rem] font-semibold uppercase tracking-widest text-primary/70">
                   Data Used In Answer
                 </p>
                 {citations.length === 0 ? (
@@ -301,34 +329,76 @@ interface SourceTone {
   queryCard: string;
   queryBorder: string;
   readyCard: string;
+  badgeText: string;
+  badgeBg: string;
 }
 
 function getSourceTone(sourceId: string): SourceTone {
   const source = sourceId.toUpperCase();
-  if (source.startsWith("VECTOR")) {
-    return {
-      accentBar: "bg-sky-500/80",
-      queryCard: "border-sky-500/45 bg-sky-500/[0.08]",
-      queryBorder: "border-sky-500/55",
-      readyCard: "border-sky-500/35 bg-sky-500/[0.05]",
-    };
-  }
-
-  if (source === "NOSQL") {
-    return {
-      accentBar: "bg-purple-500/80",
-      queryCard: "border-purple-500/45 bg-purple-500/[0.08]",
-      queryBorder: "border-purple-500/55",
-      readyCard: "border-purple-500/35 bg-purple-500/[0.05]",
-    };
-  }
 
   if (source === "SQL") {
+    return {
+      accentBar: "bg-blue-500/80",
+      queryCard: "border-blue-500/45 bg-blue-500/[0.08]",
+      queryBorder: "border-blue-500/55",
+      readyCard: "border-blue-500/35 bg-blue-500/[0.05]",
+      badgeText: "text-blue-400",
+      badgeBg: "bg-blue-500/10 border-blue-500/30",
+    };
+  }
+
+  if (source === "KQL") {
     return {
       accentBar: "bg-teal-500/80",
       queryCard: "border-teal-500/45 bg-teal-500/[0.08]",
       queryBorder: "border-teal-500/55",
       readyCard: "border-teal-500/35 bg-teal-500/[0.05]",
+      badgeText: "text-teal-400",
+      badgeBg: "bg-teal-500/10 border-teal-500/30",
+    };
+  }
+
+  if (source.startsWith("VECTOR")) {
+    return {
+      accentBar: "bg-purple-500/80",
+      queryCard: "border-purple-500/45 bg-purple-500/[0.08]",
+      queryBorder: "border-purple-500/55",
+      readyCard: "border-purple-500/35 bg-purple-500/[0.05]",
+      badgeText: "text-purple-400",
+      badgeBg: "bg-purple-500/10 border-purple-500/30",
+    };
+  }
+
+  if (source === "NOSQL") {
+    return {
+      accentBar: "bg-orange-500/80",
+      queryCard: "border-orange-500/45 bg-orange-500/[0.08]",
+      queryBorder: "border-orange-500/55",
+      readyCard: "border-orange-500/35 bg-orange-500/[0.05]",
+      badgeText: "text-orange-400",
+      badgeBg: "bg-orange-500/10 border-orange-500/30",
+    };
+  }
+
+  if (source === "GRAPH") {
+    return {
+      accentBar: "bg-green-500/80",
+      queryCard: "border-green-500/45 bg-green-500/[0.08]",
+      queryBorder: "border-green-500/55",
+      readyCard: "border-green-500/35 bg-green-500/[0.05]",
+      badgeText: "text-green-400",
+      badgeBg: "bg-green-500/10 border-green-500/30",
+    };
+  }
+
+  if (source === "FABRIC_SQL" || source === "FABRICSQL") {
+    return {
+      accentBar: "bg-amber-500/80",
+      queryCard: "border-amber-500/45 bg-amber-500/[0.08]",
+      queryBorder: "border-amber-500/55",
+      readyCard: "border-amber-500/35 bg-amber-500/[0.05]",
+      badgeText: "text-amber-400",
+      badgeBg: "bg-amber-500/10 border-amber-500/30",
     };
   }
 
@@ -337,6 +407,8 @@ function getSourceTone(sourceId: string): SourceTone {
     queryCard: "border-primary/45 bg-primary/[0.07]",
     queryBorder: "border-primary/55",
     readyCard: "border-primary/35 bg-primary/[0.05]",
+    badgeText: "text-primary",
+    badgeBg: "bg-primary/10 border-primary/30",
   };
 }
 
