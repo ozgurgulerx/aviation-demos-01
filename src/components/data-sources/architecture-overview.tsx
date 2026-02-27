@@ -10,25 +10,27 @@ interface SourceBox {
   label: string;
   detail: string;
   stat: string;
+  dataContent: string;
+  usefulFor: string;
   colorClass: string;
   borderColor: string;
 }
 
 const STRUCTURED: SourceBox[] = [
-  { id: "SQL", label: "SQL", detail: "Azure PostgreSQL", stat: "20+ tables", colorClass: "text-blue-400", borderColor: "border-blue-500/40" },
-  { id: "KQL", label: "KQL", detail: "Fabric Eventhouse", stat: "ADS-B, SIGMETs", colorClass: "text-teal-400", borderColor: "border-teal-500/40" },
-  { id: "FABRIC_SQL", label: "FABRIC_SQL", detail: "Fabric SQL WH", stat: "BTS on-time data", colorClass: "text-amber-400", borderColor: "border-amber-500/40" },
+  { id: "SQL", label: "SQL", detail: "Azure PostgreSQL", stat: "20+ tables", dataContent: "ASRS safety reports, flight legs, crew rosters, MEL/techlog, baggage, turnaround milestones, airport/runway/navaid reference, route network", usefulFor: "Counts, rankings, KPI audits, trend analysis, cross-table joins", colorClass: "text-blue-400", borderColor: "border-blue-500/40" },
+  { id: "KQL", label: "KQL", detail: "Fabric Eventhouse", stat: "ADS-B, SIGMETs", dataContent: "Live ADS-B flight positions, active SIGMET/AIRMET alerts, G-AIRMET graphical weather forecasts", usefulFor: "Real-time weather checks, live flight tracking, freshness-critical queries", colorClass: "text-teal-400", borderColor: "border-teal-500/40" },
+  { id: "FABRIC_SQL", label: "FABRIC_SQL", detail: "Fabric SQL WH", stat: "BTS on-time data", dataContent: "BTS flight-level on-time reporting (38 cols), aggregate delay statistics by carrier across 5 delay categories", usefulFor: "Delay root-cause analysis, carrier performance comparison, cancellation trends", colorClass: "text-amber-400", borderColor: "border-amber-500/40" },
 ];
 
 const SEMANTIC: SourceBox[] = [
-  { id: "VECTOR_OPS", label: "VECTOR_OPS", detail: "idx_ops_narratives", stat: "240K chunks", colorClass: "text-purple-400", borderColor: "border-purple-500/40" },
-  { id: "VECTOR_REG", label: "VECTOR_REG", detail: "idx_regulatory", stat: "55+ docs", colorClass: "text-purple-400", borderColor: "border-purple-500/40" },
-  { id: "VECTOR_AIRPORT", label: "VECTOR_AIRPORT", detail: "idx_airport_ops_docs", stat: "2K+ docs", colorClass: "text-purple-400", borderColor: "border-purple-500/40" },
+  { id: "VECTOR_OPS", label: "VECTOR_OPS", detail: "idx_ops_narratives", stat: "240K chunks", dataContent: "ASRS incident narratives chunked with 1536-dim embeddings — near-miss reports, safety observations, lessons learned", usefulFor: "Find similar incidents, summarize safety patterns, narrative-based evidence", colorClass: "text-purple-400", borderColor: "border-purple-500/40" },
+  { id: "VECTOR_REG", label: "VECTOR_REG", detail: "idx_regulatory", stat: "55+ docs", dataContent: "NOTAMs, Airworthiness Directives, EASA bulletins, FAA service bulletins, SOPs, compliance documents", usefulFor: "Semantic search over regulatory text, AD applicability, compliance checks", colorClass: "text-purple-400", borderColor: "border-purple-500/40" },
+  { id: "VECTOR_AIRPORT", label: "VECTOR_AIRPORT", detail: "idx_airport_ops_docs", stat: "2K+ docs", dataContent: "Runway specs, station manuals, ground handling procedures, taxiway diagrams, gate/stand allocation rules", usefulFor: "Airport facility lookups, runway compatibility, ground handling SOPs", colorClass: "text-purple-400", borderColor: "border-purple-500/40" },
 ];
 
 const DOCUMENT_GRAPH: SourceBox[] = [
-  { id: "NOSQL", label: "NOSQL", detail: "Cosmos DB (notams)", stat: "25+ NOTAMs", colorClass: "text-orange-400", borderColor: "border-orange-500/40" },
-  { id: "GRAPH", label: "GRAPH", detail: "Fabric / PG fallback", stat: "500K+ edges", colorClass: "text-green-400", borderColor: "border-green-500/40" },
+  { id: "NOSQL", label: "NOSQL", detail: "Cosmos DB (notams)", stat: "25+ NOTAMs", dataContent: "Structured NOTAM documents with severity, category, ICAO partition key, effective date ranges, active/expired status", usefulFor: "Exact NOTAM lookups by airport ICAO, active NOTAM checks, structured filters", colorClass: "text-orange-400", borderColor: "border-orange-500/40" },
+  { id: "GRAPH", label: "GRAPH", detail: "Fabric / PG fallback", stat: "500K+ edges", dataContent: "Knowledge graph — 16 edge types connecting airports, runways, flights, tails, crew, NOTAMs, routes, airlines, navaids", usefulFor: "Impact analysis, dependency chains, disruption cascades, alternate routing", colorClass: "text-green-400", borderColor: "border-green-500/40" },
 ];
 
 function SourceBoxCard({ box, hovered, onHover, onLeave }: {
@@ -40,15 +42,27 @@ function SourceBoxCard({ box, hovered, onHover, onLeave }: {
   const isHovered = hovered === box.id;
   return (
     <div
-      className={`rounded-md border bg-card/80 px-3 py-2 transition-all ${box.borderColor} ${
+      className={`rounded-md border bg-card/80 px-3 py-2.5 transition-all ${box.borderColor} ${
         isHovered ? "border-opacity-100 shadow-md" : "border-opacity-60"
       }`}
       onMouseEnter={() => onHover(box.id)}
       onMouseLeave={onLeave}
     >
-      <div className={`font-mono text-xs font-bold ${box.colorClass}`}>{box.label}</div>
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <div className={`font-mono text-xs font-bold ${box.colorClass}`}>{box.label}</div>
+        <div className="text-[0.68rem] text-muted-foreground/70">{box.stat}</div>
+      </div>
       <div className="text-xs text-muted-foreground">{box.detail}</div>
-      <div className="mt-0.5 text-[0.68rem] text-muted-foreground/70">{box.stat}</div>
+      <div className="mt-2 border-t border-border/50 pt-2">
+        <div className="text-[0.68rem] leading-relaxed text-muted-foreground">
+          <span className="font-semibold text-foreground/80">Data: </span>
+          {box.dataContent}
+        </div>
+        <div className="mt-1 text-[0.68rem] leading-relaxed text-muted-foreground">
+          <span className="font-semibold text-foreground/80">Useful for: </span>
+          {box.usefulFor}
+        </div>
+      </div>
     </div>
   );
 }
