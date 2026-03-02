@@ -343,9 +343,9 @@ def _gen_ops_edges(cur, schema: str) -> List[EdgeRow]:
         for row in cur.fetchall():
             origin, dest, leg, tail = row
             if origin and leg:
-                edges.append(("FlightLegs", leg, "legDepartsFrom", "Airports", origin))
+                edges.append(("FlightLeg", leg, "DEPARTS", "Airport", origin))
             if leg and dest:
-                edges.append(("FlightLegs", leg, "legArrivesAt", "Airports", dest))
+                edges.append(("FlightLeg", leg, "ARRIVES", "Airport", dest))
             if tail and leg:
                 edges.append(("Tail", tail, "OPERATES", "FlightLeg", leg))
 
@@ -358,7 +358,7 @@ def _gen_ops_edges(cur, schema: str) -> List[EdgeRow]:
             WHERE leg_id IS NOT NULL AND crew_id IS NOT NULL
         """)
         for row in cur.fetchall():
-            edges.append(("FlightLegs", row[0], "crewedBy", "CrewDuties", row[1]))
+            edges.append(("FlightLeg", row[0], "CREWED_BY", "Crew", row[1]))
 
     if "ops_mel_techlog_events" in available:
         # Ontology-aligned: FlightLegs → MaintenanceEvents
@@ -368,20 +368,7 @@ def _gen_ops_edges(cur, schema: str) -> List[EdgeRow]:
             WHERE leg_id IS NOT NULL AND tech_event_id IS NOT NULL
         """)
         for row in cur.fetchall():
-            edges.append(("FlightLegs", row[0], "hasMaintenanceEvent", "MaintenanceEvents", row[1]))
-
-    if "ops_mel_techlog_events" in available and "ops_flight_legs" in available:
-        # Legacy PG BFS fallback: Tail → FlightLeg (keep for backward compatibility)
-        cur.execute(f"""
-            SELECT DISTINCT
-                UPPER(fl.tailnum) AS tail,
-                UPPER(m.leg_id) AS leg
-            FROM {qident(schema)}.ops_mel_techlog_events m
-            JOIN {qident(schema)}.ops_flight_legs fl ON m.leg_id = fl.leg_id
-            WHERE fl.tailnum IS NOT NULL AND m.leg_id IS NOT NULL
-        """)
-        for row in cur.fetchall():
-            edges.append(("Tail", row[0], "MEL_ON", "FlightLeg", row[1]))
+            edges.append(("FlightLeg", row[0], "MEL_ON", "MaintenanceEvent", row[1]))
 
     return edges
 
@@ -420,7 +407,7 @@ def _gen_flown_by(cur, schema: str) -> List[EdgeRow]:
         FROM {qident(schema)}.ops_flight_legs
         WHERE leg_id IS NOT NULL AND carrier_code IS NOT NULL AND carrier_code != ''
     """)
-    return [("FlightLegs", row[0], "flownBy", "Airlines", row[1]) for row in cur.fetchall()]
+    return [("FlightLeg", row[0], "FLOWN_BY", "Airline", row[1]) for row in cur.fetchall()]
 
 
 def _gen_reported_at(cur) -> List[EdgeRow]:
@@ -473,7 +460,7 @@ def _gen_reported_at(cur) -> List[EdgeRow]:
                 iata_code = code
                 break
         if iata_code:
-            edges.append(("SafetyReports", str(report_id), "reportedAt", "Airports", iata_code))
+            edges.append(("SafetyReport", str(report_id), "REPORTED_AT", "Airport", iata_code))
     return edges
 
 
