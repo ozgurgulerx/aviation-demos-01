@@ -343,9 +343,9 @@ def _gen_ops_edges(cur, schema: str) -> List[EdgeRow]:
         for row in cur.fetchall():
             origin, dest, leg, tail = row
             if origin and leg:
-                edges.append(("Airport", origin, "DEPARTS", "FlightLeg", leg))
+                edges.append(("FlightLegs", leg, "legDepartsFrom", "Airports", origin))
             if leg and dest:
-                edges.append(("FlightLeg", leg, "ARRIVES", "Airport", dest))
+                edges.append(("FlightLegs", leg, "legArrivesAt", "Airports", dest))
             if tail and leg:
                 edges.append(("Tail", tail, "OPERATES", "FlightLeg", leg))
 
@@ -358,9 +358,20 @@ def _gen_ops_edges(cur, schema: str) -> List[EdgeRow]:
             WHERE leg_id IS NOT NULL AND crew_id IS NOT NULL
         """)
         for row in cur.fetchall():
-            edges.append(("FlightLeg", row[0], "CREWED_BY", "Crew", row[1]))
+            edges.append(("FlightLegs", row[0], "crewedBy", "CrewDuties", row[1]))
+
+    if "ops_mel_techlog_events" in available:
+        # Ontology-aligned: FlightLegs → MaintenanceEvents
+        cur.execute(f"""
+            SELECT DISTINCT UPPER(leg_id) AS leg, UPPER(tech_event_id) AS event_id
+            FROM {qident(schema)}.ops_mel_techlog_events
+            WHERE leg_id IS NOT NULL AND tech_event_id IS NOT NULL
+        """)
+        for row in cur.fetchall():
+            edges.append(("FlightLegs", row[0], "hasMaintenanceEvent", "MaintenanceEvents", row[1]))
 
     if "ops_mel_techlog_events" in available and "ops_flight_legs" in available:
+        # Legacy PG BFS fallback: Tail → FlightLeg (keep for backward compatibility)
         cur.execute(f"""
             SELECT DISTINCT
                 UPPER(fl.tailnum) AS tail,
@@ -402,8 +413,18 @@ def _gen_notam_edges(cur, schema: str) -> List[EdgeRow]:
     return edges
 
 
+def _gen_flown_by(cur, schema: str) -> List[EdgeRow]:
+    """FlightLegs -> Airlines edges from ops_flight_legs.carrier_code."""
+    cur.execute(f"""
+        SELECT DISTINCT UPPER(leg_id) AS leg, UPPER(carrier_code) AS carrier
+        FROM {qident(schema)}.ops_flight_legs
+        WHERE leg_id IS NOT NULL AND carrier_code IS NOT NULL AND carrier_code != ''
+    """)
+    return [("FlightLegs", row[0], "flownBy", "Airlines", row[1]) for row in cur.fetchall()]
+
+
 def _gen_reported_at(cur) -> List[EdgeRow]:
-    """ASRSReport -> Airport edges from public.asrs_reports location field."""
+    """SafetyReports -> Airports edges from public.asrs_reports location field."""
     edges: List[EdgeRow] = []
     cur.execute("""
         SELECT asrs_report_id, UPPER(location) AS loc
@@ -412,22 +433,47 @@ def _gen_reported_at(cur) -> List[EdgeRow]:
     """)
     # Parse ICAO or IATA codes from location field
     icao_re = re.compile(r"\b([A-Z]{4})\b")
+    iata_re = re.compile(r"\b([A-Z]{3})\b")
+    noise_4 = {"NONE", "UNKN", "FROM", "NEAR", "AREA", "OVER", "WITH", "INTO",
+               "UPON", "LAND", "WEST", "EAST", "LEFT", "THIS", "THAT", "THEN",
+               "WHEN", "WERE", "BEEN", "HAVE", "SOME", "THEY", "THEM", "EACH",
+               "BOTH", "MUCH", "VERY", "ALSO", "JUST", "MORE", "MOST", "ONLY",
+               "BACK", "EVEN", "LONG", "MADE", "MANY", "TAKE", "CAME", "COME",
+               "MAKE", "LIKE", "TIME", "PART", "TOLD", "SAID", "LOST", "USED",
+               "CALL", "GAVE", "WENT", "DOES", "DONE", "TOOK", "KNEW", "FELT",
+               "KEPT", "HELD", "WILL", "TURN"}
+    noise_3 = {"THE", "AND", "FOR", "NOT", "WAS", "ARE", "BUT", "ALL", "CAN",
+               "HAD", "HER", "ONE", "OUR", "OUT", "DAY", "GET", "HAS", "HIM",
+               "HIS", "HOW", "ITS", "MAY", "NEW", "NOW", "OLD", "SEE", "WAY",
+               "WHO", "DID", "GOT", "LET", "SAY", "TOO", "USE", "ATC", "VFR",
+               "IFR", "ILS", "VOR", "DME", "FPM", "AGL", "MSL", "NDB", "GPS",
+               "MEL", "APU", "TWR", "APP", "CTR", "DEP", "GND", "OAT", "RPM"}
     for row in cur.fetchall():
         report_id, loc = row
-        matches = icao_re.findall(loc)
-        for m in matches:
-            # Filter out common English 4-letter words that aren't airport codes
-            if m in ("NONE", "UNKN", "UNKNOWN", "FROM", "NEAR", "AREA",
-                      "OVER", "WITH", "INTO", "UPON", "LAND", "WEST",
-                      "EAST", "LEFT", "THIS", "THAT", "THEN", "WHEN",
-                      "WERE", "BEEN", "HAVE", "SOME", "THEY", "THEM",
-                      "EACH", "BOTH", "MUCH", "VERY", "ALSO", "JUST",
-                      "MORE", "MOST", "ONLY", "BACK", "EVEN", "LONG",
-                      "MADE", "MANY", "TAKE", "CAME", "COME", "MAKE",
-                      "LIKE", "TIME", "PART"):
+        iata_code = None
+        # Try 4-letter ICAO codes first
+        for m in icao_re.finditer(loc):
+            code = m.group(1)
+            if code in noise_4:
                 continue
-            edges.append(("ASRSReport", f"ASRS-{report_id}", "REPORTED_AT", "Airport", m))
-            break  # Take first plausible match only
+            # US ICAO: strip leading K
+            if code.startswith("K") and len(code) == 4:
+                iata_code = code[1:]
+                break
+            # Other regions — use as-is (limited match rate)
+            if code[0] in ("P", "T", "L", "E"):
+                iata_code = code
+                break
+        # Fall back to 3-letter IATA codes
+        if not iata_code:
+            for m in iata_re.finditer(loc):
+                code = m.group(1)
+                if code in noise_3:
+                    continue
+                iata_code = code
+                break
+        if iata_code:
+            edges.append(("SafetyReports", str(report_id), "reportedAt", "Airports", iata_code))
     return edges
 
 
@@ -482,6 +528,7 @@ def main() -> None:
         ("SAME_CITY", lambda: _gen_same_city(cur, args.schema)),
         ("OPS (DEPARTS/ARRIVES/OPERATES/CREWED_BY/MEL_ON)",
          lambda: _gen_ops_edges(cur, args.schema)),
+        ("FLOWN_BY", lambda: _gen_flown_by(cur, args.schema)),
         ("NOTAM (AFFECTS/AFFECTS_RUNWAY)",
          lambda: _gen_notam_edges(cur, args.schema)),
         ("REPORTED_AT", lambda: _gen_reported_at(cur)),

@@ -42,6 +42,8 @@ from shared_utils import (
     ENGLISH_4LETTER_BLOCKLIST as _ENGLISH_4LETTER_BLOCKLIST,
     CITY_AIRPORT_MAP,
     IATA_TO_ICAO_MAP,
+    ICAO_TO_IATA_MAP,
+    KNOWN_AIRLINE_IATA,
     OPS_TABLE_SIGNALS,
     FABRIC_SQL_DELAY_TRIGGERS,
     env_bool as _env_bool,
@@ -64,6 +66,8 @@ _SEMANTIC_MIN_SCORE = float(os.getenv("SEMANTIC_MIN_SCORE_THRESHOLD", "0.0"))
 
 FABRIC_KQL_ENDPOINT = os.getenv("FABRIC_KQL_ENDPOINT")
 FABRIC_GRAPH_ENDPOINT = os.getenv("FABRIC_GRAPH_ENDPOINT")
+FABRIC_GRAPH_MODEL_ID = os.getenv("FABRIC_GRAPH_MODEL_ID", "").strip()
+FABRIC_WORKSPACE_ID = os.getenv("FABRIC_WORKSPACE_ID", "cfbb82a5-799e-421b-b2cc-8a164b17a849").strip()
 FABRIC_NOSQL_ENDPOINT = os.getenv("FABRIC_NOSQL_ENDPOINT")
 FABRIC_SQL_ENDPOINT = os.getenv("FABRIC_SQL_ENDPOINT")
 FABRIC_KUSTO_CLUSTER_URL = os.getenv("FABRIC_KUSTO_CLUSTER_URL", "").strip()
@@ -495,6 +499,14 @@ def _invalidate_fabric_token_cache(scope: str = _FABRIC_DEFAULT_SCOPE) -> None:
     """Remove cached token for *scope* so the next acquire triggers a fresh fetch."""
     with _fabric_token_lock:
         _fabric_token_cache.pop(scope, None)
+
+
+@dataclass
+class GraphEntity:
+    """A typed entity extracted from a query for graph traversal."""
+    value: str
+    node_type: str       # Airports, FlightLegs, CrewDuties, Airlines, SafetyReports, MaintenanceEvents
+    property_name: str   # iata_code, leg_id, tailnum, crew_id, iata, asrs_report_id
 
 
 @dataclass
@@ -982,6 +994,110 @@ class UnifiedRetriever:
 
         return out[:12]
 
+    # ------------------------------------------------------------------
+    # Graph entity classification
+    # ------------------------------------------------------------------
+
+    _RE_LEG_ID = re.compile(r"\b((?:LEG|OSL)\d{3,6})\b", re.IGNORECASE)
+    _RE_TAILNUM = re.compile(r"\b(N\d{1,5}[A-Z]{0,2})\b")
+    _RE_CREW_ID = re.compile(r"\b(CREW\d{3,6})\b", re.IGNORECASE)
+    _RE_ASRS_ID = re.compile(r"\b(ASRS-\d+)\b", re.IGNORECASE)
+    _RE_AIRLINE_CODE = re.compile(r"\b([A-Z]{2})\b")
+
+    def _classify_graph_entities(self, query: str) -> List["GraphEntity"]:
+        """Extract typed graph entities from a natural-language query.
+
+        Returns a list of GraphEntity objects with (value, node_type, property_name).
+        Node types use ontology names: FlightLegs, Airports, CrewDuties, Airlines,
+        SafetyReports, MaintenanceEvents.
+        Priority: FlightLegs > Airports > CrewDuties > Airlines > SafetyReports.
+        """
+        text = query if isinstance(query, str) else str(query or "")
+        upper = text.upper()
+        entities: List[GraphEntity] = []
+        seen_values: set = set()
+
+        def _add(value: str, node_type: str, property_name: str) -> None:
+            key = (value.upper(), node_type)
+            if key not in seen_values:
+                seen_values.add(key)
+                entities.append(GraphEntity(value=value, node_type=node_type, property_name=property_name))
+
+        # FlightLegs by leg_id (LEG0033, OSL0001)
+        for m in self._RE_LEG_ID.finditer(upper):
+            _add(m.group(1).upper(), "FlightLegs", "leg_id")
+
+        # FlightLegs by tail number (N123AB)
+        for m in self._RE_TAILNUM.finditer(text):
+            _add(m.group(1), "FlightLegs", "tailnum")
+
+        # Airports (reuse existing extractor — returns ICAO codes)
+        icao_codes = self._extract_airports_from_query(text)
+        for icao in icao_codes:
+            iata = ICAO_TO_IATA_MAP.get(icao, icao)
+            _add(iata, "Airports", "iata_code")
+
+        # CrewDuties by crew_id
+        for m in self._RE_CREW_ID.finditer(upper):
+            _add(m.group(1).upper(), "CrewDuties", "crew_id")
+
+        # Airlines by 2-letter IATA
+        for m in self._RE_AIRLINE_CODE.finditer(upper):
+            code = m.group(1)
+            if code in KNOWN_AIRLINE_IATA:
+                _add(code, "Airlines", "iata")
+
+        # SafetyReports by ASRS ID
+        for m in self._RE_ASRS_ID.finditer(upper):
+            _add(m.group(1).upper(), "SafetyReports", "asrs_report_id")
+
+        return entities[:12]
+
+    # ------------------------------------------------------------------
+    # Edge type inference
+    # ------------------------------------------------------------------
+
+    # Edge label mapping: canonical camelCase (ontology) -> UPPER_SNAKE_CASE (legacy PG)
+    _EDGE_LABEL_MAP: Dict[str, str] = {
+        "legDepartsFrom": "DEPARTS",
+        "legArrivesAt": "ARRIVES",
+        "crewedBy": "CREWED_BY",
+        "hasMaintenanceEvent": "MEL_ON",
+        "flownBy": "OPERATED_BY",
+        "reportedAt": "REPORTED_AT",
+        "CONNECTS": "CONNECTS",
+        "AFFECTS": "AFFECTS",
+    }
+
+    _EDGE_KEYWORD_MAP: Dict[str, List[str]] = {
+        "legDepartsFrom":       ["depart", "departure", "takeoff", "outbound"],
+        "legArrivesAt":         ["arrive", "arrival", "land", "inbound", "destination"],
+        "OPERATES":             ["operate", "tail", "aircraft", "fleet"],
+        "crewedBy":             ["crew", "pilot", "captain", "first officer"],
+        "hasMaintenanceEvent":  ["maintenance", "mel", "techlog", "defect", "deferred"],
+        "HAS_RUNWAY":           ["runway", "rwy"],
+        "CONNECTS":             ["connect", "direct", "nonstop"],
+        "SAME_CITY":            ["same city", "alternate", "nearby airport"],
+        "AFFECTS":              ["notam", "closure", "restrict"],
+        "reportedAt":           ["report", "asrs", "safety report", "incident"],
+        "SERVED_BY_ROUTE":      ["route", "served"],
+        "flownBy":              ["airline", "carrier"],
+    }
+
+    def _infer_edge_types(self, query: str) -> List[str]:
+        """Infer relevant graph edge types from a query using keyword matching.
+
+        Returns an empty list when no keywords match (means 'no filter, match all').
+        """
+        lower = (query if isinstance(query, str) else str(query or "")).lower()
+        matched: List[str] = []
+        for edge_type, keywords in self._EDGE_KEYWORD_MAP.items():
+            for kw in keywords:
+                if kw in lower:
+                    matched.append(edge_type)
+                    break
+        return matched
+
     def _resolve_kusto_query_endpoint(self, endpoint: str) -> Tuple[str, bool, str]:
         """Normalize Kusto endpoint to a valid query URI.
 
@@ -1204,10 +1320,345 @@ class UnifiedRetriever:
             out.append(item)
         return out
 
-    def _query_graph_live(self, query: str, hops: int = 2, probe: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str], int, Dict[str, Any]]:
+    @staticmethod
+    def _build_gql_query(
+        entities: List["GraphEntity"],
+        edge_types: Optional[List[str]] = None,
+        hops: int = 2,
+        probe: bool = False,
+        limit: int = 50,
+    ) -> str:
+        """Build an ISO GQL query for Fabric Graph from classified entities.
+
+        Fabric Graph uses ISO GQL (not openCypher) — no labels()/type() functions;
+        use explicit node label matching and property-based WHERE clauses.
+
+        Node labels use ontology names (plural): Airports, FlightLegs, CrewDuties,
+        Airlines, SafetyReports, MaintenanceEvents.
+        Edge labels use ontology camelCase: legDepartsFrom, legArrivesAt, crewedBy,
+        hasMaintenanceEvent, flownBy, reportedAt.
+        """
+        if probe:
+            return "MATCH (a:Airports) RETURN a.iata_code, a.name LIMIT 5"
+
+        max_hops = min(max(hops, 1), 4)
+        cap = max(1, limit)
+
+        def _esc(v: str) -> str:
+            return v.replace("\\", "\\\\").replace("'", "\\'")
+
+        # No entities, no edge types → generic scan
+        if not entities and not edge_types:
+            return f"MATCH (a)-[r]->(b) RETURN a, r, b LIMIT 30"
+
+        # No entities, with edge types → typed edge scan
+        if not entities and edge_types:
+            et = edge_types[0]
+            return f"MATCH (a)-[r:{et}]->(b) RETURN a, r, b LIMIT {cap}"
+
+        # Group entities by node type; pick the highest-priority seed type.
+        _PRIORITY = {"FlightLegs": 0, "Airports": 1, "CrewDuties": 2, "Airlines": 3, "SafetyReports": 4, "MaintenanceEvents": 5}
+        by_type: Dict[str, List["GraphEntity"]] = {}
+        for e in entities:
+            by_type.setdefault(e.node_type, []).append(e)
+        seed_type = min(by_type.keys(), key=lambda t: _PRIORITY.get(t, 99))
+        seeds = by_type[seed_type]
+
+        # Build edge label clause fragment
+        def _edge_label(types: Optional[List[str]], alias: str = "r") -> str:
+            if not types:
+                return f"[{alias}]"
+            if len(types) == 1:
+                return f"[:{types[0]}]"
+            return f"[{alias}]"
+
+        edge_clause = _edge_label(edge_types)
+
+        # ---- Airports seeds ----
+        if seed_type == "Airports":
+            vals = [_esc(e.value) for e in seeds]
+            in_clause = ", ".join(f"'{v}'" for v in vals)
+            single = len(vals) == 1
+
+            # Special case: legDepartsFrom edge (FlightLegs->Airports)
+            if edge_types and "legDepartsFrom" in edge_types:
+                where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
+                if max_hops >= 2:
+                    return (
+                        f"MATCH (f:FlightLegs)-[:legDepartsFrom]->(a:Airports), "
+                        f"(f)-[:legArrivesAt]->(b:Airports) "
+                        f"WHERE {where} "
+                        f"RETURN a.iata_code AS origin, f.leg_id, f.carrier_code, b.iata_code AS dest LIMIT {cap}"
+                    )
+                return (
+                    f"MATCH (f:FlightLegs)-[:legDepartsFrom]->(a:Airports) "
+                    f"WHERE {where} "
+                    f"RETURN a.iata_code AS origin, f.leg_id, f.carrier_code, f.dest_iata LIMIT {cap}"
+                )
+
+            # Special case: legArrivesAt edge
+            if edge_types and "legArrivesAt" in edge_types:
+                where = f"b.iata_code = '{vals[0]}'" if single else f"b.iata_code IN [{in_clause}]"
+                return (
+                    f"MATCH (f:FlightLegs)-[:legArrivesAt]->(b:Airports) "
+                    f"WHERE {where} "
+                    f"RETURN f.leg_id, f.origin_iata, b.iata_code AS dest LIMIT {cap}"
+                )
+
+            # Special case: CONNECTS
+            if edge_types and "CONNECTS" in edge_types:
+                where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
+                return (
+                    f"MATCH (a:Airports)-[:CONNECTS]->(b:Airports) "
+                    f"WHERE {where} "
+                    f"RETURN a.iata_code AS origin, b.iata_code AS dest, b.name LIMIT {cap}"
+                )
+
+            # Special case: AFFECTS (NOTAMs)
+            if edge_types and "AFFECTS" in edge_types:
+                where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
+                return (
+                    f"MATCH (n:NOTAM)-[:AFFECTS]->(a:Airports) "
+                    f"WHERE {where} "
+                    f"RETURN n, a.iata_code LIMIT {cap}"
+                )
+
+            # General Airport queries
+            where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
+            if max_hops >= 2:
+                return (
+                    f"MATCH (a:Airports)-[r1]->(mid)-[r2]->(b) "
+                    f"WHERE {where} "
+                    f"RETURN a.iata_code AS origin, mid, b LIMIT {cap}"
+                )
+            return (
+                f"MATCH (a:Airports)-{edge_clause}->(b) "
+                f"WHERE {where} "
+                f"RETURN a.iata_code AS seed, r, b LIMIT {cap}"
+            )
+
+        # ---- FlightLegs seeds ----
+        if seed_type == "FlightLegs":
+            seed = seeds[0]
+            val = _esc(seed.value)
+            prop = seed.property_name  # leg_id or tailnum
+
+            # crewedBy edge
+            if edge_types and "crewedBy" in edge_types:
+                return (
+                    f"MATCH (f:FlightLegs)-[:crewedBy]->(c:CrewDuties) "
+                    f"WHERE f.{prop} = '{val}' "
+                    f"RETURN f.leg_id, c.crew_id, c.role LIMIT {cap}"
+                )
+
+            # hasMaintenanceEvent edge
+            if edge_types and "hasMaintenanceEvent" in edge_types:
+                return (
+                    f"MATCH (f:FlightLegs)-[:hasMaintenanceEvent]->(m:MaintenanceEvents) "
+                    f"WHERE f.{prop} = '{val}' "
+                    f"RETURN f.leg_id, m.tech_event_id, m.severity LIMIT {cap}"
+                )
+
+            # flownBy edge
+            if edge_types and "flownBy" in edge_types:
+                return (
+                    f"MATCH (f:FlightLegs)-[:flownBy]->(al:Airlines) "
+                    f"WHERE f.{prop} = '{val}' "
+                    f"RETURN f.leg_id, al.iata, al.name LIMIT {cap}"
+                )
+
+            # General FlightLegs — get origin airport via legDepartsFrom
+            if max_hops >= 2:
+                return (
+                    f"MATCH (f:FlightLegs)-[:legDepartsFrom]->(a:Airports) "
+                    f"WHERE f.{prop} = '{val}' "
+                    f"RETURN a.iata_code AS origin, f.leg_id, f.carrier_code, f.dest_iata LIMIT {cap}"
+                )
+            return (
+                f"MATCH (f:FlightLegs)-{edge_clause}->(b) "
+                f"WHERE f.{prop} = '{val}' "
+                f"RETURN f.leg_id AS seed, r, b LIMIT {cap}"
+            )
+
+        # ---- CrewDuties seeds ----
+        if seed_type == "CrewDuties":
+            val = _esc(seeds[0].value)
+            return (
+                f"MATCH (c:CrewDuties)<-[:crewedBy]-(f:FlightLegs) "
+                f"WHERE c.crew_id = '{val}' "
+                f"RETURN c.crew_id, c.role, f.leg_id, f.origin_iata, f.dest_iata LIMIT {cap}"
+            )
+
+        # ---- Airlines seeds ----
+        if seed_type == "Airlines":
+            val = _esc(seeds[0].value)
+            return (
+                f"MATCH (f:FlightLegs)-[:flownBy]->(al:Airlines) "
+                f"WHERE al.iata = '{val}' "
+                f"RETURN al.name, al.iata, f.leg_id, f.origin_iata, f.dest_iata LIMIT {cap}"
+            )
+
+        # ---- SafetyReports seeds ----
+        if seed_type == "SafetyReports":
+            val = _esc(seeds[0].value)
+            return (
+                f"MATCH (s:SafetyReports)-[:reportedAt]->(a:Airports) "
+                f"WHERE s.asrs_report_id = '{val}' "
+                f"RETURN s.asrs_report_id, s.title, a.iata_code, a.name LIMIT {cap}"
+            )
+
+        # Fallback: generic scan
+        return f"MATCH (a)-[r]->(b) RETURN a, r, b LIMIT 30"
+
+    @staticmethod
+    def _normalize_gql_rows(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Flatten Fabric GQL nested node/edge objects into flat dicts.
+
+        Fabric Graph API returns nodes and edges as nested objects like:
+          {"a.iata_code": "IST", "r": {"~id": ..., "~type": "DEPARTS", ...}, "b": {"~id": ..., ...}}
+        This normalizer flattens them so downstream consumers (annotation, synthesis)
+        get consistent flat key-value rows.
+        """
+        out: List[Dict[str, Any]] = []
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            flat: Dict[str, Any] = {}
+            for key, val in row.items():
+                if isinstance(val, dict):
+                    # Nested node or edge object — extract inner properties
+                    node_type = val.get("~type") or val.get("~label") or ""
+                    node_id = val.get("~id", "")
+                    if node_type:
+                        flat[f"{key}_type"] = node_type
+                    if node_id:
+                        flat[f"{key}_id"] = node_id
+                    for inner_k, inner_v in val.items():
+                        if inner_k.startswith("~"):
+                            continue
+                        flat[f"{key}.{inner_k}" if key in ("r", "r1", "r2", "mid") else inner_k] = inner_v
+                elif isinstance(val, list):
+                    flat[key] = val
+                else:
+                    flat[key] = val
+            out.append(flat)
+        return out
+
+    def _query_graph_gql(self, query: str, hops: int = 2, probe: bool = False, edge_types: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], Optional[str], int, Dict[str, Any]]:
+        """Query the Fabric Graph Model via GQL REST API."""
+        ws_id = FABRIC_WORKSPACE_ID
+        graph_id = FABRIC_GRAPH_MODEL_ID
+        if not graph_id or not ws_id:
+            return [], "fabric_graph_model_not_configured", 0, {"graph_path": "fabric_gql_not_configured"}
+
+        entities = [] if probe else self._classify_graph_entities(query)
+        inferred_edges = [] if probe else (edge_types or self._infer_edge_types(query))
+        gql = self._build_gql_query(entities, edge_types=inferred_edges, hops=hops, probe=probe)
+        url = f"https://api.fabric.microsoft.com/v1/workspaces/{ws_id}/GraphModels/{graph_id}/executeQuery?preview=true"
+
+        max_attempts = 1 + max(0, self._graph_max_retries)
+        last_error: Optional[str] = None
+        attempts = 0
+
+        for attempt in range(1, max_attempts + 1):
+            attempts = attempt
+            fabric_token = _acquire_fabric_token()
+            if not fabric_token:
+                last_error = "fabric_token_unavailable"
+                if attempt < max_attempts:
+                    self._graph_retry_sleep(attempt)
+                    continue
+                break
+
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps({"query": gql}).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {fabric_token}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=self._graph_timeout_seconds) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                error_body = ""
+                try:
+                    error_body = e.read().decode("utf-8")[:500]
+                except Exception:
+                    pass
+                last_error = f"gql_http_{e.code}_{e.reason}_{error_body}"
+                logger.warning("GQL query HTTP %d: %s %s", e.code, e.reason, error_body[:200])
+                if attempt < max_attempts and self._graph_retryable_error(last_error):
+                    self._graph_retry_sleep(attempt)
+                    continue
+                break
+            except Exception as e:
+                last_error = f"gql_request_error_{e}"
+                logger.warning("GQL query error: %s", e)
+                if attempt < max_attempts and self._graph_retryable_error(last_error):
+                    self._graph_retry_sleep(attempt)
+                    continue
+                break
+
+            # Parse results — Fabric Graph API returns:
+            #   {"status": {"code": "00000", ...}, "result": {"kind": "TABLE", "columns": [...], "data": [...]}}
+            # Error responses have status.code != "00000" and may have errorCode at top level.
+            status_obj = body.get("status", {})
+            status_code = str(status_obj.get("code", ""))
+            result_obj = body.get("result", {})
+            data_rows = result_obj.get("data", [])
+
+            # Check for GQL errors (non-zero status code)
+            if body.get("errorCode"):
+                last_error = f"gql_error_{body['errorCode']}_{body.get('message', '')}"
+                if attempt < max_attempts and self._graph_retryable_error(last_error):
+                    self._graph_retry_sleep(attempt)
+                    continue
+                break
+            if status_code and status_code not in ("00000", "02000"):
+                cause = status_obj.get("cause", {})
+                last_error = f"gql_status_{status_code}_{cause.get('description', status_obj.get('description', ''))}"
+                logger.warning("GQL query status %s: %s", status_code, last_error[:200])
+                if attempt < max_attempts and self._graph_retryable_error(last_error):
+                    self._graph_retry_sleep(attempt)
+                    continue
+                break
+
+            if isinstance(data_rows, list) and data_rows:
+                rows: List[Dict[str, Any]] = []
+                for item in data_rows:
+                    if isinstance(item, dict):
+                        rows.append(item)
+                    elif isinstance(item, (list, tuple)):
+                        rows.append({"values": item})
+                    else:
+                        rows.append({"value": item})
+                normalized = self._normalize_gql_rows(rows)
+                return normalized, None, attempts, {"graph_path": "fabric_gql", "gql": gql}
+
+            # Also check legacy response shapes (results/rows at top level)
+            legacy = body.get("results", body.get("rows", []))
+            if isinstance(legacy, list) and legacy:
+                raw = [r if isinstance(r, dict) else {"value": r} for r in legacy]
+                return self._normalize_gql_rows(raw), None, attempts, {"graph_path": "fabric_gql", "gql": gql}
+
+            # Status 02000 = "no data" — empty result set, not an error
+            return [], "graph_query_returned_no_rows", attempts, {"graph_path": "fabric_gql", "gql": gql}
+
+        return [], last_error or "gql_query_failed", attempts, {"graph_path": "fabric_gql", "gql": gql}
+
+    def _query_graph_live(self, query: str, hops: int = 2, probe: bool = False, edge_types: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], Optional[str], int, Dict[str, Any]]:
         self._ensure_graph_runtime_state()
         max_attempts = 1 + max(0, self._graph_max_retries)
         attempts = 0
+
+        # Prefer Fabric Graph GQL API when FABRIC_GRAPH_MODEL_ID is configured
+        if FABRIC_GRAPH_MODEL_ID:
+            return self._query_graph_gql(query, hops=hops, probe=probe, edge_types=edge_types)
+
         graph_endpoint = self._effective_fabric_endpoint("GRAPH")
 
         if self._is_kusto_endpoint(graph_endpoint):
@@ -1271,7 +1722,7 @@ class UnifiedRetriever:
     def _probe_graph_query(self) -> Dict[str, Any]:
         self._ensure_graph_runtime_state()
         graph_endpoint = self._effective_fabric_endpoint("GRAPH")
-        if not graph_endpoint:
+        if not graph_endpoint and not FABRIC_GRAPH_MODEL_ID:
             return {
                 "status": "warn",
                 "detail": "graph_endpoint_not_configured",
@@ -1529,7 +1980,16 @@ class UnifiedRetriever:
         # GRAPH
         graph_db = self._graph_database()
         graph_endpoint = self._effective_fabric_endpoint("GRAPH")
-        if not graph_endpoint:
+        if FABRIC_GRAPH_MODEL_ID:
+            # Fabric Graph GQL API path — preferred when graph model ID is set
+            source_caps["GRAPH"] = self._source_capability_payload(
+                source="GRAPH",
+                status="healthy",
+                reason_code="ready",
+                detail=f"fabric_gql;model={FABRIC_GRAPH_MODEL_ID[:8]}...;ws={FABRIC_WORKSPACE_ID[:8]}...",
+                execution_mode="live",
+            )
+        elif not graph_endpoint:
             if sql_available:
                 source_caps["GRAPH"] = self._source_capability_payload(
                     source="GRAPH",
@@ -3727,7 +4187,7 @@ class UnifiedRetriever:
             return all_rows, [Citation(source_type="GRAPH", identifier="graph_pg_fallback", title="Graph edges (PostgreSQL fallback)", content_preview=str(all_rows)[:120], score=0.8, dataset="ops_graph_edges")]
         return [self._source_error_row("GRAPH", "graph_runtime_error", "bfs_returned_no_rows")], []
 
-    def query_graph(self, query: str, hops: int = 2) -> Tuple[List[Dict], List[Citation]]:
+    def query_graph(self, query: str, hops: int = 2, edge_types: Optional[List[str]] = None) -> Tuple[List[Dict], List[Citation]]:
         """Retrieve graph relationships from Fabric graph endpoint, with PostgreSQL fallback."""
         graph_capability = self.source_capability("GRAPH", refresh=True)
         if graph_capability.get("status") == "unavailable":
@@ -3739,6 +4199,7 @@ class UnifiedRetriever:
             rows, citations = self._query_graph_pg_fallback(
                 query,
                 hops=hops,
+                edge_types=edge_types,
                 unavailable_detail=f"Graph live path skipped by capability mode fallback ({reason})",
             )
             snapshot = self._graph_circuit_snapshot()
@@ -3751,10 +4212,11 @@ class UnifiedRetriever:
             ), citations
 
         graph_endpoint = self._effective_fabric_endpoint("GRAPH")
-        if not graph_endpoint:
+        if not graph_endpoint and not FABRIC_GRAPH_MODEL_ID:
             rows, citations = self._query_graph_pg_fallback(
                 query,
                 hops=hops,
+                edge_types=edge_types,
                 unavailable_detail="FABRIC_GRAPH_ENDPOINT not configured; attempting SQL fallback",
             )
             snapshot = self._graph_circuit_snapshot()
@@ -3771,6 +4233,7 @@ class UnifiedRetriever:
             rows, citations = self._query_graph_pg_fallback(
                 query,
                 hops=hops,
+                edge_types=edge_types,
                 unavailable_detail="Graph live path skipped because circuit breaker is open",
             )
             return self._annotate_graph_rows(
@@ -3781,7 +4244,7 @@ class UnifiedRetriever:
                 extra=snapshot,
             ), citations
 
-        paths, live_error, retry_attempts, live_meta = self._query_graph_live(query, hops=hops)
+        paths, live_error, retry_attempts, live_meta = self._query_graph_live(query, hops=hops, edge_types=edge_types)
         if paths:
             self._graph_circuit_record_success()
             graph_path = str(live_meta.get("graph_path", "fabric_graph_live"))
@@ -3812,6 +4275,7 @@ class UnifiedRetriever:
         fallback_rows, fallback_citations = self._query_graph_pg_fallback(
             query,
             hops=hops,
+            edge_types=edge_types,
             unavailable_detail=f"Fabric graph live query failed ({live_error or 'unknown_error'}) and SQL fallback unavailable",
         )
         snapshot = self._graph_circuit_snapshot()
@@ -4565,7 +5029,8 @@ class UnifiedRetriever:
                 return rows, citations, None
             if source == "GRAPH":
                 hops = int(cfg.get("hops", 2))
-                rows, citations = self.query_graph(query, hops=hops)
+                et = cfg.get("edge_types") or None
+                rows, citations = self.query_graph(query, hops=hops, edge_types=et)
                 span.set_attribute("row_count", len(rows))
                 span.set_attribute("hops", hops)
                 return rows, citations, None
