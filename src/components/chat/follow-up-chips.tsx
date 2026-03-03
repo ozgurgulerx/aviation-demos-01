@@ -14,7 +14,7 @@ import {
 import { Button } from "@/components/ui/button";
 import type { QueryType } from "@/data/seed";
 
-interface FollowUpSuggestion {
+export interface FollowUpSuggestion {
   text: string;
   type: QueryType;
   sources?: number;
@@ -83,7 +83,7 @@ function inferQueryType(text: string): QueryType {
   return "ops-live";
 }
 
-const DEFAULT_VISIBLE_COUNT = 3;
+const DEFAULT_VISIBLE_COUNT = 2;
 
 export function FollowUpChips({ suggestions, onSelect, isVisible }: FollowUpChipsProps) {
   const [isHydrated, setIsHydrated] = useState(false);

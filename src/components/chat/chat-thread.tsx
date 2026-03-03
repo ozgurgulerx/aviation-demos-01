@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Message } from "./message";
 import { AnswerFrame } from "./answer-frame";
+import { FollowUpChips, type FollowUpSuggestion } from "./follow-up-chips";
 import { QUERY_CATEGORIES, type QueryType } from "@/data/seed";
 import type { Message as MessageType } from "@/types";
 import { motionTokens } from "@/lib/motion";
@@ -31,6 +32,9 @@ interface ChatThreadProps {
   voiceStatuses?: Record<string, "idle" | "preparing" | "ready" | "error">;
   onSendMessage?: (message: string) => void;
   currentReasoningDetail?: string;
+  followUpSuggestions?: FollowUpSuggestion[];
+  onFollowUpSelect?: (suggestion: string) => void;
+  showFollowUps?: boolean;
 }
 
 const iconMap: Record<QueryType, React.ElementType> = {
@@ -60,6 +64,9 @@ export function ChatThread({
   voiceStatuses = {},
   onSendMessage,
   currentReasoningDetail,
+  followUpSuggestions,
+  onFollowUpSelect,
+  showFollowUps = false,
 }: ChatThreadProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -143,35 +150,45 @@ export function ChatThread({
             })}
           </div>
         ) : (
-          <AnimatePresence mode="popLayout">
-            {messages.map((message) => {
-              if (message.role === "assistant") {
-                const isActiveStreaming = isLoading &&
-                  (message.status === "streaming" || message.status === "loading");
+          <>
+            <AnimatePresence mode="popLayout">
+              {messages.map((message) => {
+                if (message.role === "assistant") {
+                  const isActiveStreaming = isLoading &&
+                    (message.status === "streaming" || message.status === "loading");
+                  return (
+                    <AnswerFrame
+                      key={message.id}
+                      message={message}
+                      streamingContent={isActiveStreaming ? streamingContent : undefined}
+                      currentReasoningDetail={isActiveStreaming ? currentReasoningDetail : undefined}
+                      loadingElapsedMs={isActiveStreaming ? loadingElapsedMs : 0}
+                      onCitationClick={onCitationClick}
+                      activeCitationId={activeCitationId}
+                      onSpeakMessage={onSpeakMessage}
+                      isSpeaking={speakingMessageId === message.id}
+                      voiceEnabled={voiceEnabled}
+                      voiceStatus={voiceStatuses[message.id] || "idle"}
+                    />
+                  );
+                }
                 return (
-                  <AnswerFrame
+                  <Message
                     key={message.id}
                     message={message}
-                    streamingContent={isActiveStreaming ? streamingContent : undefined}
-                    currentReasoningDetail={isActiveStreaming ? currentReasoningDetail : undefined}
-                    loadingElapsedMs={isActiveStreaming ? loadingElapsedMs : 0}
-                    onCitationClick={onCitationClick}
-                    activeCitationId={activeCitationId}
-                    onSpeakMessage={onSpeakMessage}
-                    isSpeaking={speakingMessageId === message.id}
-                    voiceEnabled={voiceEnabled}
-                    voiceStatus={voiceStatuses[message.id] || "idle"}
                   />
                 );
-              }
-              return (
-                <Message
-                  key={message.id}
-                  message={message}
-                />
-              );
-            })}
-          </AnimatePresence>
+              })}
+            </AnimatePresence>
+
+            {followUpSuggestions && onFollowUpSelect && (
+              <FollowUpChips
+                suggestions={followUpSuggestions}
+                onSelect={onFollowUpSelect}
+                isVisible={showFollowUps}
+              />
+            )}
+          </>
         )}
 
         <div ref={bottomRef} className="h-1" />

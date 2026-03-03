@@ -8,7 +8,6 @@ import { SourcesPanel } from "@/components/layout/sources-panel";
 import { ChatThread } from "@/components/chat/chat-thread";
 import { TimelinePanel } from "@/components/chat/timeline-panel";
 import { MessageComposer } from "@/components/chat/message-composer";
-import { FollowUpChips } from "@/components/chat/follow-up-chips";
 import { PipelineSelector } from "@/components/chat/pipeline-selector";
 import { PredictivePanel } from "@/components/predictive/predictive-panel";
 import { ToggleGroup } from "@/components/ui/switch";
@@ -1464,12 +1463,9 @@ export default function ChatPage() {
               ? reasoningEvents[reasoningEvents.length - 1]?.payload?.detail
               : undefined
           }
-        />
-
-        <FollowUpChips
-          suggestions={ENHANCED_FOLLOW_UP_SUGGESTIONS}
-          onSelect={handleFollowUpSelect}
-          isVisible={showFollowUps && !isLoading && messages.length > 0}
+          followUpSuggestions={ENHANCED_FOLLOW_UP_SUGGESTIONS}
+          onFollowUpSelect={handleFollowUpSelect}
+          showFollowUps={showFollowUps && !isLoading && messages.length > 0}
         />
 
         <MessageComposer
