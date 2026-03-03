@@ -310,6 +310,13 @@ RULE 3 — Use GRAPH for relationship and impact queries
   "downstream", "upstream", "cascade", "propagate", "chain", "ripple",
   "knock-on", "what happens if", "connected", "alternate", "network".
   GRAPH is especially valuable for "if-then" disruption scenarios.
+  When including GRAPH, optionally include a "graph_hint" object with
+  edge_types relevant to the query:
+    {"edge_types": ["DEPARTS", "ARRIVES"], "seed_type": "Airport"}
+  Valid edge types: DEPARTS, ARRIVES, OPERATES, CREWED_BY, MEL_ON,
+  HAS_RUNWAY, CONNECTS, SAME_CITY, AFFECTS, REPORTED_AT,
+  SERVED_BY_ROUTE, OPERATED_BY.
+  Only include graph_hint when the query clearly maps to specific edge types.
 
 RULE 4 — Use FABRIC_SQL for airline performance and delay analytics
   Include FABRIC_SQL when the query involves: "delay", "on-time",
@@ -359,7 +366,8 @@ Return JSON only — no prose, no markdown:
     "route": "SQL" | "SEMANTIC" | "HYBRID",
     "reasoning": "Brief explanation of route choice and why these sources were selected",
     "sql_hint": "Optional SQL generation hint if route involves SQL queries",
-    "sources": ["SQL", "KQL", "VECTOR_OPS"]
+    "sources": ["SQL", "KQL", "VECTOR_OPS"],
+    "graph_hint": {"edge_types": ["DEPARTS"], "seed_type": "Airport"}  // optional, only when GRAPH is in sources
 }
 
 Valid source names: SQL, KQL, GRAPH, VECTOR_OPS, VECTOR_REG, VECTOR_AIRPORT, NOSQL, FABRIC_SQL
@@ -396,7 +404,13 @@ class QueryRouter:
                 })
             messages.append({"role": "user", "content": query})
 
-            response = self.client.chat.completions.create(
+            # Tighter timeout + no retries for routing — it has a heuristic
+            # fallback, so burning 45s+retry here steals budget from synthesis.
+            _routing_timeout = float(os.getenv("ROUTING_TIMEOUT_SECONDS", "20"))
+            response = self.client.with_options(
+                timeout=_routing_timeout,
+                max_retries=0,
+            ).chat.completions.create(
                 model=self.model,
                 messages=messages,
                 response_format={"type": "json_object"}
@@ -416,6 +430,20 @@ class QueryRouter:
                 if isinstance(raw_sources, list)
                 else []
             )
+
+            # Extract optional graph_hint when GRAPH is in sources.
+            raw_hint = result.get("graph_hint")
+            if isinstance(raw_hint, dict) and "GRAPH" in result["sources"]:
+                edge_types = raw_hint.get("edge_types", [])
+                if isinstance(edge_types, list):
+                    result["graph_hint"] = {
+                        "edge_types": [str(e).upper() for e in edge_types if isinstance(e, str)],
+                        "seed_type": str(raw_hint.get("seed_type", "")).strip() or None,
+                    }
+                else:
+                    result.pop("graph_hint", None)
+            else:
+                result.pop("graph_hint", None)
 
             return result
         except Exception as exc:

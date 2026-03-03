@@ -79,6 +79,7 @@ class AgentFrameworkRuntime:
         self._agent: Any = None
         self._af_enabled = False
         self._framework_label = "local-fallback"
+        self._foundry_client: Any = None  # lazy-init in _run_with_foundry_iq
 
         self._init_observability()
         self._init_agent_framework()
@@ -342,6 +343,8 @@ class AgentFrameworkRuntime:
         failure_policy: str = "graceful",
     ) -> Generator[Dict[str, Any], None, None]:
         _t0_total = time.perf_counter()
+        _request_budget = float(os.getenv("REQUEST_BUDGET_SECONDS", "180"))
+        _deadline = _t0_total + _request_budget
         sid = session_id or str(uuid.uuid4())
         _resolved_route = "UNKNOWN"
         failure_policy = self._normalize_failure_policy(failure_policy)
@@ -412,13 +415,20 @@ class AgentFrameworkRuntime:
         yield self._reasoning_stage_event("pii_scan", "Scanning for PII entities...")
 
         # Run PII check and query routing in parallel — they are independent.
+        # For foundry-iq mode, skip routing (the Foundry agent handles its own).
         _t0_parallel = time.perf_counter()
         precomputed_route = None
+        _skip_routing = retrieval_mode == "foundry-iq"
 
         def _pii_task():
             return self.retriever.check_pii(query)
 
         def _routing_task():
+            remaining = _deadline - time.perf_counter()
+            if remaining < 60:
+                logger.info("Budget tight (%.1fs remaining), using heuristic routing", remaining)
+                heuristic = self.retriever.router.quick_route(query)
+                return {"route": heuristic, "reasoning": "Heuristic routing (budget tight)", "sources": []}
             intent_graph = self.context_provider.intent_graph_provider.load()
             intent_graph_data = intent_graph.data if intent_graph else None
             return self.retriever.router.smart_route(query, intent_graph=intent_graph_data)
@@ -426,10 +436,11 @@ class AgentFrameworkRuntime:
         with _tracer.start_as_current_span("pipeline.pii_routing", attributes={"query.length": len(query), "session.id": sid}) as _pii_span:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 pii_future = pool.submit(_pii_task)
-                route_future = pool.submit(_routing_task)
+                route_future = None if _skip_routing else pool.submit(_routing_task)
+                route_done = _skip_routing
 
                 # Poll both futures so we can emit reasoning events as each completes.
-                pii_done = route_done = False
+                pii_done = False
                 pii_result = None
                 while not (pii_done and route_done):
                     if not pii_done and pii_future.done():
@@ -439,7 +450,7 @@ class AgentFrameworkRuntime:
                             "pii_scan",
                             "PII scan complete \u2014 no PII detected" if not pii_result.has_pii else "PII scan complete \u2014 PII detected",
                         )
-                    if not route_done and route_future.done():
+                    if not route_done and route_future is not None and route_future.done():
                         route_done = True
                         try:
                             precomputed_route = route_future.result()
@@ -513,6 +524,37 @@ class AgentFrameworkRuntime:
                 }
                 return
 
+        # --- Foundry IQ branch: skip AF/local entirely ---
+        if retrieval_mode == "foundry-iq":
+            try:
+                with _tracer.start_as_current_span("pipeline.foundry_iq", attributes={"session.id": sid}):
+                    for event in self._run_with_foundry_iq(query, sid, failure_policy=failure_policy):
+                        if event.get("type") in {"agent_done", "agent_partial_done"}:
+                            _resolved_route = event.get("route", "FOUNDRY_IQ")
+                        yield event
+            except Exception as exc:
+                _error_counter.add(1, {"stage": "foundry_iq"})
+                logger.exception("Foundry IQ run failed: %s", exc)
+                yield {
+                    "type": "agent_error",
+                    "message": f"Foundry IQ error: {exc}",
+                    "sessionId": sid,
+                }
+                yield {
+                    "type": "agent_done",
+                    "isVerified": False,
+                    "route": "FOUNDRY_IQ",
+                    "reasoning": "Foundry IQ call failed",
+                    "sessionId": sid,
+                    "framework": "foundry-iq",
+                }
+            _total_ms = (time.perf_counter() - _t0_total) * 1000
+            _query_counter.add(1)
+            _route_counter.add(1, {"route": _resolved_route})
+            _query_latency.record(_total_ms, {"route": _resolved_route})
+            logger.info("perf stage=%s ms=%.1f", "run_stream_total", _total_ms)
+            return
+
         if self._af_enabled:
             try:
                 with _tracer.start_as_current_span("pipeline.agent_framework", attributes={"session.id": sid, "framework": self._framework_label}):
@@ -531,6 +573,7 @@ class AgentFrameworkRuntime:
                         precomputed_route=precomputed_route,
                         conversation_history=conversation_history,
                         failure_policy=failure_policy,
+                        deadline=_deadline,
                     ):
                         if event.get("type") in {"agent_done", "agent_partial_done"}:
                             _resolved_route = event.get("route", "AGENTIC")
@@ -567,6 +610,7 @@ class AgentFrameworkRuntime:
                 precomputed_route=precomputed_route,
                 conversation_history=conversation_history,
                 failure_policy=failure_policy,
+                deadline=_deadline,
             ):
                 if event.get("type") in {"agent_done", "agent_partial_done"}:
                     _resolved_route = event.get("route", "LOCAL")
@@ -576,6 +620,126 @@ class AgentFrameworkRuntime:
         _route_counter.add(1, {"route": _resolved_route})
         _query_latency.record(_total_ms, {"route": _resolved_route})
         logger.info("perf stage=%s ms=%.1f", "run_stream_total", _total_ms)
+
+    def _run_with_foundry_iq(
+        self,
+        query: str,
+        session_id: str,
+        failure_policy: str = "graceful",
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Run query through the Azure AI Foundry Responses API (Foundry IQ mode).
+
+        Emits SSE events compatible with the existing frontend protocol.
+        """
+        _ = failure_policy  # reserved for future error-handling policy
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Lazy-init the client to avoid import/startup cost for code-rag users.
+        if self._foundry_client is None:
+            from foundry_client import FoundryClient
+            self._foundry_client = FoundryClient()
+
+        client = self._foundry_client
+
+        # 1. Reasoning stage
+        yield self._reasoning_stage_event(
+            "intent_mapped",
+            "Routing to Foundry IQ agent...",
+            route="FOUNDRY_IQ",
+        )
+
+        # 2. Tool call event
+        call_id = str(uuid.uuid4())
+        yield {
+            "type": "tool_call",
+            "id": call_id,
+            "name": "foundry_iq.query",
+            "arguments": {
+                "query": query,
+                "model": client.model,
+                "endpoint": client.endpoint,
+            },
+        }
+
+        # 3. Call the Foundry Responses API
+        _t0 = time.perf_counter()
+        try:
+            result = client.query(query)
+        except Exception as exc:
+            logger.error("Foundry IQ query failed: %s", exc)
+            yield {
+                "type": "tool_result",
+                "id": call_id,
+                "name": "foundry_iq.query",
+                "result": {"error": str(exc)},
+            }
+            yield {
+                "type": "agent_error",
+                "message": f"Foundry IQ agent returned an error: {exc}",
+                "sessionId": session_id,
+            }
+            yield {
+                "type": "agent_done",
+                "isVerified": False,
+                "route": "FOUNDRY_IQ",
+                "reasoning": f"Foundry IQ call failed: {exc}",
+                "sessionId": session_id,
+                "framework": "foundry-iq",
+            }
+            return
+
+        _latency_ms = (time.perf_counter() - _t0) * 1000
+
+        # 4. Tool result
+        yield {
+            "type": "tool_result",
+            "id": call_id,
+            "name": "foundry_iq.query",
+            "result": {
+                "status": "ok",
+                "model": result.model,
+                "latency_ms": round(result.latency_ms, 1),
+                "citation_count": len(result.citations),
+            },
+        }
+
+        # 5. Stream answer text
+        if result.text:
+            for event in self._emit_text_chunks(result.text):
+                yield event
+
+        # 6. Citations
+        if result.citations:
+            formatted_citations = []
+            for cit in result.citations:
+                formatted_citations.append({
+                    "id": cit.id,
+                    "provider": "FOUNDRY_IQ",
+                    "dataset": "foundry-iq-agent",
+                    "rowId": f"foundry-ref-{cit.id}",
+                    "timestamp": now_iso,
+                    "confidence": 0.85,
+                    "excerpt": cit.excerpt,
+                    "authority": "foundry-agent",
+                })
+            yield {"type": "citations", "citations": formatted_citations}
+
+        # 7. Evidence check complete
+        yield self._reasoning_stage_event(
+            "evidence_check_complete",
+            f"Foundry IQ response received ({round(_latency_ms)}ms, {len(result.citations)} citations)",
+        )
+
+        # 8. Done
+        yield {
+            "type": "agent_done",
+            "isVerified": True,
+            "route": "FOUNDRY_IQ",
+            "reasoning": "Answered via Foundry IQ agent (Responses API)",
+            "sessionId": session_id,
+            "framework": "foundry-iq",
+            "model": result.model,
+        }
 
     def _run_with_agent_framework(
         self,
@@ -593,6 +757,7 @@ class AgentFrameworkRuntime:
         precomputed_route: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         failure_policy: str = "graceful",
+        deadline: float = 0.0,
     ) -> Generator[Dict[str, Any], None, None]:
         session = self._get_or_create_session(session_id)
         call_id = str(uuid.uuid4())
@@ -722,6 +887,30 @@ class AgentFrameworkRuntime:
             f"{ctx.context_text}\n\n"
             f"User question: {query}"
         )
+
+        # Deadline guard: skip synthesis if budget is exhausted.
+        _remaining = deadline - time.perf_counter() if deadline > 0 else float("inf")
+        if _remaining < 15:
+            logger.warning("Budget exhausted (%.1fs remaining), skipping AF synthesis", _remaining)
+            degraded_sources, failed_required_sources = self._summarize_source_outcomes(
+                ctx.source_results, required_sources=required_sources,
+            )
+            for event in self._emit_no_answer_fallback_text(
+                route=ctx.route, degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=len(failed_required_sources) == 0,
+                failure_policy=failure_policy, source_policy=source_policy,
+            ):
+                yield event
+            yield self._build_partial_done_event(
+                route=ctx.route, reasoning="Budget exhausted before synthesis",
+                session_id=session_id, framework=self._framework_label,
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=len(failed_required_sources) == 0,
+                failure_policy=failure_policy, source_policy=source_policy,
+            )
+            return
 
         answer = self._invoke_agent(prompt=prompt, session=session, session_id=session_id)
         degraded_sources, failed_required_sources = self._summarize_source_outcomes(
@@ -959,6 +1148,7 @@ class AgentFrameworkRuntime:
         precomputed_route: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         failure_policy: str = "graceful",
+        deadline: float = 0.0,
     ) -> Generator[Dict[str, Any], None, None]:
         call_id = str(uuid.uuid4())
 
@@ -1143,6 +1333,27 @@ class AgentFrameworkRuntime:
             required_sources=required_sources,
         )
         required_sources_satisfied = len(failed_required_sources) == 0
+
+        # Deadline guard: skip synthesis if budget is exhausted.
+        _remaining = deadline - time.perf_counter() if deadline > 0 else float("inf")
+        if _remaining < 15:
+            logger.warning("Budget exhausted (%.1fs remaining), skipping local synthesis", _remaining)
+            for event in self._emit_no_answer_fallback_text(
+                route=route, degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy, source_policy=source_policy,
+            ):
+                yield event
+            yield self._build_partial_done_event(
+                route=route, reasoning="Budget exhausted before synthesis",
+                session_id=session_id, framework="local-fallback",
+                degraded_sources=degraded_sources,
+                failed_required_sources=failed_required_sources,
+                required_sources_satisfied=required_sources_satisfied,
+                failure_policy=failure_policy, source_policy=source_policy,
+            )
+            return
 
         # True streaming: yield tokens as they arrive from the LLM.
         local_answer_parts: List[str] = []
