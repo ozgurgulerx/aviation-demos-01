@@ -262,6 +262,14 @@ IATA_TO_ICAO_MAP: Dict[str, str] = {
     "CDG": "LFPG", "FRA": "EDDF", "AMS": "EHAM",
 }
 
+ICAO_TO_IATA_MAP: Dict[str, str] = {v: k for k, v in IATA_TO_ICAO_MAP.items()}
+
+KNOWN_AIRLINE_IATA: FrozenSet[str] = frozenset({
+    "TK", "LH", "AA", "DL", "UA", "BA", "AF", "KL", "EK", "QR",
+    "SQ", "CX", "QF", "NH", "JL", "OS", "LX", "SK", "AY", "IB",
+    "WN", "B6", "AS", "NK", "F9", "G4", "HA", "SY", "PC", "AJ",
+})
+
 
 # ---------------------------------------------------------------------------
 # Tool name canonicalization
