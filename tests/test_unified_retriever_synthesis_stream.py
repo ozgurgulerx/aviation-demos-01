@@ -41,11 +41,13 @@ class UnifiedRetrieverSynthesisStreamTests(unittest.TestCase):
     def _build_retriever(self, chunks):
         retriever = object.__new__(UnifiedRetriever)
         retriever.llm_deployment = "test-model"
-        retriever.llm = types.SimpleNamespace(
+        fake_client = types.SimpleNamespace(
             chat=types.SimpleNamespace(
                 completions=_FakeCompletions(chunks),
             )
         )
+        fake_client.with_options = lambda **_kw: fake_client
+        retriever.llm = fake_client
         return retriever
 
     def test_structured_delta_content_is_streamed_as_text(self):

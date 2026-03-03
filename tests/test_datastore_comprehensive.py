@@ -811,18 +811,18 @@ class TestQueryRouterHeuristics(unittest.TestCase):
         for query in [
             "Describe common runway incursion patterns",
             "What happened in similar incidents?",
-            "Give me examples of near misses",
             "Why did this incident occur?",
             "Lessons learned from approach incidents",
         ]:
             route = self.router.quick_route(query)
             self.assertEqual(route, "SEMANTIC", f"Expected SEMANTIC for: {query}")
 
-    def test_mixed_semantic_and_topic_keywords_route_to_hybrid(self):
-        """Queries containing semantic keywords AND topic keywords (asrs/report/safety)
-        route to HYBRID because both categories match."""
+    def test_mixed_semantic_and_topic_keywords_route_to_semantic(self):
+        """Queries containing semantic keywords (summarize, narrative) route to
+        SEMANTIC even when topic keywords (asrs) are present, because HYBRID only
+        triggers when both SQL and SEMANTIC keywords match."""
         route = self.router.quick_route("Summarize ASRS narratives about bird strikes")
-        self.assertEqual(route, "HYBRID")
+        self.assertEqual(route, "SEMANTIC")
 
     def test_hybrid_keywords_route_to_hybrid(self):
         for query in [

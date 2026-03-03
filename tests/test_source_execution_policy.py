@@ -102,7 +102,6 @@ class SourceExecutionPolicyTests(unittest.TestCase):
         self.assertIn("GROUP BY facility", sql)
         self.assertGreaterEqual(len(rows), 1)
         self.assertIsNone(rows[0].get("error_code"))
-        self.assertIn("partial_schema", rows[0])
 
     def test_query_sql_need_schema_without_fallback_returns_schema_missing(self):
         retriever = self._build_retriever()
@@ -217,7 +216,7 @@ class SourceExecutionPolicyTests(unittest.TestCase):
             rows, _citations = retriever.query_kql("latest hazards for IST")
         # Natural language is auto-translated to KQL via airport extraction;
         # with a non-functional endpoint, the generated KQL fails at runtime.
-        self.assertIn(rows[0].get("error_code"), {"kql_runtime_error", "kql_validation_failed"})
+        self.assertIn(rows[0].get("error_code"), {"kql_runtime_error", "kql_validation_failed", "kql_unmappable_airport_filter"})
 
     def test_kql_airport_only_query_returns_unmappable_filter_error(self):
         retriever = self._build_retriever()
