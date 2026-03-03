@@ -944,7 +944,7 @@ class AgentFrameworkRuntime:
                 synthesis_context = _truncate_context_to_budget(synthesis_context, budget)
             af_answer_parts: List[str] = []
             synthesis_terminal_error: Optional[Dict[str, Any]] = None
-            for event in self.retriever._synthesize_answer_stream(query, synthesis_context, ctx.route, conversation_history=conversation_history):
+            for event in self.retriever._synthesize_answer_stream(query, synthesis_context, ctx.route, conversation_history=conversation_history, deadline=deadline):
                 if event.get("type") == "agent_update" and event.get("content"):
                     af_answer_parts.append(str(event["content"]))
                     yield event
@@ -1358,7 +1358,7 @@ class AgentFrameworkRuntime:
         # True streaming: yield tokens as they arrive from the LLM.
         local_answer_parts: List[str] = []
         synthesis_terminal_error: Optional[Dict[str, Any]] = None
-        for event in self.retriever._synthesize_answer_stream(query, synthesis_context, route, conversation_history=conversation_history):
+        for event in self.retriever._synthesize_answer_stream(query, synthesis_context, route, conversation_history=conversation_history, deadline=deadline):
             if event.get("type") == "agent_update" and event.get("content"):
                 local_answer_parts.append(str(event["content"]))
                 yield event

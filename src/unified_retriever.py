@@ -505,7 +505,7 @@ def _invalidate_fabric_token_cache(scope: str = _FABRIC_DEFAULT_SCOPE) -> None:
 class GraphEntity:
     """A typed entity extracted from a query for graph traversal."""
     value: str
-    node_type: str       # Airports, FlightLegs, CrewDuties, Airlines, SafetyReports, MaintenanceEvents
+    node_type: str       # Airport, FlightLeg, Crew, Airline, SafetyReport, MaintenanceEvent
     property_name: str   # iata_code, leg_id, tailnum, crew_id, iata, asrs_report_id
 
 
@@ -1008,9 +1008,9 @@ class UnifiedRetriever:
         """Extract typed graph entities from a natural-language query.
 
         Returns a list of GraphEntity objects with (value, node_type, property_name).
-        Node types use ontology names: FlightLegs, Airports, CrewDuties, Airlines,
-        SafetyReports, MaintenanceEvents.
-        Priority: FlightLegs > Airports > CrewDuties > Airlines > SafetyReports.
+        Node types use singular labels matching the live graph: FlightLeg, Airport,
+        Crew, Airline, SafetyReport, MaintenanceEvent.
+        Priority: FlightLeg > Airport > Crew > Airline > SafetyReport.
         """
         text = query if isinstance(query, str) else str(query or "")
         upper = text.upper()
@@ -1023,33 +1023,33 @@ class UnifiedRetriever:
                 seen_values.add(key)
                 entities.append(GraphEntity(value=value, node_type=node_type, property_name=property_name))
 
-        # FlightLegs by leg_id (LEG0033, OSL0001)
+        # FlightLeg by leg_id (LEG0033, OSL0001)
         for m in self._RE_LEG_ID.finditer(upper):
-            _add(m.group(1).upper(), "FlightLegs", "leg_id")
+            _add(m.group(1).upper(), "FlightLeg", "leg_id")
 
-        # FlightLegs by tail number (N123AB)
+        # FlightLeg by tail number (N123AB)
         for m in self._RE_TAILNUM.finditer(text):
-            _add(m.group(1), "FlightLegs", "tailnum")
+            _add(m.group(1), "FlightLeg", "tailnum")
 
-        # Airports (reuse existing extractor — returns ICAO codes)
+        # Airport (reuse existing extractor — returns ICAO codes)
         icao_codes = self._extract_airports_from_query(text)
         for icao in icao_codes:
             iata = ICAO_TO_IATA_MAP.get(icao, icao)
-            _add(iata, "Airports", "iata_code")
+            _add(iata, "Airport", "iata_code")
 
-        # CrewDuties by crew_id
+        # Crew by crew_id
         for m in self._RE_CREW_ID.finditer(upper):
-            _add(m.group(1).upper(), "CrewDuties", "crew_id")
+            _add(m.group(1).upper(), "Crew", "crew_id")
 
-        # Airlines by 2-letter IATA
+        # Airline by 2-letter IATA
         for m in self._RE_AIRLINE_CODE.finditer(upper):
             code = m.group(1)
             if code in KNOWN_AIRLINE_IATA:
-                _add(code, "Airlines", "iata")
+                _add(code, "Airline", "iata")
 
-        # SafetyReports by ASRS ID
+        # SafetyReport by ASRS ID
         for m in self._RE_ASRS_ID.finditer(upper):
-            _add(m.group(1).upper(), "SafetyReports", "asrs_report_id")
+            _add(m.group(1).upper(), "SafetyReport", "asrs_report_id")
 
         return entities[:12]
 
@@ -1057,31 +1057,31 @@ class UnifiedRetriever:
     # Edge type inference
     # ------------------------------------------------------------------
 
-    # Edge label mapping: canonical camelCase (ontology) -> UPPER_SNAKE_CASE (legacy PG)
+    # Edge label mapping: UPPER_SNAKE_CASE (live graph) -> legacy PG fallback
     _EDGE_LABEL_MAP: Dict[str, str] = {
-        "legDepartsFrom": "DEPARTS",
-        "legArrivesAt": "ARRIVES",
-        "crewedBy": "CREWED_BY",
-        "hasMaintenanceEvent": "MEL_ON",
-        "flownBy": "OPERATED_BY",
-        "reportedAt": "REPORTED_AT",
+        "DEPARTS": "DEPARTS",
+        "ARRIVES": "ARRIVES",
+        "CREWED_BY": "CREWED_BY",
+        "MEL_ON": "MEL_ON",
+        "FLOWN_BY": "OPERATED_BY",
+        "REPORTED_AT": "REPORTED_AT",
         "CONNECTS": "CONNECTS",
         "AFFECTS": "AFFECTS",
     }
 
     _EDGE_KEYWORD_MAP: Dict[str, List[str]] = {
-        "legDepartsFrom":       ["depart", "departure", "takeoff", "outbound"],
-        "legArrivesAt":         ["arrive", "arrival", "land", "inbound", "destination"],
+        "DEPARTS":              ["depart", "departure", "takeoff", "outbound"],
+        "ARRIVES":              ["arrive", "arrival", "land", "inbound", "destination"],
         "OPERATES":             ["operate", "tail", "aircraft", "fleet"],
-        "crewedBy":             ["crew", "pilot", "captain", "first officer"],
-        "hasMaintenanceEvent":  ["maintenance", "mel", "techlog", "defect", "deferred"],
+        "CREWED_BY":            ["crew", "pilot", "captain", "first officer"],
+        "MEL_ON":               ["maintenance", "mel", "techlog", "defect", "deferred"],
         "HAS_RUNWAY":           ["runway", "rwy"],
         "CONNECTS":             ["connect", "direct", "nonstop"],
         "SAME_CITY":            ["same city", "alternate", "nearby airport"],
         "AFFECTS":              ["notam", "closure", "restrict"],
-        "reportedAt":           ["report", "asrs", "safety report", "incident"],
+        "REPORTED_AT":          ["report", "asrs", "safety report", "incident"],
         "SERVED_BY_ROUTE":      ["route", "served"],
-        "flownBy":              ["airline", "carrier"],
+        "FLOWN_BY":             ["airline", "carrier"],
     }
 
     def _infer_edge_types(self, query: str) -> List[str]:
@@ -1333,13 +1333,13 @@ class UnifiedRetriever:
         Fabric Graph uses ISO GQL (not openCypher) — no labels()/type() functions;
         use explicit node label matching and property-based WHERE clauses.
 
-        Node labels use ontology names (plural): Airports, FlightLegs, CrewDuties,
-        Airlines, SafetyReports, MaintenanceEvents.
-        Edge labels use ontology camelCase: legDepartsFrom, legArrivesAt, crewedBy,
-        hasMaintenanceEvent, flownBy, reportedAt.
+        Node labels use singular names matching the live graph: Airport, FlightLeg,
+        Crew, Airline, SafetyReport, MaintenanceEvent.
+        Edge labels use UPPER_SNAKE_CASE: DEPARTS, ARRIVES, CREWED_BY,
+        MEL_ON, FLOWN_BY, REPORTED_AT.
         """
         if probe:
-            return "MATCH (a:Airports) RETURN a.iata_code, a.name LIMIT 5"
+            return "MATCH (a:Airport) RETURN a.iata_code, a.name LIMIT 5"
 
         max_hops = min(max(hops, 1), 4)
         cap = max(1, limit)
@@ -1357,7 +1357,7 @@ class UnifiedRetriever:
             return f"MATCH (a)-[r:{et}]->(b) RETURN a, r, b LIMIT {cap}"
 
         # Group entities by node type; pick the highest-priority seed type.
-        _PRIORITY = {"FlightLegs": 0, "Airports": 1, "CrewDuties": 2, "Airlines": 3, "SafetyReports": 4, "MaintenanceEvents": 5}
+        _PRIORITY = {"FlightLeg": 0, "Airport": 1, "Crew": 2, "Airline": 3, "SafetyReport": 4, "MaintenanceEvent": 5}
         by_type: Dict[str, List["GraphEntity"]] = {}
         for e in entities:
             by_type.setdefault(e.node_type, []).append(e)
@@ -1374,33 +1374,33 @@ class UnifiedRetriever:
 
         edge_clause = _edge_label(edge_types)
 
-        # ---- Airports seeds ----
-        if seed_type == "Airports":
+        # ---- Airport seeds ----
+        if seed_type == "Airport":
             vals = [_esc(e.value) for e in seeds]
             in_clause = ", ".join(f"'{v}'" for v in vals)
             single = len(vals) == 1
 
-            # Special case: legDepartsFrom edge (FlightLegs->Airports)
-            if edge_types and "legDepartsFrom" in edge_types:
+            # Special case: DEPARTS edge (FlightLeg->Airport)
+            if edge_types and "DEPARTS" in edge_types:
                 where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
                 if max_hops >= 2:
                     return (
-                        f"MATCH (f:FlightLegs)-[:legDepartsFrom]->(a:Airports), "
-                        f"(f)-[:legArrivesAt]->(b:Airports) "
+                        f"MATCH (f:FlightLeg)-[:DEPARTS]->(a:Airport), "
+                        f"(f)-[:ARRIVES]->(b:Airport) "
                         f"WHERE {where} "
                         f"RETURN a.iata_code AS origin, f.leg_id, f.carrier_code, b.iata_code AS dest LIMIT {cap}"
                     )
                 return (
-                    f"MATCH (f:FlightLegs)-[:legDepartsFrom]->(a:Airports) "
+                    f"MATCH (f:FlightLeg)-[:DEPARTS]->(a:Airport) "
                     f"WHERE {where} "
                     f"RETURN a.iata_code AS origin, f.leg_id, f.carrier_code, f.dest_iata LIMIT {cap}"
                 )
 
-            # Special case: legArrivesAt edge
-            if edge_types and "legArrivesAt" in edge_types:
+            # Special case: ARRIVES edge
+            if edge_types and "ARRIVES" in edge_types:
                 where = f"b.iata_code = '{vals[0]}'" if single else f"b.iata_code IN [{in_clause}]"
                 return (
-                    f"MATCH (f:FlightLegs)-[:legArrivesAt]->(b:Airports) "
+                    f"MATCH (f:FlightLeg)-[:ARRIVES]->(b:Airport) "
                     f"WHERE {where} "
                     f"RETURN f.leg_id, f.origin_iata, b.iata_code AS dest LIMIT {cap}"
                 )
@@ -1409,7 +1409,7 @@ class UnifiedRetriever:
             if edge_types and "CONNECTS" in edge_types:
                 where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
                 return (
-                    f"MATCH (a:Airports)-[:CONNECTS]->(b:Airports) "
+                    f"MATCH (a:Airport)-[:CONNECTS]->(b:Airport) "
                     f"WHERE {where} "
                     f"RETURN a.iata_code AS origin, b.iata_code AS dest, b.name LIMIT {cap}"
                 )
@@ -1418,7 +1418,7 @@ class UnifiedRetriever:
             if edge_types and "AFFECTS" in edge_types:
                 where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
                 return (
-                    f"MATCH (n:NOTAM)-[:AFFECTS]->(a:Airports) "
+                    f"MATCH (n:NOTAM)-[:AFFECTS]->(a:Airport) "
                     f"WHERE {where} "
                     f"RETURN n, a.iata_code LIMIT {cap}"
                 )
@@ -1427,82 +1427,82 @@ class UnifiedRetriever:
             where = f"a.iata_code = '{vals[0]}'" if single else f"a.iata_code IN [{in_clause}]"
             if max_hops >= 2:
                 return (
-                    f"MATCH (a:Airports)-[r1]->(mid)-[r2]->(b) "
+                    f"MATCH (a:Airport)-[r1]->(mid)-[r2]->(b) "
                     f"WHERE {where} "
                     f"RETURN a.iata_code AS origin, mid, b LIMIT {cap}"
                 )
             return (
-                f"MATCH (a:Airports)-{edge_clause}->(b) "
+                f"MATCH (a:Airport)-{edge_clause}->(b) "
                 f"WHERE {where} "
                 f"RETURN a.iata_code AS seed, r, b LIMIT {cap}"
             )
 
-        # ---- FlightLegs seeds ----
-        if seed_type == "FlightLegs":
+        # ---- FlightLeg seeds ----
+        if seed_type == "FlightLeg":
             seed = seeds[0]
             val = _esc(seed.value)
             prop = seed.property_name  # leg_id or tailnum
 
-            # crewedBy edge
-            if edge_types and "crewedBy" in edge_types:
+            # CREWED_BY edge
+            if edge_types and "CREWED_BY" in edge_types:
                 return (
-                    f"MATCH (f:FlightLegs)-[:crewedBy]->(c:CrewDuties) "
+                    f"MATCH (f:FlightLeg)-[:CREWED_BY]->(c:Crew) "
                     f"WHERE f.{prop} = '{val}' "
                     f"RETURN f.leg_id, c.crew_id, c.role LIMIT {cap}"
                 )
 
-            # hasMaintenanceEvent edge
-            if edge_types and "hasMaintenanceEvent" in edge_types:
+            # MEL_ON edge
+            if edge_types and "MEL_ON" in edge_types:
                 return (
-                    f"MATCH (f:FlightLegs)-[:hasMaintenanceEvent]->(m:MaintenanceEvents) "
+                    f"MATCH (f:FlightLeg)-[:MEL_ON]->(m:MaintenanceEvent) "
                     f"WHERE f.{prop} = '{val}' "
                     f"RETURN f.leg_id, m.tech_event_id, m.severity LIMIT {cap}"
                 )
 
-            # flownBy edge
-            if edge_types and "flownBy" in edge_types:
+            # FLOWN_BY edge
+            if edge_types and "FLOWN_BY" in edge_types:
                 return (
-                    f"MATCH (f:FlightLegs)-[:flownBy]->(al:Airlines) "
+                    f"MATCH (f:FlightLeg)-[:FLOWN_BY]->(al:Airline) "
                     f"WHERE f.{prop} = '{val}' "
                     f"RETURN f.leg_id, al.iata, al.name LIMIT {cap}"
                 )
 
-            # General FlightLegs — get origin airport via legDepartsFrom
+            # General FlightLeg — get origin airport via DEPARTS
             if max_hops >= 2:
                 return (
-                    f"MATCH (f:FlightLegs)-[:legDepartsFrom]->(a:Airports) "
+                    f"MATCH (f:FlightLeg)-[:DEPARTS]->(a:Airport) "
                     f"WHERE f.{prop} = '{val}' "
                     f"RETURN a.iata_code AS origin, f.leg_id, f.carrier_code, f.dest_iata LIMIT {cap}"
                 )
             return (
-                f"MATCH (f:FlightLegs)-{edge_clause}->(b) "
+                f"MATCH (f:FlightLeg)-{edge_clause}->(b) "
                 f"WHERE f.{prop} = '{val}' "
                 f"RETURN f.leg_id AS seed, r, b LIMIT {cap}"
             )
 
-        # ---- CrewDuties seeds ----
-        if seed_type == "CrewDuties":
+        # ---- Crew seeds ----
+        if seed_type == "Crew":
             val = _esc(seeds[0].value)
             return (
-                f"MATCH (c:CrewDuties)<-[:crewedBy]-(f:FlightLegs) "
+                f"MATCH (c:Crew)<-[:CREWED_BY]-(f:FlightLeg) "
                 f"WHERE c.crew_id = '{val}' "
                 f"RETURN c.crew_id, c.role, f.leg_id, f.origin_iata, f.dest_iata LIMIT {cap}"
             )
 
-        # ---- Airlines seeds ----
-        if seed_type == "Airlines":
+        # ---- Airline seeds ----
+        if seed_type == "Airline":
             val = _esc(seeds[0].value)
             return (
-                f"MATCH (f:FlightLegs)-[:flownBy]->(al:Airlines) "
+                f"MATCH (f:FlightLeg)-[:FLOWN_BY]->(al:Airline) "
                 f"WHERE al.iata = '{val}' "
                 f"RETURN al.name, al.iata, f.leg_id, f.origin_iata, f.dest_iata LIMIT {cap}"
             )
 
-        # ---- SafetyReports seeds ----
-        if seed_type == "SafetyReports":
+        # ---- SafetyReport seeds ----
+        if seed_type == "SafetyReport":
             val = _esc(seeds[0].value)
             return (
-                f"MATCH (s:SafetyReports)-[:reportedAt]->(a:Airports) "
+                f"MATCH (s:SafetyReport)-[:REPORTED_AT]->(a:Airport) "
                 f"WHERE s.asrs_report_id = '{val}' "
                 f"RETURN s.asrs_report_id, s.title, a.iata_code, a.name LIMIT {cap}"
             )
@@ -5172,6 +5172,7 @@ Retrieved Data:
         context: dict,
         route: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        deadline: float = 0.0,
     ) -> Generator[Dict[str, Any], None, None]:
         """Stream synthesis tokens as agent_update events (true streaming)."""
         _synth_span = _ur_tracer.start_span("synthesis", attributes={"route": route})
@@ -5191,8 +5192,20 @@ Retrieved Data:
             messages.extend(conversation_history)
         messages.append({"role": "user", "content": context_str})
 
+        # Cap the LLM timeout to the remaining request budget so synthesis
+        # cannot exceed the proxy timeout.  No retries under budget pressure.
+        _default_timeout = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
+        if deadline > 0:
+            _remaining = deadline - time.perf_counter()
+            _synth_timeout = max(10, min(_remaining - 5, _default_timeout))
+            _synth_retries = 0
+        else:
+            _synth_timeout = _default_timeout
+            _synth_retries = int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1"))
+        _client = self.llm.with_options(timeout=_synth_timeout, max_retries=_synth_retries)
+
         try:
-            stream = self.llm.chat.completions.create(
+            stream = _client.chat.completions.create(
                 model=self.llm_deployment,
                 messages=messages,
                 stream=True,
@@ -5216,10 +5229,21 @@ Retrieved Data:
             _synth_ms = (time.perf_counter() - _t0_synth) * 1000
             _synth_span.set_attribute("latency_ms", _synth_ms)
             _synth_span.end()
-            logger.info("perf stage=%s ms=%.1f", "synthesize_answer_stream", _synth_ms)
+            logger.info("perf stage=%s ms=%.1f timeout=%.0f", "synthesize_answer_stream", _synth_ms, _synth_timeout)
         except Exception as exc:
             _synth_span.set_attribute("error", True)
             _synth_span.end()
+            # Skip non-streaming fallback if budget is nearly gone.
+            _fb_remaining = deadline - time.perf_counter() if deadline > 0 else float("inf")
+            if _fb_remaining < 10:
+                logger.error("LLM streaming synthesis failed and no budget for fallback (%.1fs): %s", _fb_remaining, exc)
+                yield {
+                    "type": "agent_error",
+                    "error_code": "synthesis_timeout",
+                    "terminal_reason": "synthesis_timeout",
+                    "message": f"Synthesis timed out ({exc})",
+                }
+                return
             logger.error("LLM streaming synthesis failed: %s — falling back to non-streaming", exc)
             answer = self._synthesize_answer(query, context, route, conversation_history=conversation_history)
             yield {"type": "agent_update", "content": answer}
