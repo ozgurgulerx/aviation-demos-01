@@ -343,7 +343,7 @@ class AgentFrameworkRuntime:
         failure_policy: str = "graceful",
     ) -> Generator[Dict[str, Any], None, None]:
         _t0_total = time.perf_counter()
-        _request_budget = float(os.getenv("REQUEST_BUDGET_SECONDS", "180"))
+        _request_budget = float(os.getenv("REQUEST_BUDGET_SECONDS", "220"))
         _deadline = _t0_total + _request_budget
         sid = session_id or str(uuid.uuid4())
         _resolved_route = "UNKNOWN"
@@ -890,7 +890,7 @@ class AgentFrameworkRuntime:
 
         # Deadline guard: skip synthesis if budget is exhausted.
         _remaining = deadline - time.perf_counter() if deadline > 0 else float("inf")
-        if _remaining < 15:
+        if _remaining < 10:
             logger.warning("Budget exhausted (%.1fs remaining), skipping AF synthesis", _remaining)
             degraded_sources, failed_required_sources = self._summarize_source_outcomes(
                 ctx.source_results, required_sources=required_sources,
@@ -1336,7 +1336,7 @@ class AgentFrameworkRuntime:
 
         # Deadline guard: skip synthesis if budget is exhausted.
         _remaining = deadline - time.perf_counter() if deadline > 0 else float("inf")
-        if _remaining < 15:
+        if _remaining < 10:
             logger.warning("Budget exhausted (%.1fs remaining), skipping local synthesis", _remaining)
             for event in self._emit_no_answer_fallback_text(
                 route=route, degraded_sources=degraded_sources,

@@ -5137,6 +5137,7 @@ Guidelines:
         context: dict,
         route: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        client_override=None,
     ) -> str:
         """Generate natural language answer from retrieved context."""
         _t0_synth = time.perf_counter()
@@ -5155,8 +5156,9 @@ Retrieved Data:
             messages.extend(conversation_history)
         messages.append({"role": "user", "content": context_str})
 
+        _client = client_override or self.llm
         try:
-            response = self.llm.chat.completions.create(
+            response = _client.chat.completions.create(
                 model=self.llm_deployment,
                 messages=messages,
             )
@@ -5197,8 +5199,8 @@ Retrieved Data:
         _default_timeout = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "45"))
         if deadline > 0:
             _remaining = deadline - time.perf_counter()
-            _synth_timeout = max(10, min(_remaining - 5, _default_timeout))
-            _synth_retries = 0
+            _synth_timeout = max(20, min(_remaining - 5, _default_timeout))
+            _synth_retries = 1 if _remaining > 60 else 0
         else:
             _synth_timeout = _default_timeout
             _synth_retries = int(os.getenv("AZURE_OPENAI_MAX_RETRIES", "1"))
@@ -5245,7 +5247,15 @@ Retrieved Data:
                 }
                 return
             logger.error("LLM streaming synthesis failed: %s — falling back to non-streaming", exc)
-            answer = self._synthesize_answer(query, context, route, conversation_history=conversation_history)
+            # Cap fallback timeout to remaining budget so it cannot exceed the proxy deadline.
+            if deadline > 0:
+                _fb_timeout = max(10, min(_fb_remaining - 5, _default_timeout))
+                _fb_client = self.llm.with_options(timeout=_fb_timeout, max_retries=0)
+            else:
+                _fb_client = None
+            answer = self._synthesize_answer(query, context, route,
+                                              conversation_history=conversation_history,
+                                              client_override=_fb_client)
             yield {"type": "agent_update", "content": answer}
 
     @classmethod
